@@ -65,8 +65,19 @@ async function runMigrations({ get, all, run }) {
         guild_id TEXT NOT NULL,
         last_known_level INTEGER,
         last_known_burned INTEGER,
+        last_zero_due_at TEXT,
         PRIMARY KEY (user_id, guild_id)
     )`);
+
+    const goalCols = await all(`PRAGMA table_info(goals)`);
+    if (!goalCols.find(c => c.name === 'daily_all')) {
+        await run(`ALTER TABLE goals ADD COLUMN daily_all INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    const stateCols = await all(`PRAGMA table_info(user_state)`);
+    if (!stateCols.find(c => c.name === 'last_zero_due_at')) {
+        await run(`ALTER TABLE user_state ADD COLUMN last_zero_due_at TEXT`);
+    }
 }
 
 module.exports = { runMigrations };
