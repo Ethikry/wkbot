@@ -122,6 +122,43 @@ async function getRandomKanjiAtLevel(apiKey, level) {
     return subjects[Math.floor(Math.random() * subjects.length)];
 }
 
+async function getReviewsSince(apiKey, isoDate) {
+    return fetchAllPages(`/reviews?updated_after=${encodeURIComponent(isoDate)}`, apiKey);
+}
+
+async function getSubjectsByIds(apiKey, ids) {
+    if (!ids.length) return [];
+    const collected = [];
+    const chunkSize = 100;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize);
+        const items = await fetchAllPages(`/subjects?ids=${chunk.join(',')}`, apiKey);
+        collected.push(...items);
+    }
+    return collected;
+}
+
+async function getLevelProgress(apiKey, level) {
+    const [kanji, radicals] = await Promise.all([
+        fetchAllPages(`/assignments?levels=${level}&subject_types=kanji&hidden=false`, apiKey),
+        fetchAllPages(`/assignments?levels=${level}&subject_types=radical&hidden=false`, apiKey),
+    ]);
+    const tally = (list) => {
+        const total = list.length;
+        const passed = list.filter(a => a.data.passed_at !== null).length;
+        return {
+            total,
+            passed,
+            percent: total > 0 ? Math.round((passed / total) * 100) : 0,
+        };
+    };
+    return {
+        kanji: tally(kanji),
+        radicals: tally(radicals),
+        threshold: 90,
+    };
+}
+
 module.exports = {
     wkFetch,
     fetchAllPages,
@@ -131,4 +168,7 @@ module.exports = {
     getLessonsCompletedSince,
     getBurnedCount,
     getRandomKanjiAtLevel,
+    getReviewsSince,
+    getSubjectsByIds,
+    getLevelProgress,
 };

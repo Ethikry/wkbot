@@ -108,7 +108,7 @@ function summaryEmbed(title, description, summaries) {
             const next24Excl = Math.max(0, s.dueNext24Hours - s.dueRightNow);
             embed.addFields({
                 name: s.username,
-                value: `Lvl **${s.level}** • Lessons **${s.pendingLessons}** • Now **${s.dueRightNow}** • Next 24h **${next24Excl}**`,
+                value: `Lvl **${s.level}** • Lessons **${s.pendingLessons}** • Now **${s.dueRightNow}** • Next 24h **+${next24Excl}**`,
                 inline: false,
             });
         }
@@ -118,27 +118,53 @@ function summaryEmbed(title, description, summaries) {
 
 async function appendGoalProgress(guildId, guild, embed) {
     const goals = await db.all(
-        `SELECT user_id, daily_lessons, daily_reviews FROM goals WHERE guild_id = ?`,
+        `SELECT user_id, daily_lessons, daily_reviews, daily_all FROM goals WHERE guild_id = ?`,
         [guildId]
     );
     const today = utcDateStr();
+    const now = Date.now();
+    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
     const lines = [];
+
     for (const g of goals) {
-        if ((g.daily_lessons || 0) === 0 && (g.daily_reviews || 0) === 0) continue;
+        const hasLesson = (g.daily_lessons || 0) > 0;
+        const hasReview = (g.daily_reviews || 0) > 0;
+        const hasAll = g.daily_all === 1;
+        if (!hasLesson && !hasReview && !hasAll) continue;
+
         const member = await guild.members.fetch(g.user_id).catch(() => null);
         if (!member) continue;
         const name = member.nickname || member.user.username;
+
         const snap = await db.get(
             `SELECT reviews_completed, lessons_completed FROM daily_snapshots WHERE user_id = ? AND guild_id = ? AND date = ?`,
             [g.user_id, guildId, today]
         );
         const r = snap?.reviews_completed ?? 0;
         const l = snap?.lessons_completed ?? 0;
-        const rOk = (g.daily_reviews || 0) === 0 || r >= g.daily_reviews;
-        const lOk = (g.daily_lessons || 0) === 0 || l >= g.daily_lessons;
-        const icon = rOk && lOk ? '✅' : '⏳';
-        lines.push(`${icon} **${name}** — ${l}/${g.daily_lessons || 0} lessons · ${r}/${g.daily_reviews || 0} reviews`);
+        const lOk = !hasLesson || l >= g.daily_lessons;
+        const rOk = !hasReview || r >= g.daily_reviews;
+
+        let allOk = true;
+        if (hasAll) {
+            const state = await db.get(
+                `SELECT last_zero_due_at FROM user_state WHERE user_id = ? AND guild_id = ?`,
+                [g.user_id, guildId]
+            );
+            const zeroRecent = !!state?.last_zero_due_at &&
+                (now - new Date(state.last_zero_due_at).getTime()) <= TWENTY_FOUR_HOURS;
+            allOk = r > 0 && zeroRecent;
+        }
+
+        const icon = lOk && rOk && allOk ? '✅' : '⏳';
+        const parts = [];
+        if (hasLesson) parts.push(`${l}/${g.daily_lessons} lessons`);
+        if (hasReview) parts.push(`${r}/${g.daily_reviews} reviews`);
+        if (hasAll) parts.push(`queue ${allOk ? 'cleared 🧹' : 'pending'}`);
+
+        lines.push(`${icon} **${name}** — ${parts.join(' · ')}`);
     }
+
     if (lines.length) {
         embed.addFields({ name: '🎯 Goal Progress', value: lines.join('\n') });
     }
@@ -283,36 +309,42 @@ async function hourlyMilestoneJob(client) {
     for (const guild of client.guilds.cache.values()) {
         try {
             const settings = await getOrCreateSettings(guild.id);
-            if (!settings.level_up_announcements && !settings.burn_celebrations) continue;
-
             const channel = await resolveOutputChannel(guild, settings);
-            if (!channel) continue;
 
             const rows = await db.all(
                 `SELECT user_id, api_key FROM apikeys WHERE guild_id = ?`,
                 [guild.id]
             );
+
             for (const row of rows) {
                 try {
                     const apiKey = decrypt(row.api_key);
-                    const userJson = await wkFetch('/user', apiKey);
-                    const level = userJson.data.level;
-                    const burned = settings.burn_celebrations ? await getBurnedCount(apiKey) : null;
+                    const data = await getWaniKaniData(apiKey);
+                    const level = data.userData.level;
+                    const dueRightNow = data.dueRightNow;
+                    const burned = settings.burn_celebrations
+                        ? await getBurnedCount(apiKey).catch(() => null)
+                        : null;
 
                     const state = await db.get(
-                        `SELECT last_known_level, last_known_burned FROM user_state WHERE user_id = ? AND guild_id = ?`,
+                        `SELECT last_known_level, last_known_burned, last_zero_due_at
+                         FROM user_state WHERE user_id = ? AND guild_id = ?`,
                         [row.user_id, guild.id]
                     );
 
+                    const zeroDueAt = dueRightNow === 0 ? new Date().toISOString() : null;
+
                     if (!state) {
                         await db.run(
-                            `INSERT INTO user_state (user_id, guild_id, last_known_level, last_known_burned) VALUES (?, ?, ?, ?)`,
-                            [row.user_id, guild.id, level, burned]
+                            `INSERT INTO user_state (user_id, guild_id, last_known_level, last_known_burned, last_zero_due_at)
+                             VALUES (?, ?, ?, ?, ?)`,
+                            [row.user_id, guild.id, level, burned, zeroDueAt]
                         );
                         continue;
                     }
 
                     if (
+                        channel &&
                         settings.level_up_announcements &&
                         state.last_known_level !== null &&
                         level > state.last_known_level
@@ -327,6 +359,7 @@ async function hourlyMilestoneJob(client) {
                     }
 
                     if (
+                        channel &&
                         settings.burn_celebrations &&
                         burned !== null &&
                         state.last_known_burned !== null &&
@@ -345,9 +378,10 @@ async function hourlyMilestoneJob(client) {
                     await db.run(
                         `UPDATE user_state
                          SET last_known_level = ?,
-                             last_known_burned = COALESCE(?, last_known_burned)
+                             last_known_burned = COALESCE(?, last_known_burned),
+                             last_zero_due_at = COALESCE(?, last_zero_due_at)
                          WHERE user_id = ? AND guild_id = ?`,
-                        [level, burned, row.user_id, guild.id]
+                        [level, burned, zeroDueAt, row.user_id, guild.id]
                     );
                 } catch (err) {
                     console.error(`[hourly] ${row.user_id}@${guild.id}:`, err.message);

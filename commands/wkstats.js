@@ -1,8 +1,10 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
-const { getWaniKaniData, getSrsBreakdown } = require('../helpers/wanikaniData');
+const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpers/wanikaniData');
 const { decrypt } = require('../helpers/crypto');
-const { base, error } = require('../helpers/embeds');
+const { base, error, renderMonthlyHeatmap, HEATMAP_LEGEND } = require('../helpers/embeds');
 const db = require('../db');
+
+const HEATMAP_DAYS = 30;
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -30,13 +32,23 @@ module.exports = {
 
         try {
             const apiKey = decrypt(row.api_key);
-            const [data, srs] = await Promise.all([
-                getWaniKaniData(apiKey),
-                getSrsBreakdown(apiKey),
-            ]);
-
+            const data = await getWaniKaniData(apiKey);
             const { userData, pendingLessons, dueRightNow, dueNext24Hours } = data;
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
+
+            const [srs, levelProgress, snapshots] = await Promise.all([
+                getSrsBreakdown(apiKey),
+                getLevelProgress(apiKey, userData.level),
+                db.all(
+                    `SELECT date, reviews_completed FROM daily_snapshots
+                     WHERE user_id = ? AND guild_id = ? AND date >= date('now', ?)`,
+                    [userId, guildId, `-${HEATMAP_DAYS - 1} days`]
+                ),
+            ]);
+
+            const snapshotsByDate = new Map(snapshots.map(s => [s.date, s.reviews_completed]));
+            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6);
+            const levelProgressLine = formatLevelProgress(userData.level, levelProgress);
 
             const embed = base(`📊 ${username}'s WaniKani Stats`)
                 .setURL('https://www.wanikani.com/dashboard')
@@ -44,14 +56,15 @@ module.exports = {
                     { name: 'Level', value: `**${userData.level}**`, inline: true },
                     { name: 'Lessons Pending', value: `${pendingLessons}`, inline: true },
                     { name: 'Reviews Due Now', value: `${dueRightNow}`, inline: true },
-                    { name: 'Coming in Next 24h', value: `${next24Excl}`, inline: true },
-                    { name: 'Max Level Granted', value: `${userData.subscription?.max_level_granted ?? 'N/A'}`, inline: true },
+                    { name: 'Coming in Next 24h', value: `+${next24Excl}`, inline: true },
+                    { name: '🔓 Level Progress', value: levelProgressLine, inline: false },
                     { name: '​', value: '**SRS Breakdown**', inline: false },
                     { name: '🌱 Apprentice', value: `${srs.apprentice}`, inline: true },
                     { name: '🌿 Guru', value: `${srs.guru}`, inline: true },
                     { name: '🌳 Master', value: `${srs.master}`, inline: true },
                     { name: '✨ Enlightened', value: `${srs.enlightened}`, inline: true },
                     { name: '🔥 Burned', value: `${srs.burned}`, inline: true },
+                    { name: '📅 Past 30 Days', value: `${heatmap}\n${HEATMAP_LEGEND}`, inline: false },
                 );
 
             if (userData.current_vacation_started_at) {
@@ -67,3 +80,25 @@ module.exports = {
         }
     },
 };
+
+function formatLevelProgress(level, progress) {
+    const k = progress.kanji;
+    const r = progress.radicals;
+    const lines = [];
+
+    if (k.total > 0) {
+        const ready = k.percent >= progress.threshold;
+        lines.push(
+            `Kanji passed: **${k.passed}/${k.total}** (${k.percent}%)` +
+            (ready ? ' — ready to level up! 🎉' : ` — need ${progress.threshold}%`)
+        );
+    } else {
+        lines.push('Kanji passed: *(none unlocked yet at this level)*');
+    }
+
+    if (r.total > 0) {
+        lines.push(`Radicals passed: **${r.passed}/${r.total}** (${r.percent}%)`);
+    }
+
+    return lines.join('\n');
+}
