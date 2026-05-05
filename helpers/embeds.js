@@ -42,11 +42,11 @@ function warn(title, description) {
 }
 
 function bucketEmoji(reviews) {
-    if (reviews === 0) return '⬛';
-    if (reviews < 30) return '🟩';
-    if (reviews < 100) return '🟢';
-    if (reviews < 200) return '🟡';
-    return '🟠';
+    if (reviews < 20) return '🟦';
+    if (reviews < 50) return '🟩';
+    if (reviews < 100) return '🟨';
+    if (reviews < 200) return '🟧';
+    return '🟥';
 }
 
 function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6) {
@@ -66,7 +66,7 @@ function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6) {
     return rows.join('\n');
 }
 
-const HEATMAP_LEGEND = '⬛ none · 🟩 <30 · 🟢 <100 · 🟡 <200 · 🟠 200+';
+const HEATMAP_LEGEND = '🟦 <20 · 🟩 <50 · 🟨 <100 · 🟧 <200 · 🟥 200+';
 
 module.exports = {
     base,

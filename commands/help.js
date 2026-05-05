@@ -44,8 +44,8 @@ module.exports = {
                         '`/config show` — view current settings',
                         '`/config channel` — set output channel or thread',
                         '`/config timezone` `/config modrole`',
-                        '`/config schedule daily | morning | shame | leaderboard`',
-                        '`/config announcements levelups | burns`',
+                        '`/config daily | morning | shame | leaderboard`',
+                        '`/config levelups | burns`',
                     ].join('\n'),
                 },
             );

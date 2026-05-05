@@ -34,7 +34,7 @@ module.exports = {
         .setDescription('Walk through setting a long-term WaniKani goal'),
 
     async execute(interaction) {
-        const apiKey = await getApiKeyForUser(interaction.user.id);
+        const apiKey = await getApiKeyForUser(interaction.user.id, interaction.guildId);
         if (!apiKey) {
             return interaction.reply({
                 embeds: [error(
@@ -112,18 +112,32 @@ async function handleInitModal(interaction) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
-        const apiKey = await getApiKeyForUser(interaction.user.id);
+        const apiKey = await getApiKeyForUser(interaction.user.id, interaction.guildId);
         if (!apiKey) {
             return interaction.editReply({
                 embeds: [error('No API Key', 'Set up the bot in a server first with `/setup`.')],
             });
         }
 
-        const [wkData, hitRateData, personalPace] = await Promise.all([
-            getWaniKaniData(apiKey),
-            getHitRate(apiKey, 30).catch(() => null),
-            getPersonalPace(apiKey).catch(() => null),
-        ]);
+        let wkData, hitRateData, personalPace;
+        try {
+            [wkData, hitRateData, personalPace] = await Promise.all([
+                getWaniKaniData(apiKey),
+                getHitRate(apiKey, 30).catch(() => null),
+                getPersonalPace(apiKey).catch(() => null),
+            ]);
+        } catch (apiErr) {
+            console.error('[set_goal m_init] WK fetch:', apiErr);
+            if (apiErr.message?.includes('401') || apiErr.message?.includes('403')) {
+                return interaction.editReply({
+                    embeds: [error(
+                        'API Key Rejected',
+                        'WaniKani rejected your stored token. It may have been revoked. Re-run `/setup apikey:<token>` in a server to refresh it.'
+                    )],
+                });
+            }
+            throw apiErr;
+        }
 
         const currentLevel = wkData.userData.level;
         if (targetLevel <= currentLevel) {

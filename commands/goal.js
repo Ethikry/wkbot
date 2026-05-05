@@ -43,7 +43,7 @@ async function showGoal(interaction) {
     let currentLevel = null;
     let liveProjection = null;
     try {
-        const apiKey = await getApiKeyForUser(userId);
+        const apiKey = await getApiKeyForUser(userId, interaction.guildId);
         if (apiKey) {
             const data = await getWaniKaniData(apiKey);
             currentLevel = data.userData.level;

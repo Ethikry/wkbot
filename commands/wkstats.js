@@ -45,7 +45,7 @@ module.exports = {
                 getSrsBreakdown(apiKey),
                 getLevelProgress(apiKey, userData.level),
                 db.all(
-                    `SELECT date, reviews_completed FROM daily_snapshots
+                    `SELECT date, reviews_completed, lessons_completed FROM daily_snapshots
                      WHERE user_id = ? AND guild_id = ? AND date >= date('now', ?)`,
                     [userId, guildId, `-${HEATMAP_DAYS - 1} days`]
                 ),
@@ -53,6 +53,8 @@ module.exports = {
 
             const snapshotsByDate = new Map(snapshots.map(s => [s.date, s.reviews_completed]));
             const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6);
+            const totalReviews = snapshots.reduce((acc, s) => acc + (s.reviews_completed || 0), 0);
+            const totalLessons = snapshots.reduce((acc, s) => acc + (s.lessons_completed || 0), 0);
             const levelProgressLine = formatLevelProgress(userData.level, levelProgress);
 
             const embed = base(`📊 ${username}'s WaniKani Stats`)
@@ -69,7 +71,15 @@ module.exports = {
                     { name: '🌳 Master', value: `${srs.master}`, inline: true },
                     { name: '✨ Enlightened', value: `${srs.enlightened}`, inline: true },
                     { name: '🔥 Burned', value: `${srs.burned}`, inline: true },
-                    { name: '📅 Past 30 Days', value: `${heatmap}\n${HEATMAP_LEGEND}`, inline: false },
+                    {
+                        name: '📅 Past 30 Days',
+                        value: [
+                            heatmap,
+                            HEATMAP_LEGEND,
+                            `**${totalReviews}** reviews · **${totalLessons}** lessons`,
+                        ].join('\n'),
+                        inline: false,
+                    },
                 );
 
             if (userData.current_vacation_started_at) {
