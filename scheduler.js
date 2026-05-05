@@ -10,9 +10,10 @@ const {
     getBurnedCount,
 } = require('./helpers/wanikaniData');
 const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, FOOTER } = require('./helpers/embeds');
+const { recordPoll, evaluateAllGoal } = require('./helpers/zerostate');
 
 const guildJobs = new Map();
-let hourlyJob = null;
+let pollJob = null;
 
 function clearGuildJobs(guildId) {
     const jobs = guildJobs.get(guildId);
@@ -69,6 +70,9 @@ async function fetchUserSummaries(guild, rows) {
         try {
             const apiKey = decrypt(row.api_key);
             const data = await getWaniKaniData(apiKey);
+            await recordPoll(row.user_id, guild.id, data.dueRightNow).catch(err =>
+                console.error(`[recordPoll] ${row.user_id}@${guild.id}:`, err.message)
+            );
             return {
                 userId: row.user_id,
                 username,
@@ -122,8 +126,6 @@ async function appendGoalProgress(guildId, guild, embed) {
         [guildId]
     );
     const today = utcDateStr();
-    const now = Date.now();
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
     const lines = [];
 
     for (const g of goals) {
@@ -146,27 +148,35 @@ async function appendGoalProgress(guildId, guild, embed) {
         const rOk = !hasReview || r >= g.daily_reviews;
 
         let allOk = true;
+        let allLabel = null;
         if (hasAll) {
-            const state = await db.get(
-                `SELECT last_zero_due_at FROM user_state WHERE user_id = ? AND guild_id = ?`,
-                [g.user_id, guildId]
-            );
-            const zeroRecent = !!state?.last_zero_due_at &&
-                (now - new Date(state.last_zero_due_at).getTime()) <= TWENTY_FOUR_HOURS;
-            allOk = r > 0 && zeroRecent;
+            const result = await evaluateAllGoal(g.user_id, guildId, r);
+            allOk = result.ok;
+            allLabel = formatAllGoalLabel(result);
         }
 
         const icon = lOk && rOk && allOk ? '✅' : '⏳';
         const parts = [];
         if (hasLesson) parts.push(`${l}/${g.daily_lessons} lessons`);
         if (hasReview) parts.push(`${r}/${g.daily_reviews} reviews`);
-        if (hasAll) parts.push(`queue ${allOk ? 'cleared 🧹' : 'pending'}`);
+        if (allLabel) parts.push(allLabel);
 
         lines.push(`${icon} **${name}** — ${parts.join(' · ')}`);
     }
 
     if (lines.length) {
         embed.addFields({ name: '🎯 Goal Progress', value: lines.join('\n') });
+    }
+}
+
+function formatAllGoalLabel(result) {
+    switch (result.reason) {
+        case 'cleared': return 'queue cleared 🧹';
+        case 'kept_up': return 'queue kept up 📈';
+        case 'no_reviews': return 'queue pending';
+        case 'queue_grew': return 'queue grew 📉';
+        case 'insufficient_history': return 'queue tracking…';
+        default: return 'queue pending';
     }
 }
 
@@ -238,6 +248,9 @@ async function shameJob(client, guildId) {
         try {
             const apiKey = decrypt(row.api_key);
             const data = await getWaniKaniData(apiKey);
+            await recordPoll(row.user_id, guild.id, data.dueRightNow).catch(err =>
+                console.error(`[recordPoll/shame] ${row.user_id}@${guild.id}:`, err.message)
+            );
             if (data.userData.current_vacation_started_at) return null;
             if (data.dueRightNow > 0) return { userId: row.user_id, due: data.dueRightNow };
             return null;
@@ -305,7 +318,7 @@ async function leaderboardJob(client, guildId) {
     await channel.send({ embeds: [embed] });
 }
 
-async function hourlyMilestoneJob(client) {
+async function pollUsersJob(client) {
     for (const guild of client.guilds.cache.values()) {
         try {
             const settings = await getOrCreateSettings(guild.id);
@@ -326,19 +339,22 @@ async function hourlyMilestoneJob(client) {
                         ? await getBurnedCount(apiKey).catch(() => null)
                         : null;
 
+                    await recordPoll(row.user_id, guild.id, dueRightNow);
+
                     const state = await db.get(
-                        `SELECT last_known_level, last_known_burned, last_zero_due_at
+                        `SELECT last_known_level, last_known_burned
                          FROM user_state WHERE user_id = ? AND guild_id = ?`,
                         [row.user_id, guild.id]
                     );
 
-                    const zeroDueAt = dueRightNow === 0 ? new Date().toISOString() : null;
-
                     if (!state) {
                         await db.run(
-                            `INSERT INTO user_state (user_id, guild_id, last_known_level, last_known_burned, last_zero_due_at)
-                             VALUES (?, ?, ?, ?, ?)`,
-                            [row.user_id, guild.id, level, burned, zeroDueAt]
+                            `INSERT INTO user_state (user_id, guild_id, last_known_level, last_known_burned)
+                             VALUES (?, ?, ?, ?)
+                             ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                                 last_known_level = excluded.last_known_level,
+                                 last_known_burned = excluded.last_known_burned`,
+                            [row.user_id, guild.id, level, burned]
                         );
                         continue;
                     }
@@ -378,17 +394,16 @@ async function hourlyMilestoneJob(client) {
                     await db.run(
                         `UPDATE user_state
                          SET last_known_level = ?,
-                             last_known_burned = COALESCE(?, last_known_burned),
-                             last_zero_due_at = COALESCE(?, last_zero_due_at)
+                             last_known_burned = COALESCE(?, last_known_burned)
                          WHERE user_id = ? AND guild_id = ?`,
-                        [level, burned, zeroDueAt, row.user_id, guild.id]
+                        [level, burned, row.user_id, guild.id]
                     );
                 } catch (err) {
-                    console.error(`[hourly] ${row.user_id}@${guild.id}:`, err.message);
+                    console.error(`[poll] ${row.user_id}@${guild.id}:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[hourly] guild loop:', err);
+            console.error('[poll] guild loop:', err);
         }
     }
 }
@@ -510,10 +525,10 @@ async function scheduleAll(client) {
             console.error(`[scheduleAll] guild=${guild.id}:`, err);
         }
     }
-    if (!hourlyJob) {
-        hourlyJob = cron.schedule(
-            '0 * * * *',
-            () => hourlyMilestoneJob(client).catch(err => console.error('[hourlyMilestoneJob]', err)),
+    if (!pollJob) {
+        pollJob = cron.schedule(
+            '*/15 * * * *',
+            () => pollUsersJob(client).catch(err => console.error('[pollUsersJob]', err)),
             { timezone: 'UTC' }
         );
     }
@@ -527,5 +542,5 @@ module.exports = {
     morningJob,
     shameJob,
     leaderboardJob,
-    hourlyMilestoneJob,
+    pollUsersJob,
 };
