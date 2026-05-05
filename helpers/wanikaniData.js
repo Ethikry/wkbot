@@ -1,5 +1,3 @@
-const fetch = require('node-fetch');
-
 const BASE = 'https://api.wanikani.com/v2';
 
 async function wkFetch(pathOrUrl, apiKey, { timeoutMs = 10000, retries = 1 } = {}) {

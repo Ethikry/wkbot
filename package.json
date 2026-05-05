@@ -22,7 +22,6 @@
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "node-cron": "^4.2.1",
-    "node-fetch": "^2.7.0",
     "sqlite3": "^5.1.7"
   }
 }

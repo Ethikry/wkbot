@@ -1,5 +1,3 @@
-const fetch = require('node-fetch');
-
 const KEY_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isApiKeyFormatValid(apiKey) {
