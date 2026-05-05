@@ -15,11 +15,20 @@ module.exports = {
                     value: [
                         '`/setup` — register your read-only WaniKani API token, toggle daily pings',
                         '`/wkstats` — level progress, lessons, reviews, SRS breakdown, 30-day heatmap',
-                        '`/streak` — your current and longest review streak',
-                        '`/goal` — set lessons / reviews / "clear queue" daily targets',
+                        '`/streak` — current and longest review streak',
+                        '`/daily_goal` — set lessons / reviews / "clear queue" daily targets (auto-set if `/goal` is in place)',
                         '`/mistakes` — your missed reviews from the past 7 days (answers in spoilers)',
                         '`/vacation` — sync ping setting with WK vacation status',
                         '`/forget` — delete all your data in this server',
+                    ].join('\n'),
+                },
+                {
+                    name: '🎯 Long-term Goal (works in DMs)',
+                    value: [
+                        '`/set_goal` — interactive wizard to plan your level-up pace',
+                        '`/goal show` — current goal + on-pace status',
+                        '`/goal alerts` — opt in to DM pings (daily pace, reviews piling up)',
+                        '`/goal clear` — remove your goal',
                     ].join('\n'),
                 },
                 {

@@ -89,6 +89,24 @@ async function runMigrations({ get, all, run }) {
 
     await run(`CREATE INDEX IF NOT EXISTS idx_queue_history_lookup
         ON queue_history(user_id, guild_id, recorded_at)`);
+
+    await run(`CREATE TABLE IF NOT EXISTS long_goals (
+        user_id TEXT PRIMARY KEY,
+        target_level INTEGER NOT NULL,
+        deadline TEXT NOT NULL,
+        pace_mode TEXT,
+        days_per_level REAL NOT NULL,
+        items_per_level INTEGER NOT NULL,
+        daily_lessons INTEGER NOT NULL,
+        daily_reviews INTEGER NOT NULL,
+        hit_rate REAL,
+        notify_pace_daily INTEGER NOT NULL DEFAULT 0,
+        notify_reviews_available INTEGER NOT NULL DEFAULT 0,
+        notify_review_threshold INTEGER NOT NULL DEFAULT 50,
+        last_pace_alert_at TEXT,
+        last_review_alert_at TEXT,
+        created_at TEXT NOT NULL
+    )`);
 }
 
 module.exports = { runMigrations };

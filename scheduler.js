@@ -14,6 +14,10 @@ const { recordPoll, evaluateAllGoal } = require('./helpers/zerostate');
 
 const guildJobs = new Map();
 let pollJob = null;
+let paceAlertJobHandle = null;
+
+const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+const TWENTY_HOURS_MS = 20 * 60 * 60 * 1000;
 
 function clearGuildJobs(guildId) {
     const jobs = guildJobs.get(guildId);
@@ -121,14 +125,24 @@ function summaryEmbed(title, description, summaries) {
 }
 
 async function appendGoalProgress(guildId, guild, embed) {
-    const goals = await db.all(
-        `SELECT user_id, daily_lessons, daily_reviews, daily_all FROM goals WHERE guild_id = ?`,
+    const rows = await db.all(
+        `SELECT
+             ak.user_id,
+             COALESCE(g.daily_lessons, lg.daily_lessons, 0) AS daily_lessons,
+             COALESCE(g.daily_reviews, lg.daily_reviews, 0) AS daily_reviews,
+             COALESCE(g.daily_all, 0) AS daily_all,
+             CASE WHEN g.user_id IS NOT NULL THEN 'local' ELSE 'long' END AS source
+         FROM apikeys ak
+         LEFT JOIN goals g ON g.user_id = ak.user_id AND g.guild_id = ak.guild_id
+         LEFT JOIN long_goals lg ON lg.user_id = ak.user_id
+         WHERE ak.guild_id = ?
+           AND (g.user_id IS NOT NULL OR lg.user_id IS NOT NULL)`,
         [guildId]
     );
     const today = utcDateStr();
     const lines = [];
 
-    for (const g of goals) {
+    for (const g of rows) {
         const hasLesson = (g.daily_lessons || 0) > 0;
         const hasReview = (g.daily_reviews || 0) > 0;
         const hasAll = g.daily_all === 1;
@@ -156,12 +170,13 @@ async function appendGoalProgress(guildId, guild, embed) {
         }
 
         const icon = lOk && rOk && allOk ? '✅' : '⏳';
+        const sourceTag = g.source === 'long' ? ' 🎯' : '';
         const parts = [];
         if (hasLesson) parts.push(`${l}/${g.daily_lessons} lessons`);
         if (hasReview) parts.push(`${r}/${g.daily_reviews} reviews`);
         if (allLabel) parts.push(allLabel);
 
-        lines.push(`${icon} **${name}** — ${parts.join(' · ')}`);
+        lines.push(`${icon} **${name}**${sourceTag} — ${parts.join(' · ')}`);
     }
 
     if (lines.length) {
@@ -398,12 +413,118 @@ async function pollUsersJob(client) {
                          WHERE user_id = ? AND guild_id = ?`,
                         [level, burned, row.user_id, guild.id]
                     );
+
+                    await maybeSendReviewsAvailableDM(client, row.user_id, dueRightNow);
                 } catch (err) {
                     console.error(`[poll] ${row.user_id}@${guild.id}:`, err.message);
                 }
             }
         } catch (err) {
             console.error('[poll] guild loop:', err);
+        }
+    }
+}
+
+async function maybeSendReviewsAvailableDM(client, userId, dueRightNow) {
+    if (dueRightNow <= 0) return;
+    const goal = await db.get(
+        `SELECT notify_reviews_available, notify_review_threshold, last_review_alert_at, target_level, deadline
+         FROM long_goals WHERE user_id = ?`,
+        [userId]
+    );
+    if (!goal || goal.notify_reviews_available !== 1) return;
+    if (dueRightNow < goal.notify_review_threshold) return;
+    if (goal.last_review_alert_at) {
+        const ageMs = Date.now() - new Date(goal.last_review_alert_at).getTime();
+        if (ageMs >= 0 && ageMs < FOUR_HOURS_MS) return;
+    }
+
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) return;
+
+    const embed = new EmbedBuilder()
+        .setColor(COLOR_PRIMARY)
+        .setTitle('📚 Reviews piling up')
+        .setDescription([
+            `You have **${dueRightNow}** reviews due (your alert threshold is ${goal.notify_review_threshold}).`,
+            `Goal: level ${goal.target_level} by ${goal.deadline}.`,
+            '',
+            'Disable with `/goal alerts reviews_available:false`.',
+        ].join('\n'))
+        .setTimestamp()
+        .setFooter(FOOTER);
+
+    try {
+        await user.send({ embeds: [embed] });
+        await db.run(
+            `UPDATE long_goals SET last_review_alert_at = ? WHERE user_id = ?`,
+            [new Date().toISOString(), userId]
+        );
+    } catch (err) {
+        console.warn(`[reviewDM] ${userId}: ${err.message}`);
+    }
+}
+
+async function paceAlertJob(client) {
+    const goals = await db.all(`SELECT * FROM long_goals WHERE notify_pace_daily = 1`);
+    const today = utcDateStr();
+
+    for (const goal of goals) {
+        try {
+            if (goal.last_pace_alert_at) {
+                const ageMs = Date.now() - new Date(goal.last_pace_alert_at).getTime();
+                if (ageMs >= 0 && ageMs < TWENTY_HOURS_MS) continue;
+            }
+
+            const apikeyRows = await db.all(
+                `SELECT guild_id FROM apikeys WHERE user_id = ?`,
+                [goal.user_id]
+            );
+            if (apikeyRows.length === 0) continue;
+
+            let lessonsToday = 0;
+            for (const r of apikeyRows) {
+                const snap = await db.get(
+                    `SELECT lessons_completed FROM daily_snapshots WHERE user_id = ? AND guild_id = ? AND date = ?`,
+                    [goal.user_id, r.guild_id, today]
+                );
+                if (snap?.lessons_completed > lessonsToday) {
+                    lessonsToday = snap.lessons_completed;
+                }
+            }
+
+            const target = goal.daily_lessons || 0;
+            if (target === 0) continue;
+            const ratio = lessonsToday / target;
+            if (ratio >= 0.5) continue;
+
+            const user = await client.users.fetch(goal.user_id).catch(() => null);
+            if (!user) continue;
+
+            const embed = new EmbedBuilder()
+                .setColor(COLOR_WARN)
+                .setTitle('⏳ Behind pace today')
+                .setDescription([
+                    `You've done **${lessonsToday}/${target}** lessons today.`,
+                    `Goal: level **${goal.target_level}** by **${goal.deadline}** (~${goal.days_per_level.toFixed(1)} days/level).`,
+                    'Try to log a session today to stay on track.',
+                    '',
+                    'Disable with `/goal alerts pace_daily:false`.',
+                ].join('\n'))
+                .setTimestamp()
+                .setFooter(FOOTER);
+
+            try {
+                await user.send({ embeds: [embed] });
+                await db.run(
+                    `UPDATE long_goals SET last_pace_alert_at = ? WHERE user_id = ?`,
+                    [new Date().toISOString(), goal.user_id]
+                );
+            } catch (err) {
+                console.warn(`[paceDM] ${goal.user_id}: ${err.message}`);
+            }
+        } catch (err) {
+            console.error(`[paceAlert] ${goal.user_id}:`, err.message);
         }
     }
 }
@@ -532,6 +653,13 @@ async function scheduleAll(client) {
             { timezone: 'UTC' }
         );
     }
+    if (!paceAlertJobHandle) {
+        paceAlertJobHandle = cron.schedule(
+            '0 22 * * *',
+            () => paceAlertJob(client).catch(err => console.error('[paceAlertJob]', err)),
+            { timezone: 'UTC' }
+        );
+    }
 }
 
 module.exports = {
@@ -543,4 +671,5 @@ module.exports = {
     shameJob,
     leaderboardJob,
     pollUsersJob,
+    paceAlertJob,
 };
