@@ -50,16 +50,43 @@ async function main() {
         }
     });
 
-    client.on(Events.InteractionCreate, async (interaction) => {
-        if (!interaction.isChatInputCommand()) return;
+    const findHandlerForCustomId = (customId, kind) => {
+        if (!customId) return null;
+        for (const cmd of client.commands.values()) {
+            if (typeof cmd.isOurId === 'function' && cmd.isOurId(customId)) {
+                return cmd[kind] ? { command: cmd, handler: cmd[kind] } : null;
+            }
+        }
+        return null;
+    };
 
-        const command = client.commands.get(interaction.commandName);
-        if (!command) return;
-
+    const handleInteraction = async (interaction) => {
         try {
-            await command.execute(interaction, client);
+            if (interaction.isChatInputCommand()) {
+                const command = client.commands.get(interaction.commandName);
+                if (!command) return;
+                await command.execute(interaction, client);
+                return;
+            }
+            if (interaction.isButton()) {
+                const found = findHandlerForCustomId(interaction.customId, 'handleButton');
+                if (!found) return;
+                await found.handler.call(found.command, interaction, client);
+                return;
+            }
+            if (interaction.isModalSubmit()) {
+                const found = findHandlerForCustomId(interaction.customId, 'handleModal');
+                if (!found) return;
+                await found.handler.call(found.command, interaction, client);
+                return;
+            }
         } catch (err) {
-            console.error(`[interaction] /${interaction.commandName}:`, err);
+            const label = interaction.isChatInputCommand?.()
+                ? `/${interaction.commandName}`
+                : interaction.customId
+                    ? `[component ${interaction.customId}]`
+                    : '[unknown interaction]';
+            console.error(`[interaction] ${label}:`, err);
             const payload = {
                 embeds: [errorEmbed('Command Failed', 'Something went wrong while running that command.')],
                 flags: MessageFlags.Ephemeral,
@@ -67,14 +94,16 @@ async function main() {
             try {
                 if (interaction.deferred || interaction.replied) {
                     await interaction.followUp(payload);
-                } else {
+                } else if (interaction.isRepliable?.()) {
                     await interaction.reply(payload);
                 }
             } catch (replyErr) {
                 console.error('[interaction] failed to send error reply:', replyErr.message);
             }
         }
-    });
+    };
+
+    client.on(Events.InteractionCreate, handleInteraction);
 
     startHealthServer({
         getStatus: () => ({

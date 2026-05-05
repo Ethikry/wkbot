@@ -159,6 +159,43 @@ async function getLevelProgress(apiKey, level) {
     };
 }
 
+async function getHitRate(apiKey, days = 30) {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    const reviews = await fetchAllPages(
+        `/reviews?updated_after=${encodeURIComponent(since.toISOString())}`,
+        apiKey
+    );
+    if (reviews.length === 0) return null;
+    const allCorrect = reviews.filter(r =>
+        (r.data.incorrect_meaning_answers || 0) === 0 &&
+        (r.data.incorrect_reading_answers || 0) === 0
+    ).length;
+    return {
+        hitRate: allCorrect / reviews.length,
+        sampleSize: reviews.length,
+        windowDays: days,
+    };
+}
+
+async function getLevelProgressions(apiKey) {
+    return fetchAllPages('/level_progressions', apiKey);
+}
+
+async function getPersonalPace(apiKey) {
+    const progressions = await getLevelProgressions(apiKey);
+    const completed = progressions
+        .filter(p => p.data.passed_at !== null && p.data.started_at !== null)
+        .sort((a, b) => new Date(b.data.passed_at) - new Date(a.data.passed_at))
+        .slice(0, 5);
+    if (completed.length === 0) return null;
+    const days = completed.map(p =>
+        (new Date(p.data.passed_at) - new Date(p.data.started_at)) / (1000 * 60 * 60 * 24)
+    );
+    const avg = days.reduce((a, b) => a + b, 0) / days.length;
+    return { daysPerLevel: avg, sampleSize: completed.length };
+}
+
 module.exports = {
     wkFetch,
     fetchAllPages,
@@ -171,4 +208,7 @@ module.exports = {
     getReviewsSince,
     getSubjectsByIds,
     getLevelProgress,
+    getHitRate,
+    getLevelProgressions,
+    getPersonalPace,
 };
