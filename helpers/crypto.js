@@ -17,6 +17,9 @@ function getKey() {
 function warnIfMissing() {
     if (warned) return;
     if (!process.env.ENCRYPTION_KEY) {
+        if (process.env.NODE_ENV === 'production') {
+            throw new Error('ENCRYPTION_KEY must be set when NODE_ENV=production. Generate with: openssl rand -hex 32');
+        }
         console.warn('[crypto] ENCRYPTION_KEY not set — API keys are stored in plaintext. Set it for at-rest encryption.');
         warned = true;
     }

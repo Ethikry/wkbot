@@ -57,6 +57,9 @@ async function init() {
     await new Promise((resolve, reject) => {
         dbInstance.run('PRAGMA foreign_keys = ON;', (err) => err ? reject(err) : resolve());
     });
+    await new Promise((resolve, reject) => {
+        dbInstance.run('PRAGMA busy_timeout = 5000;', (err) => err ? reject(err) : resolve());
+    });
     await runMigrations({ get, all, run });
 }
 

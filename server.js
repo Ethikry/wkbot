@@ -2,6 +2,7 @@ const express = require('express');
 
 function startHealthServer({ getStatus } = {}) {
     const port = Number(process.env.HEALTH_PORT) || 3000;
+    const host = process.env.HEALTH_HOST || '127.0.0.1';
     const app = express();
     const startedAt = Date.now();
 
@@ -17,8 +18,8 @@ function startHealthServer({ getStatus } = {}) {
 
     app.get('/', (_req, res) => res.redirect('/health'));
 
-    const server = app.listen(port, () => {
-        console.log(`Health endpoint listening on :${port}/health`);
+    const server = app.listen(port, host, () => {
+        console.log(`Health endpoint listening on ${host}:${port}/health`);
     });
 
     server.on('error', (err) => {
