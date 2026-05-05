@@ -2,6 +2,7 @@ const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpers/wanikaniData');
 const { decrypt } = require('../helpers/crypto');
 const { base, error, renderMonthlyHeatmap, HEATMAP_LEGEND } = require('../helpers/embeds');
+const { recordPoll } = require('../helpers/zerostate');
 const db = require('../db');
 
 const HEATMAP_DAYS = 30;
@@ -35,6 +36,10 @@ module.exports = {
             const data = await getWaniKaniData(apiKey);
             const { userData, pendingLessons, dueRightNow, dueNext24Hours } = data;
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
+
+            await recordPoll(userId, guildId, dueRightNow).catch(err =>
+                console.error('[wkstats recordPoll]', err.message)
+            );
 
             const [srs, levelProgress, snapshots] = await Promise.all([
                 getSrsBreakdown(apiKey),

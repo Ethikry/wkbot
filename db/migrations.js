@@ -78,6 +78,17 @@ async function runMigrations({ get, all, run }) {
     if (!stateCols.find(c => c.name === 'last_zero_due_at')) {
         await run(`ALTER TABLE user_state ADD COLUMN last_zero_due_at TEXT`);
     }
+
+    await run(`CREATE TABLE IF NOT EXISTS queue_history (
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        queue_size INTEGER NOT NULL,
+        PRIMARY KEY (user_id, guild_id, recorded_at)
+    )`);
+
+    await run(`CREATE INDEX IF NOT EXISTS idx_queue_history_lookup
+        ON queue_history(user_id, guild_id, recorded_at)`);
 }
 
 module.exports = { runMigrations };
