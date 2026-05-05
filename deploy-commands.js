@@ -1,30 +1,41 @@
-require('dotenv').config(); // load .env first
+require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { REST } = require('@discordjs/rest'); // correct package
-const { Routes } = require('discord.js');
+const { REST, Routes } = require('discord.js');
 
-// Load command files
-const commands = [];
-const commandFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'));
-
-for (const file of commandFiles) {
-    const command = require(`./commands/${file}`);
-    commands.push(command.data.toJSON());
+if (!process.env.TOKEN) {
+    console.error('TOKEN is not set.');
+    process.exit(1);
+}
+if (!process.env.CLIENT_ID) {
+    console.error('CLIENT_ID is not set.');
+    process.exit(1);
 }
 
-// Create REST instance and set token
+const commands = [];
+const commandsDir = path.join(__dirname, 'commands');
+for (const file of fs.readdirSync(commandsDir).filter(f => f.endsWith('.js'))) {
+    const cmd = require(path.join(commandsDir, file));
+    if (!cmd?.data) {
+        console.warn(`[deploy] skipping ${file} — no data export`);
+        continue;
+    }
+    commands.push(cmd.data.toJSON());
+}
+
 const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
 
 (async () => {
     try {
-        console.log('Deploying slash commands...');
-        await rest.put(
-            Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-            { body: commands }
-        );
-        console.log('Slash commands deployed successfully!');
+        const route = process.env.GUILD_ID
+            ? Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID)
+            : Routes.applicationCommands(process.env.CLIENT_ID);
+        const target = process.env.GUILD_ID ? `guild ${process.env.GUILD_ID}` : 'global';
+        console.log(`Deploying ${commands.length} commands to ${target}...`);
+        await rest.put(route, { body: commands });
+        console.log('Deployed.');
     } catch (err) {
-        console.error('Error deploying commands:', err);
+        console.error('Deploy failed:', err);
+        process.exit(1);
     }
 })();

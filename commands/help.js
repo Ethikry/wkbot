@@ -1,40 +1,47 @@
-const { SlashCommandBuilder, InteractionResponse } = require('discord.js')
-const { EmbedBuilder } = require('discord.js');
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { base } = require('../helpers/embeds');
 
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('help')
-        .setDescription('Information on how to use this bot'),
+        .setDescription('How to use the WaniKani bot'),
 
-        async execute(interaction) {
-            const embed = new EmbedBuilder()
-                .setTitle("WaniKani Bot Info")
-                .setColor("#FF9900")
-                .setDescription("How to set configure your Discord WaniKani experience")
+    async execute(interaction) {
+        const embed = base('WaniKani Bot — Commands')
+            .setDescription('Track your WaniKani progress and study with the rest of the server.')
+            .addFields(
+                {
+                    name: '👤 Personal',
+                    value: [
+                        '`/setup` — register your read-only WaniKani API token, toggle daily pings',
+                        '`/wkstats` — your level, lessons, reviews, and SRS-stage breakdown',
+                        '`/streak` — your current and longest review streak',
+                        '`/goal` — set or view your daily lesson/review targets',
+                        '`/vacation` — sync ping setting with WK vacation status',
+                        '`/forget` — delete all your data in this server',
+                    ].join('\n'),
+                },
+                {
+                    name: '🌐 Shared',
+                    value: [
+                        '`/leaderboard` — past 7 days, ranked by reviews',
+                        '`/kanji` — random kanji from your current level',
+                    ].join('\n'),
+                },
+                {
+                    name: '🛠️ Moderator',
+                    value: [
+                        '`/config show` — view current server settings',
+                        '`/config channel` — set bot output channel',
+                        '`/config daily` `/config morning` `/config shame` — schedule pings',
+                        '`/config leaderboard` — schedule weekly leaderboard',
+                        '`/config timezone` — set IANA timezone for schedules',
+                        '`/config modrole` — set the role allowed to run `/config`',
+                        '`/config levelups` `/config burns` — toggle milestone announcements',
+                    ].join('\n'),
+                },
+            );
 
-            embed.addFields({
-                name: "/help",
-                value: `Pulls up the help menu`,
-                inline: false
-            })
-
-            embed.addFields({
-                name: "/setup",
-                value: `**Setting your Wanikani API key**: You can find this on wanikani.com, please provide a read only key for the bot\n**Ping Status**: By default you will be pinged with daily stats, if you would like to disable this please set it to false`,
-                inline: false
-            })
-
-            embed.addFields({
-                name: "/wkstats",
-                value: `Pulls the stats of the user who called it\nProvides level, reviews due now, reviews due within 24 hours and the amount of pending lessons`,
-                inline: false
-            })
-
-
-            return interaction.reply({
-                    embeds: [embed]
-            })
-        }
-
-
-}
+        return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    },
+};

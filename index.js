@@ -1,102 +1,107 @@
-require('dotenv').config()
-const fs = require('fs')
+require('dotenv').config();
+const fs = require('fs');
 const path = require('path');
-const { scheduleDailyPing } = require('./scheduler');
-const { Client, GatewayIntentBits, Collection } = require('discord.js');
+const { Client, GatewayIntentBits, Collection, Events, MessageFlags } = require('discord.js');
+const db = require('./db');
+const { scheduleAll } = require('./scheduler');
+const { startHealthServer } = require('./server');
+const { warnIfMissing } = require('./helpers/crypto');
+const { error: errorEmbed } = require('./helpers/embeds');
 
-// Database stuff
-const dbPath = path.join(__dirname, 'database.sqlite');
-const sqlite3 = require('sqlite3').verbose()
-const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
-    if (err) {
-        console.error("Failed to open SQLite database:", err.message);
-    } else {
-        console.log("SQLite DB opened successfully");
-
-        db.run("PRAGMA journal_mode = WAL;", (err) => {
-            if (err) {
-                console.error("Failed to set journal mode to WAL:", err.message);
-            } else {
-                console.log("Journal mode set to WAL");
-            }
-        });
+async function main() {
+    if (!process.env.TOKEN) {
+        console.error('TOKEN is not set in environment.');
+        process.exit(1);
     }
-});
 
-
-db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        ping_enabled, INTEGER DEFAULT 1,
-        points INTEGER DEFAULT 0
-    )`, (err) => {
-        if (err) console.error(" Error creating users table:", err.message);
-        else console.log("users table OK");
-    });
-
-    db.run(`CREATE TABLE IF NOT EXISTS apikeys (
-        user_id TEXT NOT NULL,
-        guild_id TEXT NOT NULL,
-        api_key TEXT,
-        ping_enabled INTEGER DEFAULT 1,
-        PRIMARY KEY (user_id, guild_id)
-    )`, (err) => {
-        if (err) console.error("Error creating apikeys table:", err.message);
-        else console.log("apikeys table OK");
-    });
-})
-
-
-// Discord Client stuff
-const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent
-    ]
-  });
-
-// loading commands
-client.commands = new Collection()
-const commandsFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'))
-for (const file of commandsFiles) {
-    const cmd = require(`./commands/${file}`)
-    client.commands.set(cmd.data.name, cmd)
-}
-
-client.once('clientReady', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  scheduleDailyPing(client, db)
-});
-
-client.on('interactionCreate', async interaction => {
-    if(!interaction.isChatInputCommand()) return
-
-    const command = client.commands.get(interaction.commandName)
-    if(!command) return
+    warnIfMissing();
 
     try {
-        await command.execute(interaction, db)
-
+        await db.init();
+        console.log('Database ready');
     } catch (err) {
-        console.error(err)
-        await interaction.reply({
-            content: 'There was an error while executing this command!',
-            ephemeral: true
-        })
+        console.error('Database init failed:', err);
+        process.exit(1);
     }
-    
-})
 
-client.on('messageCreate', (message) => {
-  if (message.author.bot) return;
+    const client = new Client({
+        intents: [GatewayIntentBits.Guilds],
+    });
+
+    client.commands = new Collection();
+    const commandsDir = path.join(__dirname, 'commands');
+    for (const file of fs.readdirSync(commandsDir).filter(f => f.endsWith('.js'))) {
+        const cmd = require(path.join(commandsDir, file));
+        if (!cmd?.data?.name || typeof cmd.execute !== 'function') {
+            console.warn(`[commands] Skipping ${file} — missing data.name or execute()`);
+            continue;
+        }
+        client.commands.set(cmd.data.name, cmd);
+    }
+    console.log(`Loaded ${client.commands.size} commands`);
+
+    client.once(Events.ClientReady, async (readyClient) => {
+        console.log(`Logged in as ${readyClient.user.tag}`);
+        try {
+            await scheduleAll(readyClient);
+            console.log('Schedules initialized');
+        } catch (err) {
+            console.error('Scheduling failed:', err);
+        }
+    });
+
+    client.on(Events.InteractionCreate, async (interaction) => {
+        if (!interaction.isChatInputCommand()) return;
+
+        const command = client.commands.get(interaction.commandName);
+        if (!command) return;
+
+        try {
+            await command.execute(interaction, client);
+        } catch (err) {
+            console.error(`[interaction] /${interaction.commandName}:`, err);
+            const payload = {
+                embeds: [errorEmbed('Command Failed', 'Something went wrong while running that command.')],
+                flags: MessageFlags.Ephemeral,
+            };
+            try {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.followUp(payload);
+                } else {
+                    await interaction.reply(payload);
+                }
+            } catch (replyErr) {
+                console.error('[interaction] failed to send error reply:', replyErr.message);
+            }
+        }
+    });
+
+    startHealthServer({
+        getStatus: () => ({
+            discord: client.isReady() ? 'ready' : 'connecting',
+            guildCount: client.guilds?.cache?.size ?? 0,
+        }),
+    });
+
+    await client.login(process.env.TOKEN);
+
+    let shuttingDown = false;
+    const shutdown = async (signal) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log(`Received ${signal}, shutting down...`);
+        try { client.destroy(); } catch { /* ignore */ }
+        try { await db.close(); } catch { /* ignore */ }
+        process.exit(0);
+    };
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('unhandledRejection', (reason) => {
+        console.error('[unhandledRejection]', reason);
+    });
+}
+
+main().catch(err => {
+    console.error('Fatal:', err);
+    process.exit(1);
 });
-
-client.login(process.env.TOKEN);
-
-process.on('SIGINT', () => {
-    console.log('Closing database connection...')
-    db.close()
-    process.exit()
-})
