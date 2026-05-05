@@ -1,16 +1,18 @@
 {
   "name": "wk-discord",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node deploy-commands.js && node index.js",
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js",
+    "deploy-and-start": "node deploy-commands.js && node index.js",
+    "clear-commands": "node clear-commands.js",
     "dev": "nodemon index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Discord bot for tracking WaniKani progress, streaks, and leaderboards.",
   "devDependencies": {
     "nodemon": "^3.1.11"
   },
