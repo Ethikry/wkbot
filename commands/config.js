@@ -50,7 +50,6 @@ module.exports = {
         .setName('config')
         .setDescription('Configure server-wide WaniKani bot settings (mods only)')
         .setDMPermission(false)
-        // Top-level subcommands
         .addSubcommand(s =>
             s.setName('show').setDescription('Show current settings'))
         .addSubcommand(s =>
@@ -70,68 +69,57 @@ module.exports = {
             s.setName('modrole')
                 .setDescription('Set the role allowed to run /config')
                 .addRoleOption(o => o.setName('role').setDescription('Mod role').setRequired(true)))
-        // Schedule group
-        .addSubcommandGroup(g =>
-            g.setName('schedule')
-                .setDescription('Configure scheduled posts')
-                .addSubcommand(s => s.setName('daily')
-                    .setDescription('Set daily summary time')
-                    .addStringOption(o => o.setName('time')
-                        .setDescription('HH:MM in 24-hour format')
-                        .setRequired(true)))
-                .addSubcommand(s => s.setName('morning')
-                    .setDescription('Toggle morning ping')
-                    .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                    .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
-                .addSubcommand(s => s.setName('shame')
-                    .setDescription('Toggle end-of-day shame mode (pings users with pending reviews)')
-                    .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                    .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
-                .addSubcommand(s => s.setName('leaderboard')
-                    .setDescription('Toggle the weekly auto-leaderboard')
-                    .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                    .addIntegerOption(o => o.setName('day')
-                        .setDescription('Day of week (0=Sun, 6=Sat)')
-                        .setMinValue(0).setMaxValue(6))
-                    .addStringOption(o => o.setName('time').setDescription('HH:MM 24h'))))
-        // Announcements group
-        .addSubcommandGroup(g =>
-            g.setName('announcements')
-                .setDescription('Toggle milestone announcements')
-                .addSubcommand(s => s.setName('levelups')
-                    .setDescription('Toggle level-up announcements')
-                    .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true)))
-                .addSubcommand(s => s.setName('burns')
-                    .setDescription('Toggle burn-celebration announcements')
-                    .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true)))),
+        .addSubcommand(s =>
+            s.setName('daily')
+                .setDescription('Set the daily summary time')
+                .addStringOption(o => o.setName('time')
+                    .setDescription('HH:MM in 24-hour format')
+                    .setRequired(true)))
+        .addSubcommand(s =>
+            s.setName('morning')
+                .setDescription('Toggle the morning ping')
+                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
+                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
+        .addSubcommand(s =>
+            s.setName('shame')
+                .setDescription('Toggle end-of-day shame mode (pings users with pending reviews)')
+                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
+                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
+        .addSubcommand(s =>
+            s.setName('leaderboard')
+                .setDescription('Toggle the weekly auto-leaderboard')
+                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
+                .addIntegerOption(o => o.setName('day')
+                    .setDescription('Day of week (0=Sun, 6=Sat)')
+                    .setMinValue(0).setMaxValue(6))
+                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
+        .addSubcommand(s =>
+            s.setName('levelups')
+                .setDescription('Toggle level-up announcements')
+                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true)))
+        .addSubcommand(s =>
+            s.setName('burns')
+                .setDescription('Toggle burn-celebration announcements')
+                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))),
 
     async execute(interaction, client) {
         if (!(await modGuard(interaction))) return;
 
         const guildId = interaction.guild.id;
         await ensureSettings(guildId);
-        const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand();
 
-        if (!group) {
-            switch (sub) {
-                case 'show': return showSettings(interaction, guildId);
-                case 'channel': return setChannel(interaction, client, guildId);
-                case 'timezone': return setTimezone(interaction, client, guildId);
-                case 'modrole': return setModRole(interaction, guildId);
-            }
-        } else if (group === 'schedule') {
-            switch (sub) {
-                case 'daily': return setDaily(interaction, client, guildId);
-                case 'morning': return setMorning(interaction, client, guildId);
-                case 'shame': return setShame(interaction, client, guildId);
-                case 'leaderboard': return setLeaderboard(interaction, client, guildId);
-            }
-        } else if (group === 'announcements') {
-            switch (sub) {
-                case 'levelups': return setBoolFlag(interaction, guildId, 'level_up_announcements', 'Level-up announcements');
-                case 'burns': return setBoolFlag(interaction, guildId, 'burn_celebrations', 'Burn celebrations');
-            }
+        switch (sub) {
+            case 'show': return showSettings(interaction, guildId);
+            case 'channel': return setChannel(interaction, client, guildId);
+            case 'timezone': return setTimezone(interaction, client, guildId);
+            case 'modrole': return setModRole(interaction, guildId);
+            case 'daily': return setDaily(interaction, client, guildId);
+            case 'morning': return setMorning(interaction, client, guildId);
+            case 'shame': return setShame(interaction, client, guildId);
+            case 'leaderboard': return setLeaderboard(interaction, client, guildId);
+            case 'levelups': return setBoolFlag(interaction, guildId, 'level_up_announcements', 'Level-up announcements');
+            case 'burns': return setBoolFlag(interaction, guildId, 'burn_celebrations', 'Burn celebrations');
         }
     },
 };
