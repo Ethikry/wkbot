@@ -13,7 +13,7 @@ module.exports = {
                 {
                     name: '👤 Personal',
                     value: [
-                        '`/setup` — register your read-only WaniKani API token, toggle daily pings',
+                        '`/setup` — register your read-only WaniKani API token, toggle daily pings + shame',
                         '`/wkstats` — level progress, lessons, reviews, SRS breakdown, 30-day heatmap',
                         '`/streak` — current and longest review streak',
                         '`/daily_goal` — set lessons / reviews / "clear queue" daily targets (auto-set if `/goal` is in place)',
@@ -41,11 +41,12 @@ module.exports = {
                 {
                     name: '🛠️ Moderator — `/config`',
                     value: [
-                        '`/config show` — view current settings',
-                        '`/config channel` — set output channel or thread',
-                        '`/config timezone` `/config modrole`',
-                        '`/config daily | morning | shame | leaderboard`',
-                        '`/config levelups | burns`',
+                        '`/config` (no args) — view current settings',
+                        'Optional params (set any combination in one call):',
+                        '`burn` `levelup` `reviews_cleared` — toggle announcements',
+                        '`daily` `daily_time` — daily summary on/off + time',
+                        '`weekly` `weekly_day` `weekly_time` — leaderboard schedule',
+                        '`channel` `modrole` — output channel/thread, mod role',
                     ].join('\n'),
                 },
             );

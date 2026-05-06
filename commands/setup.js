@@ -7,7 +7,7 @@ const db = require('../db');
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('setup')
-        .setDescription('Set your WaniKani API key and ping preferences')
+        .setDescription('Set your WaniKani API key and personal preferences')
         .setDMPermission(false)
         .addStringOption(opt =>
             opt.setName('apikey')
@@ -18,11 +18,17 @@ module.exports = {
             opt.setName('ping')
                 .setDescription('Receive daily ping with your stats')
                 .setRequired(false)
+        )
+        .addBooleanOption(opt =>
+            opt.setName('shame')
+                .setDescription('Show shame messages alongside your name in daily/weekly posts when you fall short')
+                .setRequired(false)
         ),
 
     async execute(interaction) {
         const apiKey = interaction.options.getString('apikey');
         const pingOpt = interaction.options.getBoolean('ping');
+        const shameOpt = interaction.options.getBoolean('shame');
         const userId = interaction.user.id;
         const guildId = interaction.guild.id;
 
@@ -53,7 +59,7 @@ module.exports = {
         };
 
         const existing = await db.get(
-            `SELECT api_key, ping_enabled FROM apikeys WHERE user_id = ? AND guild_id = ?`,
+            `SELECT api_key, ping_enabled, shame_enabled FROM apikeys WHERE user_id = ? AND guild_id = ?`,
             [userId, guildId]
         );
 
@@ -67,14 +73,19 @@ module.exports = {
                 });
             }
             const ping = pingOpt === null ? 1 : (pingOpt ? 1 : 0);
+            const shame = shameOpt === null ? 0 : (shameOpt ? 1 : 0);
             await db.run(
-                `INSERT INTO apikeys (user_id, guild_id, api_key, ping_enabled) VALUES (?, ?, ?, ?)`,
-                [userId, guildId, encrypt(apiKey), ping]
+                `INSERT INTO apikeys (user_id, guild_id, api_key, ping_enabled, shame_enabled) VALUES (?, ?, ?, ?, ?)`,
+                [userId, guildId, encrypt(apiKey), ping, shame]
             );
             return respond({
                 embeds: [success(
                     'Setup Complete',
-                    `Your API key is saved.\nDaily pings: **${ping ? 'enabled' : 'disabled'}**.`
+                    [
+                        'Your API key is saved.',
+                        `Daily pings: **${ping ? 'enabled' : 'disabled'}**.`,
+                        `Shame messages: **${shame ? 'enabled' : 'disabled'}**.`,
+                    ].join('\n')
                 )],
             });
         }
@@ -89,10 +100,14 @@ module.exports = {
             fields.push('ping_enabled = ?');
             params.push(pingOpt ? 1 : 0);
         }
+        if (shameOpt !== null) {
+            fields.push('shame_enabled = ?');
+            params.push(shameOpt ? 1 : 0);
+        }
 
         if (fields.length === 0) {
             return respond({
-                embeds: [error('Nothing to Update', 'Provide an `apikey` or `ping` value to change.')],
+                embeds: [error('Nothing to Update', 'Provide an `apikey`, `ping`, or `shame` value to change.')],
             });
         }
 
@@ -103,9 +118,11 @@ module.exports = {
         );
 
         const newPing = pingOpt === null ? existing.ping_enabled : (pingOpt ? 1 : 0);
+        const newShame = shameOpt === null ? existing.shame_enabled : (shameOpt ? 1 : 0);
         const lines = [];
         if (apiKey) lines.push('API key updated.');
         if (pingOpt !== null) lines.push(`Daily pings: **${newPing ? 'enabled' : 'disabled'}**.`);
+        if (shameOpt !== null) lines.push(`Shame messages: **${newShame ? 'enabled' : 'disabled'}**.`);
 
         return respond({
             embeds: [success('Settings Updated', lines.join('\n'))],

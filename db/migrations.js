@@ -29,8 +29,22 @@ async function runMigrations({ get, all, run }) {
         weekly_leaderboard_time TEXT NOT NULL DEFAULT '20:00',
         mod_role_id TEXT,
         level_up_announcements INTEGER NOT NULL DEFAULT 1,
-        burn_celebrations INTEGER NOT NULL DEFAULT 1
+        burn_celebrations INTEGER NOT NULL DEFAULT 1,
+        daily_enabled INTEGER NOT NULL DEFAULT 1,
+        reviews_cleared_announcements INTEGER NOT NULL DEFAULT 0
     )`);
+
+    const settingsCols = await all(`PRAGMA table_info(guild_settings)`);
+    if (!settingsCols.find(c => c.name === 'daily_enabled')) {
+        await run(`ALTER TABLE guild_settings ADD COLUMN daily_enabled INTEGER NOT NULL DEFAULT 1`);
+    }
+    if (!settingsCols.find(c => c.name === 'reviews_cleared_announcements')) {
+        await run(`ALTER TABLE guild_settings ADD COLUMN reviews_cleared_announcements INTEGER NOT NULL DEFAULT 0`);
+    }
+
+    if (!apikeyCols.find(c => c.name === 'shame_enabled')) {
+        await run(`ALTER TABLE apikeys ADD COLUMN shame_enabled INTEGER NOT NULL DEFAULT 0`);
+    }
 
     await run(`CREATE TABLE IF NOT EXISTS streaks (
         user_id TEXT NOT NULL,
