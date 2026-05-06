@@ -69,6 +69,13 @@ module.exports = {
                 (r.data.incorrect_reading_answers || 0) > 0
             );
 
+            if (reviews.length === 0) {
+                return interaction.editReply({
+                    embeds: [base('📭 No Data Yet')
+                        .setDescription('No reviews found in the past 7 days. Check back after you\'ve done some reviews!')],
+                });
+            }
+
             if (errored.length === 0) {
                 return interaction.editReply({
                     embeds: [base('🎯 No Mistakes!')

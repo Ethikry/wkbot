@@ -23,12 +23,18 @@ module.exports = {
             opt.setName('shame')
                 .setDescription('Show shame messages alongside your name in daily/weekly posts when you fall short')
                 .setRequired(false)
+        )
+        .addBooleanOption(opt =>
+            opt.setName('cleared')
+                .setDescription('Announce in channel when you clear your review queue (requires server to have this enabled)')
+                .setRequired(false)
         ),
 
     async execute(interaction) {
         const apiKey = interaction.options.getString('apikey');
         const pingOpt = interaction.options.getBoolean('ping');
         const shameOpt = interaction.options.getBoolean('shame');
+        const clearedOpt = interaction.options.getBoolean('cleared');
         const userId = interaction.user.id;
         const guildId = interaction.guild.id;
 
@@ -59,7 +65,7 @@ module.exports = {
         };
 
         const existing = await db.get(
-            `SELECT api_key, ping_enabled, shame_enabled FROM apikeys WHERE user_id = ? AND guild_id = ?`,
+            `SELECT api_key, ping_enabled, shame_enabled, cleared_enabled FROM apikeys WHERE user_id = ? AND guild_id = ?`,
             [userId, guildId]
         );
 
@@ -74,9 +80,10 @@ module.exports = {
             }
             const ping = pingOpt === null ? 1 : (pingOpt ? 1 : 0);
             const shame = shameOpt === null ? 0 : (shameOpt ? 1 : 0);
+            const cleared = clearedOpt === null ? 1 : (clearedOpt ? 1 : 0);
             await db.run(
-                `INSERT INTO apikeys (user_id, guild_id, api_key, ping_enabled, shame_enabled) VALUES (?, ?, ?, ?, ?)`,
-                [userId, guildId, encrypt(apiKey), ping, shame]
+                `INSERT INTO apikeys (user_id, guild_id, api_key, ping_enabled, shame_enabled, cleared_enabled) VALUES (?, ?, ?, ?, ?, ?)`,
+                [userId, guildId, encrypt(apiKey), ping, shame, cleared]
             );
             return respond({
                 embeds: [success(
@@ -85,6 +92,7 @@ module.exports = {
                         'Your API key is saved.',
                         `Daily pings: **${ping ? 'enabled' : 'disabled'}**.`,
                         `Shame messages: **${shame ? 'enabled' : 'disabled'}**.`,
+                        `Queue-cleared announcements: **${cleared ? 'enabled' : 'disabled'}**.`,
                     ].join('\n')
                 )],
             });
@@ -104,10 +112,14 @@ module.exports = {
             fields.push('shame_enabled = ?');
             params.push(shameOpt ? 1 : 0);
         }
+        if (clearedOpt !== null) {
+            fields.push('cleared_enabled = ?');
+            params.push(clearedOpt ? 1 : 0);
+        }
 
         if (fields.length === 0) {
             return respond({
-                embeds: [error('Nothing to Update', 'Provide an `apikey`, `ping`, or `shame` value to change.')],
+                embeds: [error('Nothing to Update', 'Provide an `apikey`, `ping`, `shame`, or `cleared` value to change.')],
             });
         }
 
@@ -119,10 +131,12 @@ module.exports = {
 
         const newPing = pingOpt === null ? existing.ping_enabled : (pingOpt ? 1 : 0);
         const newShame = shameOpt === null ? existing.shame_enabled : (shameOpt ? 1 : 0);
+        const newCleared = clearedOpt === null ? existing.cleared_enabled : (clearedOpt ? 1 : 0);
         const lines = [];
         if (apiKey) lines.push('API key updated.');
         if (pingOpt !== null) lines.push(`Daily pings: **${newPing ? 'enabled' : 'disabled'}**.`);
         if (shameOpt !== null) lines.push(`Shame messages: **${newShame ? 'enabled' : 'disabled'}**.`);
+        if (clearedOpt !== null) lines.push(`Queue-cleared announcements: **${newCleared ? 'enabled' : 'disabled'}**.`);
 
         return respond({
             embeds: [success('Settings Updated', lines.join('\n'))],

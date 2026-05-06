@@ -45,6 +45,9 @@ async function runMigrations({ get, all, run }) {
     if (!apikeyCols.find(c => c.name === 'shame_enabled')) {
         await run(`ALTER TABLE apikeys ADD COLUMN shame_enabled INTEGER NOT NULL DEFAULT 0`);
     }
+    if (!apikeyCols.find(c => c.name === 'cleared_enabled')) {
+        await run(`ALTER TABLE apikeys ADD COLUMN cleared_enabled INTEGER NOT NULL DEFAULT 1`);
+    }
 
     await run(`CREATE TABLE IF NOT EXISTS streaks (
         user_id TEXT NOT NULL,
