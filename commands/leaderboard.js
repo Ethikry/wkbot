@@ -37,7 +37,7 @@ module.exports = {
 
         const lines = await Promise.all(rows.map(async (r, i) => {
             const member = await interaction.guild.members.fetch(r.user_id).catch(() => null);
-            const name = member ? (member.nickname || member.user.username) : 'Unknown';
+            const name = member ? member.displayName : 'Unknown';
             const medal = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
             return `${medal} **${name}** — ${r.reviews} reviews · ${r.lessons} lessons`;
         }));

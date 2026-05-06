@@ -16,7 +16,7 @@ module.exports = {
     async execute(interaction) {
         const userId = interaction.user.id;
         const guildId = interaction.guild.id;
-        const username = interaction.member?.nickname || interaction.user.username;
+        const username = interaction.member?.displayName ?? interaction.user.displayName;
 
         const row = await db.get(
             `SELECT api_key FROM apikeys WHERE user_id = ? AND guild_id = ?`,

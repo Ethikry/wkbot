@@ -76,7 +76,7 @@ async function resolveOutputChannel(guild, settings) {
 async function fetchUserSummaries(guild, rows) {
     return Promise.all(rows.map(async row => {
         const member = await guild.members.fetch(row.user_id).catch(() => null);
-        const username = member ? (member.nickname || member.user.username) : 'Unknown';
+        const username = member ? member.displayName : 'Unknown';
         try {
             const apiKey = decrypt(row.api_key);
             const data = await getWaniKaniData(apiKey);
@@ -159,7 +159,7 @@ async function appendGoalProgress(guildId, guild, embed) {
 
         const member = await guild.members.fetch(g.user_id).catch(() => null);
         if (!member) continue;
-        const name = member.nickname || member.user.username;
+        const name = member.displayName;
 
         const snap = await db.get(
             `SELECT reviews_completed, lessons_completed FROM daily_snapshots WHERE user_id = ? AND guild_id = ? AND date = ?`,
@@ -272,7 +272,7 @@ async function leaderboardJob(client, guildId) {
 
     const enriched = await Promise.all(rows.map(async (r, i) => {
         const member = await guild.members.fetch(r.user_id).catch(() => null);
-        const name = member ? (member.nickname || member.user.username) : 'Unknown';
+        const name = member ? member.displayName : 'Unknown';
         const medal = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
         return {
             userId: r.user_id,
@@ -317,7 +317,7 @@ async function pollUsersJob(client) {
             const channel = await resolveOutputChannel(guild, settings);
 
             const rows = await db.all(
-                `SELECT user_id, api_key FROM apikeys WHERE guild_id = ?`,
+                `SELECT user_id, api_key, cleared_enabled FROM apikeys WHERE guild_id = ?`,
                 [guild.id]
             );
 
@@ -335,6 +335,7 @@ async function pollUsersJob(client) {
                     if (
                         channel &&
                         settings.reviews_cleared_announcements &&
+                        row.cleared_enabled !== 0 &&
                         dueRightNow === 0
                     ) {
                         const prev = await db.get(
@@ -460,7 +461,7 @@ async function maybeSendReviewsAvailableDM(client, userId, dueRightNow) {
             `You have **${dueRightNow}** reviews due (your alert threshold is ${goal.notify_review_threshold}).`,
             `Goal: level ${goal.target_level} by ${goal.deadline}.`,
             '',
-            'Disable with `/goal alerts reviews_available:false`.',
+            'Disable with `/goals` → Configure alerts.',
         ].join('\n'))
         .setTimestamp()
         .setFooter(FOOTER);
@@ -520,7 +521,7 @@ async function paceAlertJob(client) {
                     `Goal: level **${goal.target_level}** by **${goal.deadline}** (~${goal.days_per_level.toFixed(1)} days/level).`,
                     'Try to log a session today to stay on track.',
                     '',
-                    'Disable with `/goal alerts pace_daily:false`.',
+                    'Disable with `/goals` → Configure alerts.',
                 ].join('\n'))
                 .setTimestamp()
                 .setFooter(FOOTER);
