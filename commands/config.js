@@ -6,6 +6,7 @@ const db = require('../db');
 
 const VALID_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const DAY_NAME_TO_INT = Object.fromEntries(DAY_NAMES.map((name, i) => [name.toLowerCase(), i]));
 
 const OUTPUT_CHANNEL_TYPES = [
     ChannelType.GuildText,
@@ -19,108 +20,154 @@ function dayName(n) {
     return DAY_NAMES[n] ?? '?';
 }
 
-function isValidTimezone(tz) {
-    try {
-        new Intl.DateTimeFormat('en-US', { timeZone: tz });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 async function ensureSettings(guildId) {
     await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
-}
-
-function ephemeral(interaction, embed) {
-    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-}
-
-async function modGuard(interaction) {
-    if (await isModerator(interaction)) return true;
-    await ephemeral(
-        interaction,
-        error('Forbidden', 'You need the configured mod role, or Manage Server permission, to run this.')
-    );
-    return false;
 }
 
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('config')
-        .setDescription('Configure server-wide WaniKani bot settings (mods only)')
+        .setDescription('Configure server-wide WaniKani bot settings (mods only). Run with no options to view current.')
         .setDMPermission(false)
-        .addSubcommand(s =>
-            s.setName('show').setDescription('Show current settings'))
-        .addSubcommand(s =>
-            s.setName('channel')
-                .setDescription('Set the bot output channel or thread')
-                .addChannelOption(o => o.setName('channel')
-                    .setDescription('Text channel, announcement channel, or thread')
-                    .addChannelTypes(...OUTPUT_CHANNEL_TYPES)
-                    .setRequired(true)))
-        .addSubcommand(s =>
-            s.setName('timezone')
-                .setDescription('Set IANA timezone for all schedules')
-                .addStringOption(o => o.setName('tz')
-                    .setDescription('e.g. America/New_York, Europe/London, Asia/Tokyo')
-                    .setRequired(true)))
-        .addSubcommand(s =>
-            s.setName('modrole')
-                .setDescription('Set the role allowed to run /config')
-                .addRoleOption(o => o.setName('role').setDescription('Mod role').setRequired(true)))
-        .addSubcommand(s =>
-            s.setName('daily')
-                .setDescription('Set the daily summary time')
-                .addStringOption(o => o.setName('time')
-                    .setDescription('HH:MM in 24-hour format')
-                    .setRequired(true)))
-        .addSubcommand(s =>
-            s.setName('morning')
-                .setDescription('Toggle the morning ping')
-                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
-        .addSubcommand(s =>
-            s.setName('shame')
-                .setDescription('Toggle end-of-day shame mode (pings users with pending reviews)')
-                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
-        .addSubcommand(s =>
-            s.setName('leaderboard')
-                .setDescription('Toggle the weekly auto-leaderboard')
-                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))
-                .addIntegerOption(o => o.setName('day')
-                    .setDescription('Day of week (0=Sun, 6=Sat)')
-                    .setMinValue(0).setMaxValue(6))
-                .addStringOption(o => o.setName('time').setDescription('HH:MM 24h')))
-        .addSubcommand(s =>
-            s.setName('levelups')
-                .setDescription('Toggle level-up announcements')
-                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true)))
-        .addSubcommand(s =>
-            s.setName('burns')
-                .setDescription('Toggle burn-celebration announcements')
-                .addBooleanOption(o => o.setName('enabled').setDescription('On/off').setRequired(true))),
+        .addBooleanOption(o =>
+            o.setName('burn').setDescription('Burn-celebration announcements: true=enable, false=disable'))
+        .addBooleanOption(o =>
+            o.setName('levelup').setDescription('Level-up announcements: true=enable, false=disable'))
+        .addBooleanOption(o =>
+            o.setName('reviews_cleared').setDescription('Reviews-cleared celebration: true=enable, false=disable'))
+        .addBooleanOption(o =>
+            o.setName('daily').setDescription('Daily summary post: true=enable, false=disable'))
+        .addStringOption(o =>
+            o.setName('daily_time').setDescription('Daily summary time, HH:MM 24h'))
+        .addBooleanOption(o =>
+            o.setName('weekly').setDescription('Weekly leaderboard: true=enable, false=disable'))
+        .addStringOption(o =>
+            o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
+                .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
+        .addStringOption(o =>
+            o.setName('weekly_time').setDescription('Weekly leaderboard time, HH:MM 24h'))
+        .addChannelOption(o =>
+            o.setName('channel').setDescription('Output channel or thread for bot posts')
+                .addChannelTypes(...OUTPUT_CHANNEL_TYPES))
+        .addRoleOption(o =>
+            o.setName('modrole').setDescription('Role allowed to run /config')),
 
     async execute(interaction, client) {
-        if (!(await modGuard(interaction))) return;
+        if (!(await isModerator(interaction))) {
+            return interaction.reply({
+                embeds: [error('Forbidden', 'You need the configured mod role, or Manage Server permission, to run this.')],
+                flags: MessageFlags.Ephemeral,
+            });
+        }
 
         const guildId = interaction.guild.id;
         await ensureSettings(guildId);
-        const sub = interaction.options.getSubcommand();
 
-        switch (sub) {
-            case 'show': return showSettings(interaction, guildId);
-            case 'channel': return setChannel(interaction, client, guildId);
-            case 'timezone': return setTimezone(interaction, client, guildId);
-            case 'modrole': return setModRole(interaction, guildId);
-            case 'daily': return setDaily(interaction, client, guildId);
-            case 'morning': return setMorning(interaction, client, guildId);
-            case 'shame': return setShame(interaction, client, guildId);
-            case 'leaderboard': return setLeaderboard(interaction, client, guildId);
-            case 'levelups': return setBoolFlag(interaction, guildId, 'level_up_announcements', 'Level-up announcements');
-            case 'burns': return setBoolFlag(interaction, guildId, 'burn_celebrations', 'Burn celebrations');
+        const burn = interaction.options.getBoolean('burn');
+        const levelup = interaction.options.getBoolean('levelup');
+        const reviewsCleared = interaction.options.getBoolean('reviews_cleared');
+        const daily = interaction.options.getBoolean('daily');
+        const dailyTime = interaction.options.getString('daily_time');
+        const weekly = interaction.options.getBoolean('weekly');
+        const weeklyDay = interaction.options.getString('weekly_day');
+        const weeklyTime = interaction.options.getString('weekly_time');
+        const channel = interaction.options.getChannel('channel');
+        const modrole = interaction.options.getRole('modrole');
+
+        const noneSet = [burn, levelup, reviewsCleared, daily, dailyTime, weekly, weeklyDay, weeklyTime, channel, modrole]
+            .every(v => v === null);
+
+        if (noneSet) {
+            return showSettings(interaction, guildId);
         }
+
+        if (dailyTime !== null && !VALID_TIME.test(dailyTime)) {
+            return interaction.reply({
+                embeds: [error('Invalid daily_time', 'Use 24-hour `HH:MM`, e.g. `15:00`.')],
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        if (weeklyTime !== null && !VALID_TIME.test(weeklyTime)) {
+            return interaction.reply({
+                embeds: [error('Invalid weekly_time', 'Use 24-hour `HH:MM`, e.g. `20:00`.')],
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+
+        const fields = [];
+        const params = [];
+        const summary = [];
+        let scheduleChanged = false;
+
+        if (burn !== null) {
+            fields.push('burn_celebrations = ?');
+            params.push(burn ? 1 : 0);
+            summary.push(`Burn celebrations: **${burn ? 'on' : 'off'}**`);
+        }
+        if (levelup !== null) {
+            fields.push('level_up_announcements = ?');
+            params.push(levelup ? 1 : 0);
+            summary.push(`Level-up announcements: **${levelup ? 'on' : 'off'}**`);
+        }
+        if (reviewsCleared !== null) {
+            fields.push('reviews_cleared_announcements = ?');
+            params.push(reviewsCleared ? 1 : 0);
+            summary.push(`Reviews-cleared celebrations: **${reviewsCleared ? 'on' : 'off'}**`);
+        }
+        if (daily !== null) {
+            fields.push('daily_enabled = ?');
+            params.push(daily ? 1 : 0);
+            summary.push(`Daily summary: **${daily ? 'on' : 'off'}**`);
+            scheduleChanged = true;
+        }
+        if (dailyTime !== null) {
+            fields.push('daily_time = ?');
+            params.push(dailyTime);
+            summary.push(`Daily summary time: **${dailyTime}**`);
+            scheduleChanged = true;
+        }
+        if (weekly !== null) {
+            fields.push('weekly_leaderboard_enabled = ?');
+            params.push(weekly ? 1 : 0);
+            summary.push(`Weekly leaderboard: **${weekly ? 'on' : 'off'}**`);
+            scheduleChanged = true;
+        }
+        if (weeklyDay !== null) {
+            fields.push('weekly_leaderboard_day = ?');
+            params.push(DAY_NAME_TO_INT[weeklyDay]);
+            summary.push(`Weekly leaderboard day: **${weeklyDay[0].toUpperCase() + weeklyDay.slice(1)}**`);
+            scheduleChanged = true;
+        }
+        if (weeklyTime !== null) {
+            fields.push('weekly_leaderboard_time = ?');
+            params.push(weeklyTime);
+            summary.push(`Weekly leaderboard time: **${weeklyTime}**`);
+            scheduleChanged = true;
+        }
+        if (channel !== null) {
+            fields.push('channel_id = ?');
+            params.push(channel.id);
+            summary.push(`Output channel: <#${channel.id}>`);
+            scheduleChanged = true;
+        }
+        if (modrole !== null) {
+            fields.push('mod_role_id = ?');
+            params.push(modrole.id);
+            summary.push(`Mod role: <@&${modrole.id}>`);
+        }
+
+        params.push(guildId);
+        await db.run(
+            `UPDATE guild_settings SET ${fields.join(', ')} WHERE guild_id = ?`,
+            params
+        );
+
+        if (scheduleChanged) await rescheduleGuild(client, guildId);
+
+        return interaction.reply({
+            embeds: [success('Settings Updated', summary.join('\n'))],
+            flags: MessageFlags.Ephemeral,
+        });
     },
 };
 
@@ -136,130 +183,22 @@ async function showSettings(interaction, guildId) {
     const embed = base('⚙️ Server Settings')
         .addFields(
             { name: 'Output channel', value: channelStr, inline: false },
-            { name: 'Daily summary', value: `${s.daily_time} ${s.timezone}`, inline: true },
-            { name: 'Morning ping', value: s.morning_ping_enabled ? `${s.morning_time} ${s.timezone}` : 'off', inline: true },
-            { name: 'Shame mode', value: s.shame_mode_enabled ? `${s.shame_time} ${s.timezone}` : 'off', inline: true },
+            {
+                name: 'Daily summary',
+                value: s.daily_enabled ? `on at **${s.daily_time}** UTC` : 'off',
+                inline: true,
+            },
             {
                 name: 'Weekly leaderboard',
                 value: s.weekly_leaderboard_enabled
-                    ? `${dayName(s.weekly_leaderboard_day)} ${s.weekly_leaderboard_time} ${s.timezone}`
+                    ? `on, **${dayName(s.weekly_leaderboard_day)} ${s.weekly_leaderboard_time}** UTC`
                     : 'off',
-                inline: false,
+                inline: true,
             },
             { name: 'Mod role', value: modRoleStr, inline: false },
             { name: 'Level-up announcements', value: s.level_up_announcements ? 'on' : 'off', inline: true },
             { name: 'Burn celebrations', value: s.burn_celebrations ? 'on' : 'off', inline: true },
+            { name: 'Reviews-cleared celebrations', value: s.reviews_cleared_announcements ? 'on' : 'off', inline: true },
         );
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-}
-
-async function setChannel(interaction, client, guildId) {
-    const ch = interaction.options.getChannel('channel');
-    await db.run(`UPDATE guild_settings SET channel_id = ? WHERE guild_id = ?`, [ch.id, guildId]);
-    await rescheduleGuild(client, guildId);
-    return ephemeral(interaction, success('Channel Updated', `Bot output now goes to <#${ch.id}>.`));
-}
-
-async function setDaily(interaction, client, guildId) {
-    const time = interaction.options.getString('time');
-    if (!VALID_TIME.test(time)) {
-        return ephemeral(interaction, error('Invalid Time', 'Use 24-hour `HH:MM`, e.g. `15:00`.'));
-    }
-    await db.run(`UPDATE guild_settings SET daily_time = ? WHERE guild_id = ?`, [time, guildId]);
-    await rescheduleGuild(client, guildId);
-    return ephemeral(interaction, success('Daily Time Updated', `Daily summary will run at ${time}.`));
-}
-
-async function setTimezone(interaction, client, guildId) {
-    const tz = interaction.options.getString('tz');
-    if (!isValidTimezone(tz)) {
-        return ephemeral(interaction, error('Invalid Timezone', 'Use an IANA timezone (e.g. `America/New_York`, `Europe/London`).'));
-    }
-    await db.run(`UPDATE guild_settings SET timezone = ? WHERE guild_id = ?`, [tz, guildId]);
-    await rescheduleGuild(client, guildId);
-    return ephemeral(interaction, success('Timezone Updated', `Schedules now use **${tz}**.`));
-}
-
-async function setMorning(interaction, client, guildId) {
-    const enabled = interaction.options.getBoolean('enabled') ? 1 : 0;
-    const time = interaction.options.getString('time');
-    if (time && !VALID_TIME.test(time)) {
-        return ephemeral(interaction, error('Invalid Time', 'Use 24-hour `HH:MM`.'));
-    }
-    if (time) {
-        await db.run(
-            `UPDATE guild_settings SET morning_ping_enabled = ?, morning_time = ? WHERE guild_id = ?`,
-            [enabled, time, guildId]
-        );
-    } else {
-        await db.run(
-            `UPDATE guild_settings SET morning_ping_enabled = ? WHERE guild_id = ?`,
-            [enabled, guildId]
-        );
-    }
-    await rescheduleGuild(client, guildId);
-    return ephemeral(
-        interaction,
-        success('Morning Ping Updated', `Morning ping ${enabled ? `enabled${time ? ` at ${time}` : ''}` : 'disabled'}.`)
-    );
-}
-
-async function setShame(interaction, client, guildId) {
-    const enabled = interaction.options.getBoolean('enabled') ? 1 : 0;
-    const time = interaction.options.getString('time');
-    if (time && !VALID_TIME.test(time)) {
-        return ephemeral(interaction, error('Invalid Time', 'Use 24-hour `HH:MM`.'));
-    }
-    if (time) {
-        await db.run(
-            `UPDATE guild_settings SET shame_mode_enabled = ?, shame_time = ? WHERE guild_id = ?`,
-            [enabled, time, guildId]
-        );
-    } else {
-        await db.run(
-            `UPDATE guild_settings SET shame_mode_enabled = ? WHERE guild_id = ?`,
-            [enabled, guildId]
-        );
-    }
-    await rescheduleGuild(client, guildId);
-    return ephemeral(
-        interaction,
-        success('Shame Mode Updated', `Shame mode ${enabled ? `enabled${time ? ` at ${time}` : ''}` : 'disabled'}.`)
-    );
-}
-
-async function setLeaderboard(interaction, client, guildId) {
-    const enabled = interaction.options.getBoolean('enabled') ? 1 : 0;
-    const day = interaction.options.getInteger('day');
-    const time = interaction.options.getString('time');
-    if (time && !VALID_TIME.test(time)) {
-        return ephemeral(interaction, error('Invalid Time', 'Use 24-hour `HH:MM`.'));
-    }
-    const fields = ['weekly_leaderboard_enabled = ?'];
-    const params = [enabled];
-    if (day !== null) { fields.push('weekly_leaderboard_day = ?'); params.push(day); }
-    if (time) { fields.push('weekly_leaderboard_time = ?'); params.push(time); }
-    params.push(guildId);
-    await db.run(
-        `UPDATE guild_settings SET ${fields.join(', ')} WHERE guild_id = ?`,
-        params
-    );
-    await rescheduleGuild(client, guildId);
-
-    const detail = enabled
-        ? `Weekly leaderboard enabled${day !== null ? ` on ${dayName(day)}` : ''}${time ? ` at ${time}` : ''}.`
-        : 'Weekly leaderboard disabled.';
-    return ephemeral(interaction, success('Weekly Leaderboard Updated', detail));
-}
-
-async function setModRole(interaction, guildId) {
-    const role = interaction.options.getRole('role');
-    await db.run(`UPDATE guild_settings SET mod_role_id = ? WHERE guild_id = ?`, [role.id, guildId]);
-    return ephemeral(interaction, success('Mod Role Updated', `<@&${role.id}> can now run \`/config\`.`));
-}
-
-async function setBoolFlag(interaction, guildId, column, label) {
-    const enabled = interaction.options.getBoolean('enabled') ? 1 : 0;
-    await db.run(`UPDATE guild_settings SET ${column} = ? WHERE guild_id = ?`, [enabled, guildId]);
-    return ephemeral(interaction, success(`${label} ${enabled ? 'Enabled' : 'Disabled'}`, `${label} ${enabled ? 'enabled' : 'disabled'}.`));
 }

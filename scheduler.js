@@ -9,8 +9,9 @@ const {
     getLessonsCompletedSince,
     getBurnedCount,
 } = require('./helpers/wanikaniData');
-const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, FOOTER } = require('./helpers/embeds');
+const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, COLOR_SUCCESS, FOOTER } = require('./helpers/embeds');
 const { recordPoll, evaluateAllGoal } = require('./helpers/zerostate');
+const { pickShameLine } = require('./helpers/shame');
 
 const guildJobs = new Map();
 let pollJob = null;
@@ -18,6 +19,11 @@ let paceAlertJobHandle = null;
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 const TWENTY_HOURS_MS = 20 * 60 * 60 * 1000;
+const MIDNIGHT_UTC_TODAY = () => {
+    const d = new Date();
+    d.setUTCHours(0, 0, 0, 0);
+    return d.toISOString();
+};
 
 function clearGuildJobs(guildId) {
     const jobs = guildJobs.get(guildId);
@@ -81,6 +87,7 @@ async function fetchUserSummaries(guild, rows) {
                 userId: row.user_id,
                 username,
                 ping: row.ping_enabled === 1,
+                shame: row.shame_enabled === 1,
                 onVacation: !!data.userData.current_vacation_started_at,
                 level: data.userData.level,
                 pendingLessons: data.pendingLessons,
@@ -93,6 +100,7 @@ async function fetchUserSummaries(guild, rows) {
                 userId: row.user_id,
                 username,
                 ping: row.ping_enabled === 1,
+                shame: row.shame_enabled === 1,
                 error: true,
             };
         }
@@ -128,6 +136,7 @@ async function appendGoalProgress(guildId, guild, embed) {
     const rows = await db.all(
         `SELECT
              ak.user_id,
+             ak.shame_enabled,
              COALESCE(g.daily_lessons, lg.daily_lessons, 0) AS daily_lessons,
              COALESCE(g.daily_reviews, lg.daily_reviews, 0) AS daily_reviews,
              COALESCE(g.daily_all, 0) AS daily_all,
@@ -169,14 +178,19 @@ async function appendGoalProgress(guildId, guild, embed) {
             allLabel = formatAllGoalLabel(result);
         }
 
-        const icon = lOk && rOk && allOk ? '✅' : '⏳';
+        const fullSuccess = lOk && rOk && allOk;
+        const icon = fullSuccess ? '✅' : '⏳';
         const sourceTag = g.source === 'long' ? ' 🎯' : '';
         const parts = [];
         if (hasLesson) parts.push(`${l}/${g.daily_lessons} lessons`);
         if (hasReview) parts.push(`${r}/${g.daily_reviews} reviews`);
         if (allLabel) parts.push(allLabel);
 
-        lines.push(`${icon} **${name}**${sourceTag} — ${parts.join(' · ')}`);
+        let line = `${icon} **${name}**${sourceTag} — ${parts.join(' · ')}`;
+        if (!fullSuccess && g.shame_enabled === 1) {
+            line += `\n  🥶 _${pickShameLine()}_`;
+        }
+        lines.push(line);
     }
 
     if (lines.length) {
@@ -200,93 +214,29 @@ async function dailyJob(client, guildId) {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return;
     const settings = await getOrCreateSettings(guildId);
-    const channel = await resolveOutputChannel(guild, settings);
-    if (!channel) return;
 
     const rows = await db.all(
-        `SELECT user_id, api_key, ping_enabled FROM apikeys WHERE guild_id = ?`,
+        `SELECT user_id, api_key, ping_enabled, shame_enabled FROM apikeys WHERE guild_id = ?`,
         [guildId]
     );
     if (rows.length === 0) return;
 
-    const summaries = await fetchUserSummaries(guild, rows);
-    const embed = summaryEmbed('📅 Daily WaniKani Summary', "Today's status:", summaries);
-    await appendGoalProgress(guildId, guild, embed);
+    if (settings.daily_enabled) {
+        const channel = await resolveOutputChannel(guild, settings);
+        if (channel) {
+            const summaries = await fetchUserSummaries(guild, rows);
+            const embed = summaryEmbed('📅 Daily WaniKani Summary', "Today's status:", summaries);
+            await appendGoalProgress(guildId, guild, embed);
 
-    const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
-    await channel.send({
-        content: pingList.length ? pingList.join(' ') : undefined,
-        embeds: [embed],
-    });
+            const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
+            await channel.send({
+                content: pingList.length ? pingList.join(' ') : undefined,
+                embeds: [embed],
+            });
+        }
+    }
 
     await updateSnapshotsAndStreaks(guildId, rows);
-}
-
-async function morningJob(client, guildId) {
-    console.log(`[morning] guild=${guildId}`);
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) return;
-    const settings = await getOrCreateSettings(guildId);
-    const channel = await resolveOutputChannel(guild, settings);
-    if (!channel) return;
-
-    const rows = await db.all(
-        `SELECT user_id, api_key, ping_enabled FROM apikeys WHERE guild_id = ?`,
-        [guildId]
-    );
-    if (rows.length === 0) return;
-
-    const summaries = await fetchUserSummaries(guild, rows);
-    const embed = summaryEmbed('☀️ Morning Reminder', 'Start the day with some reviews!', summaries);
-    const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
-    await channel.send({
-        content: pingList.length ? pingList.join(' ') : undefined,
-        embeds: [embed],
-    });
-}
-
-async function shameJob(client, guildId) {
-    console.log(`[shame] guild=${guildId}`);
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) return;
-    const settings = await getOrCreateSettings(guildId);
-    const channel = await resolveOutputChannel(guild, settings);
-    if (!channel) return;
-
-    const rows = await db.all(
-        `SELECT user_id, api_key FROM apikeys WHERE guild_id = ?`,
-        [guildId]
-    );
-    if (rows.length === 0) return;
-
-    const slackers = (await Promise.all(rows.map(async row => {
-        try {
-            const apiKey = decrypt(row.api_key);
-            const data = await getWaniKaniData(apiKey);
-            await recordPoll(row.user_id, guild.id, data.dueRightNow).catch(err =>
-                console.error(`[recordPoll/shame] ${row.user_id}@${guild.id}:`, err.message)
-            );
-            if (data.userData.current_vacation_started_at) return null;
-            if (data.dueRightNow > 0) return { userId: row.user_id, due: data.dueRightNow };
-            return null;
-        } catch {
-            return null;
-        }
-    }))).filter(Boolean);
-
-    if (slackers.length === 0) return;
-
-    const embed = new EmbedBuilder()
-        .setColor(COLOR_WARN)
-        .setTitle('⚠️ Pending Reviews')
-        .setDescription(slackers.map(s => `<@${s.userId}> — **${s.due}** review${s.due === 1 ? '' : 's'} still pending`).join('\n'))
-        .setTimestamp()
-        .setFooter(FOOTER);
-
-    await channel.send({
-        content: slackers.map(s => `<@${s.userId}>`).join(' '),
-        embeds: [embed],
-    });
 }
 
 async function leaderboardJob(client, guildId) {
@@ -302,35 +252,62 @@ async function leaderboardJob(client, guildId) {
     const sinceStr = since.toISOString().slice(0, 10);
 
     const rows = await db.all(
-        `SELECT user_id,
-                COALESCE(SUM(reviews_completed), 0) AS reviews,
-                COALESCE(SUM(lessons_completed), 0) AS lessons
-         FROM daily_snapshots
-         WHERE guild_id = ? AND date >= ?
-         GROUP BY user_id
-         HAVING reviews > 0 OR lessons > 0
-         ORDER BY reviews DESC, lessons DESC
-         LIMIT 10`,
-        [guildId, sinceStr]
+        `SELECT
+             ak.user_id,
+             ak.shame_enabled,
+             COALESCE(SUM(ds.reviews_completed), 0) AS reviews,
+             COALESCE(SUM(ds.lessons_completed), 0) AS lessons
+         FROM apikeys ak
+         LEFT JOIN daily_snapshots ds
+             ON ds.user_id = ak.user_id
+             AND ds.guild_id = ak.guild_id
+             AND ds.date >= ?
+         WHERE ak.guild_id = ?
+         GROUP BY ak.user_id, ak.shame_enabled
+         ORDER BY reviews DESC, lessons DESC, ak.user_id ASC`,
+        [sinceStr, guildId]
     );
 
     if (rows.length === 0) return;
 
-    const lines = await Promise.all(rows.map(async (r, i) => {
+    const enriched = await Promise.all(rows.map(async (r, i) => {
         const member = await guild.members.fetch(r.user_id).catch(() => null);
         const name = member ? (member.nickname || member.user.username) : 'Unknown';
         const medal = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
-        return `${medal} **${name}** — ${r.reviews} reviews · ${r.lessons} lessons`;
+        return {
+            userId: r.user_id,
+            name,
+            medal,
+            reviews: r.reviews,
+            lessons: r.lessons,
+            shameEnabled: r.shame_enabled === 1,
+        };
     }));
+
+    const lines = enriched.map(e => `${e.medal} **${e.name}** — ${e.reviews} reviews · ${e.lessons} lessons`);
+    if (enriched.length > 0) {
+        lines[0] += ' 👑';
+    }
+
+    const shameTargets = enriched.filter(e => e.shameEnabled && e.reviews === 0);
+    const shameBlock = shameTargets.length
+        ? `\n\n**🥶 Shame Corner**\n` + shameTargets.map(e => `<@${e.userId}> — _${pickShameLine()}_`).join('\n')
+        : '';
 
     const embed = new EmbedBuilder()
         .setColor(COLOR_PRIMARY)
         .setTitle('🏆 Weekly Leaderboard')
-        .setDescription(lines.join('\n'))
+        .setDescription(clipDescription(lines.join('\n') + shameBlock))
         .setTimestamp()
         .setFooter({ text: 'Past 7 days · WaniKani Bot' });
 
     await channel.send({ embeds: [embed] });
+}
+
+function clipDescription(s) {
+    const MAX = 4000;
+    if (s.length <= MAX) return s;
+    return s.slice(0, MAX - 20) + '\n*…and more*';
 }
 
 async function pollUsersJob(client) {
@@ -354,7 +331,41 @@ async function pollUsersJob(client) {
                         ? await getBurnedCount(apiKey).catch(() => null)
                         : null;
 
+                    let cleared = false;
+                    if (
+                        channel &&
+                        settings.reviews_cleared_announcements &&
+                        dueRightNow === 0
+                    ) {
+                        const prev = await db.get(
+                            `SELECT queue_size FROM queue_history
+                             WHERE user_id = ? AND guild_id = ?
+                             ORDER BY recorded_at DESC LIMIT 1`,
+                            [row.user_id, guild.id]
+                        );
+                        if (prev && prev.queue_size > 0) cleared = true;
+                    }
+
                     await recordPoll(row.user_id, guild.id, dueRightNow);
+
+                    if (cleared) {
+                        try {
+                            const reviewsToday = await getReviewsCompletedSince(apiKey, MIDNIGHT_UTC_TODAY())
+                                .catch(() => null);
+                            const description = reviewsToday !== null
+                                ? `<@${row.user_id}> just cleared their review queue — **${reviewsToday}** reviews done today!`
+                                : `<@${row.user_id}> just cleared their review queue — nice!`;
+                            const embed = new EmbedBuilder()
+                                .setColor(COLOR_SUCCESS)
+                                .setTitle('🧹 Reviews cleared!')
+                                .setDescription(description)
+                                .setTimestamp()
+                                .setFooter(FOOTER);
+                            await channel.send({ content: `<@${row.user_id}>`, embeds: [embed] });
+                        } catch (err) {
+                            console.error(`[poll/cleared] ${row.user_id}@${guild.id}:`, err.message);
+                        }
+                    }
 
                     const state = await db.get(
                         `SELECT last_known_level, last_known_burned
@@ -609,22 +620,6 @@ async function scheduleGuild(client, guildId) {
         { timezone: tz }
     ));
 
-    if (settings.morning_ping_enabled) {
-        addJob(guildId, cron.schedule(
-            cronExpr(settings.morning_time),
-            () => morningJob(client, guildId).catch(err => console.error('[morningJob]', err)),
-            { timezone: tz }
-        ));
-    }
-
-    if (settings.shame_mode_enabled) {
-        addJob(guildId, cron.schedule(
-            cronExpr(settings.shame_time),
-            () => shameJob(client, guildId).catch(err => console.error('[shameJob]', err)),
-            { timezone: tz }
-        ));
-    }
-
     if (settings.weekly_leaderboard_enabled) {
         addJob(guildId, cron.schedule(
             cronExpr(settings.weekly_leaderboard_time, settings.weekly_leaderboard_day),
@@ -667,8 +662,6 @@ module.exports = {
     scheduleGuild,
     rescheduleGuild,
     dailyJob,
-    morningJob,
-    shameJob,
     leaderboardJob,
     pollUsersJob,
     paceAlertJob,
