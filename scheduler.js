@@ -188,7 +188,7 @@ async function appendGoalProgress(guildId, guild, embed) {
 
         let line = `${icon} **${name}**${sourceTag} — ${parts.join(' · ')}`;
         if (!fullSuccess && g.shame_enabled === 1) {
-            line += `\n  🥶 _${pickShameLine()}_`;
+            line += `\n  💢 _${pickShameLine()}_`;
         }
         lines.push(line);
     }
