@@ -10,7 +10,6 @@ const PACE_PRESETS = {
         emoji: '🚀',
         labelText: 'Fastest',
         daysPerLevel: 7,
-        summary: 'Close to WaniKani\'s theoretical maximum. Demands consistency every day.',
     },
     comfortable: {
         key: 'comfortable',
@@ -18,7 +17,6 @@ const PACE_PRESETS = {
         emoji: '🎯',
         labelText: 'Comfortable',
         daysPerLevel: 10,
-        summary: 'Sustainable for most learners. Realistic if you study daily.',
     },
     relaxed: {
         key: 'relaxed',
@@ -26,7 +24,6 @@ const PACE_PRESETS = {
         emoji: '🏖️',
         labelText: 'Relaxed',
         daysPerLevel: 14,
-        summary: 'Forgiving cadence. Good for busy schedules.',
     },
 };
 
@@ -79,7 +76,6 @@ function paceOptionsFor(opts) {
             emoji: '📊',
             labelText: 'Personal',
             daysPerLevel: opts.personalPace.daysPerLevel,
-            summary: `Your historic average of ~${opts.personalPace.daysPerLevel.toFixed(1)} days/level (last ${opts.personalPace.sampleSize}).`,
             projection: projectPace({ ...opts, daysPerLevel: opts.personalPace.daysPerLevel }),
         });
     }

@@ -1,50 +1,56 @@
 const db = require('../db');
+const { getWanikaniUserId } = require('./userLink');
 
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const PRUNE_OLDER_THAN_HOURS = 48;
 const KEPT_UP_LOWER_BOUND_HOURS = 25;
 const KEPT_UP_UPPER_BOUND_HOURS = 23;
 
-async function recordPoll(userId, guildId, dueRightNow) {
+async function recordPoll(discordUserId, guildId, dueRightNow, knownWanikaniUserId = null) {
     const now = new Date().toISOString();
+    const wanikaniUserId = knownWanikaniUserId ?? await getWanikaniUserId(discordUserId);
+    if (!wanikaniUserId) return;
 
     await db.run(
-        `INSERT OR IGNORE INTO queue_history (user_id, guild_id, recorded_at, queue_size)
-         VALUES (?, ?, ?, ?)`,
-        [userId, guildId, now, dueRightNow]
+        `INSERT OR IGNORE INTO queue_history (guild_id, discord_user_id, wanikani_user_id, recorded_at, queue_size)
+         VALUES (?, ?, ?, ?, ?)`,
+        [guildId, discordUserId, wanikaniUserId, now, dueRightNow]
     );
 
     if (dueRightNow === 0) {
         await db.run(
-            `INSERT INTO user_state (user_id, guild_id, last_zero_due_at) VALUES (?, ?, ?)
-             ON CONFLICT(user_id, guild_id) DO UPDATE SET last_zero_due_at = excluded.last_zero_due_at`,
-            [userId, guildId, now]
+            `INSERT INTO bot_user_state (guild_id, discord_user_id, wanikani_user_id, last_zero_due_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                last_zero_due_at = excluded.last_zero_due_at,
+                updated_at = CURRENT_TIMESTAMP`,
+            [guildId, discordUserId, wanikaniUserId, now]
         );
     }
 
     const cutoff = new Date(Date.now() - PRUNE_OLDER_THAN_HOURS * 60 * 60 * 1000).toISOString();
     await db.run(
-        `DELETE FROM queue_history WHERE user_id = ? AND guild_id = ? AND recorded_at < ?`,
-        [userId, guildId, cutoff]
+        `DELETE FROM queue_history WHERE guild_id = ? AND discord_user_id = ? AND recorded_at < ?`,
+        [guildId, discordUserId, cutoff]
     );
 }
 
-async function lastZeroWithin24h(userId, guildId) {
+async function lastZeroWithin24h(discordUserId, guildId) {
     const state = await db.get(
-        `SELECT last_zero_due_at FROM user_state WHERE user_id = ? AND guild_id = ?`,
-        [userId, guildId]
+        `SELECT last_zero_due_at FROM bot_user_state WHERE guild_id = ? AND discord_user_id = ?`,
+        [guildId, discordUserId]
     );
     if (!state?.last_zero_due_at) return false;
     const ageMs = Date.now() - new Date(state.last_zero_due_at).getTime();
     return ageMs >= 0 && ageMs <= TWENTY_FOUR_HOURS_MS;
 }
 
-async function getQueueComparison(userId, guildId) {
+async function getQueueComparison(discordUserId, guildId) {
     const recent = await db.get(
         `SELECT queue_size, recorded_at FROM queue_history
-         WHERE user_id = ? AND guild_id = ?
+         WHERE guild_id = ? AND discord_user_id = ?
          ORDER BY recorded_at DESC LIMIT 1`,
-        [userId, guildId]
+        [guildId, discordUserId]
     );
     if (!recent) return null;
 
@@ -52,9 +58,9 @@ async function getQueueComparison(userId, guildId) {
     const lower = new Date(Date.now() - KEPT_UP_LOWER_BOUND_HOURS * 60 * 60 * 1000).toISOString();
     const old = await db.get(
         `SELECT queue_size FROM queue_history
-         WHERE user_id = ? AND guild_id = ? AND recorded_at BETWEEN ? AND ?
+         WHERE guild_id = ? AND discord_user_id = ? AND recorded_at BETWEEN ? AND ?
          ORDER BY recorded_at ASC LIMIT 1`,
-        [userId, guildId, lower, upper]
+        [guildId, discordUserId, lower, upper]
     );
     if (!old) return null;
 
@@ -65,15 +71,15 @@ async function getQueueComparison(userId, guildId) {
     };
 }
 
-async function evaluateAllGoal(userId, guildId, reviewsCompleted) {
+async function evaluateAllGoal(discordUserId, guildId, reviewsCompleted) {
     const reviewsOk = reviewsCompleted > 0;
     if (!reviewsOk) return { ok: false, reason: 'no_reviews' };
 
-    if (await lastZeroWithin24h(userId, guildId)) {
+    if (await lastZeroWithin24h(discordUserId, guildId)) {
         return { ok: true, reason: 'cleared' };
     }
 
-    const comparison = await getQueueComparison(userId, guildId);
+    const comparison = await getQueueComparison(discordUserId, guildId);
     if (comparison?.keptUp) {
         return { ok: true, reason: 'kept_up' };
     }
