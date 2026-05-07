@@ -1,20 +1,9 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { fetchAllPages, getSubjectsByIds } = require('../helpers/wanikaniData');
+const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { decrypt } = require('../helpers/crypto');
-const { getReviewsSince, getSubjectsByIds } = require('../helpers/wanikaniData');
 const { base, error } = require('../helpers/embeds');
 const db = require('../db');
-
-const SRS_LABELS = {
-    1: '🌱 Apprentice I',
-    2: '🌱 Apprentice II',
-    3: '🌱 Apprentice III',
-    4: '🌱 Apprentice IV',
-    5: '🌿 Guru I',
-    6: '🌿 Guru II',
-    7: '🌳 Master',
-    8: '✨ Enlightened',
-    9: '🔥 Burned',
-};
 
 function srsGroup(stage) {
     if (stage >= 1 && stage <= 4) return 'apprentice';
@@ -43,13 +32,9 @@ module.exports = {
 
     async execute(interaction) {
         const userId = interaction.user.id;
-        const guildId = interaction.guild.id;
 
-        const row = await db.get(
-            `SELECT api_key FROM apikeys WHERE user_id = ? AND guild_id = ?`,
-            [userId, guildId]
-        );
-        if (!row) {
+        const account = await getAccountForDiscordUser(userId);
+        if (!account?.api_token_encrypted) {
             return interaction.reply({
                 embeds: [error('No API Key', 'Set your WaniKani key with `/setup apikey:<token>` first.')],
                 flags: MessageFlags.Ephemeral,
@@ -59,58 +44,91 @@ module.exports = {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         try {
-            const apiKey = decrypt(row.api_key);
+            const apiKey = decrypt(account.api_token_encrypted);
+            const wanikaniUserId = account.wanikani_user_id;
             const since = new Date();
             since.setUTCDate(since.getUTCDate() - 7);
+            const sinceISO = since.toISOString();
 
-            const reviews = await getReviewsSince(apiKey, since.toISOString());
-            const errored = reviews.filter(r =>
-                (r.data.incorrect_meaning_answers || 0) > 0 ||
-                (r.data.incorrect_reading_answers || 0) > 0
+            // Step 1: assignments updated in window with started_at before the window = reviewed items
+            const recentAssignments = await fetchAllPages(
+                `/assignments?updated_after=${encodeURIComponent(sinceISO)}&started=true`,
+                apiKey
+            );
+            const cutoff = new Date(sinceISO);
+            const reviewed = recentAssignments.filter(a =>
+                a.data.started_at && new Date(a.data.started_at) < cutoff
             );
 
-            if (reviews.length === 0) {
+            if (reviewed.length === 0) {
                 return interaction.editReply({
                     embeds: [base('📭 No Data Yet')
                         .setDescription('No reviews found in the past 7 days. Check back after you\'ve done some reviews!')],
                 });
             }
 
+            const subjectIds = [...new Set(reviewed.map(a => a.data.subject_id))];
+
+            // Step 2: current review_statistics for those subjects
+            const currentStats = [];
+            for (let i = 0; i < subjectIds.length; i += 500) {
+                const chunk = subjectIds.slice(i, i + 500);
+                const page = await fetchAllPages(
+                    `/review_statistics?subject_ids=${chunk.join(',')}`,
+                    apiKey
+                );
+                currentStats.push(...page);
+            }
+
+            // Step 3: oldest stored snapshot per subject — used as the pre-window baseline
+            const placeholders = subjectIds.map(() => '?').join(',');
+            const snapRows = await db.all(
+                `SELECT subject_id, meaning_incorrect, reading_incorrect
+                 FROM review_stat_snapshots
+                 WHERE wanikani_user_id = ? AND subject_id IN (${placeholders})
+                 GROUP BY subject_id
+                 HAVING snapshot_date = MIN(snapshot_date)`,
+                [wanikaniUserId, ...subjectIds]
+            );
+            const baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
+
+            // Step 4: diff — items where error counts increased since the baseline
+            const srsMap = new Map(reviewed.map(a => [a.data.subject_id, a.data.srs_stage]));
+            const errored = currentStats.filter(s => {
+                const base = baselineMap.get(s.data.subject_id);
+                const prevMeaning = base?.meaning_incorrect ?? 0;
+                const prevReading = base?.reading_incorrect ?? 0;
+                return (s.data.meaning_incorrect || 0) > prevMeaning ||
+                       (s.data.reading_incorrect || 0) > prevReading;
+            });
+
+            const noSnapshotData = baselineMap.size === 0;
+
             if (errored.length === 0) {
+                const desc = noSnapshotData
+                    ? 'No baseline data yet — snapshots are recorded during the daily summary. Check back tomorrow for accurate 7-day tracking.'
+                    : 'You haven\'t missed a single review in the past 7 days. Nice.';
                 return interaction.editReply({
-                    embeds: [base('🎯 No Mistakes!')
-                        .setDescription('You haven\'t missed a single review in the past 7 days. Nice.')],
+                    embeds: [base(noSnapshotData ? '📊 Building Baseline…' : '🎯 No Mistakes!')
+                        .setDescription(desc)],
                 });
             }
 
-            const latestPerSubject = new Map();
-            for (const r of errored) {
-                const id = r.data.subject_id;
-                const existing = latestPerSubject.get(id);
-                if (!existing || new Date(r.data.created_at) > new Date(existing.created_at)) {
-                    latestPerSubject.set(id, r.data);
-                }
-            }
-
-            const subjectIds = [...latestPerSubject.keys()];
-            const subjects = await getSubjectsByIds(apiKey, subjectIds);
+            const subjectIdsErrored = errored.map(s => s.data.subject_id);
+            const subjects = await getSubjectsByIds(apiKey, subjectIdsErrored);
             const subjectMap = new Map(subjects.map(s => [s.id, s.data]));
 
-            const items = [];
-            for (const [id, reviewData] of latestPerSubject) {
-                const subj = subjectMap.get(id);
-                if (!subj) continue;
-                items.push({
-                    subjectId: id,
-                    type: subj.object,
+            const items = errored.map(s => {
+                const subj = subjectMap.get(s.data.subject_id);
+                if (!subj) return null;
+                return {
+                    subjectId: s.data.subject_id,
                     characters: subj.characters || subj.slug || '?',
                     meanings: (subj.meanings || []).map(m => m.meaning).filter(Boolean),
-                    readings: (subj.readings || [])
-                        .filter(r => r.accepted_answer)
-                        .map(r => r.reading),
-                    srsStage: reviewData.ending_srs_stage,
-                });
-            }
+                    readings: (subj.readings || []).filter(r => r.accepted_answer).map(r => r.reading),
+                    srsStage: srsMap.get(s.data.subject_id) ?? 0,
+                };
+            }).filter(Boolean);
 
             items.sort((a, b) => b.srsStage - a.srsStage);
 
@@ -126,12 +144,10 @@ module.exports = {
 
             for (const groupKey of GROUP_ORDER) {
                 const groupItems = grouped.get(groupKey);
-                if (!groupItems || groupItems.length === 0) continue;
-                const lines = groupItems.map(formatMistakeLine);
-                const value = clipFieldValue(lines.join('\n'));
+                if (!groupItems?.length) continue;
                 embed.addFields({
                     name: `${GROUP_HEADER[groupKey]} (${groupItems.length})`,
-                    value,
+                    value: clipFieldValue(groupItems.map(formatMistakeLine).join('\n')),
                     inline: false,
                 });
             }

@@ -4,3 +4,4 @@ database.sqlite
 database.sqlite-shm
 database.sqlite-wal
 *.claude/
+WaniKani-Api-Reference.html

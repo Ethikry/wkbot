@@ -1,5 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpers/wanikaniData');
+const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { decrypt } = require('../helpers/crypto');
 const { base, error, renderMonthlyHeatmap, HEATMAP_LEGEND } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
@@ -18,26 +19,30 @@ module.exports = {
         const guildId = interaction.guild.id;
         const username = interaction.member?.displayName ?? interaction.user.displayName;
 
-        const row = await db.get(
-            `SELECT api_key FROM apikeys WHERE user_id = ? AND guild_id = ?`,
-            [userId, guildId]
-        );
-        if (!row) {
+        const account = await getAccountForDiscordUser(userId);
+        if (!account?.api_token_encrypted) {
             return interaction.reply({
                 embeds: [error('No API Key', 'Set your WaniKani key with `/setup apikey:<token>` first.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
 
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        // Make sure /wkstats works as the user's first interaction in a server.
+        await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+        await db.run(
+            `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
+            [guildId, userId]
+        );
+
+        await interaction.deferReply();
 
         try {
-            const apiKey = decrypt(row.api_key);
+            const apiKey = decrypt(account.api_token_encrypted);
             const data = await getWaniKaniData(apiKey);
             const { userData, pendingLessons, dueRightNow, dueNext24Hours } = data;
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
 
-            await recordPoll(userId, guildId, dueRightNow).catch(err =>
+            await recordPoll(userId, guildId, dueRightNow, account.wanikani_user_id).catch(err =>
                 console.error('[wkstats recordPoll]', err.message)
             );
 
@@ -45,13 +50,13 @@ module.exports = {
                 getSrsBreakdown(apiKey),
                 getLevelProgress(apiKey, userData.level),
                 db.all(
-                    `SELECT date, reviews_completed, lessons_completed FROM daily_snapshots
-                     WHERE user_id = ? AND guild_id = ? AND date >= date('now', ?)`,
-                    [userId, guildId, `-${HEATMAP_DAYS - 1} days`]
+                    `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
+                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date >= date('now', ?)`,
+                    [guildId, userId, `-${HEATMAP_DAYS - 1} days`]
                 ),
             ]);
 
-            const snapshotsByDate = new Map(snapshots.map(s => [s.date, s.reviews_completed]));
+            const snapshotsByDate = new Map(snapshots.map(s => [s.snapshot_date, s.reviews_completed]));
             const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6);
             const totalReviews = snapshots.reduce((acc, s) => acc + (s.reviews_completed || 0), 0);
             const totalLessons = snapshots.reduce((acc, s) => acc + (s.lessons_completed || 0), 0);

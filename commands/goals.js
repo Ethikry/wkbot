@@ -10,6 +10,7 @@ const {
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
 const { getApiKeyForUser } = require('../helpers/userKey');
+const { getWanikaniUserId } = require('../helpers/userLink');
 const { getWaniKaniData, getHitRate, getPersonalPace } = require('../helpers/wanikaniData');
 const {
     paceOptionsFor,
@@ -55,9 +56,7 @@ module.exports = {
         if (action === 'lt_confirm')       return handleLtConfirm(interaction);
         if (action === 'lt_customize')     return handleLtCustomize(interaction);
         if (action === 'lt_cancel')        return handleLtCancel(interaction);
-        if (action === 'alert_pace')       return toggleAlertPace(interaction);
-        if (action === 'alert_reviews')    return toggleAlertReviews(interaction);
-        if (action === 'alert_threshold')  return showThresholdModal(interaction);
+        if (action === 'alert_toggle')     return toggleAlerts(interaction);
         if (action === 'clear_yes')        return execClear(interaction);
         if (action === 'clear_no')         return rebuildOverview(interaction);
     },
@@ -65,7 +64,6 @@ module.exports = {
     async handleModal(interaction) {
         const cid = interaction.customId;
         if (cid === id('m_daily'))     return handleDailyModal(interaction);
-        if (cid === id('m_threshold')) return handleThresholdModal(interaction);
         if (cid === id('m_lt_init'))   return handleLtInitModal(interaction);
         if (cid === id('m_lt_custom')) return handleLtCustomModal(interaction);
     },
@@ -77,9 +75,9 @@ module.exports = {
 
 async function buildOverviewPayload(userId, guildId) {
     const [longGoal, dailyGoal] = await Promise.all([
-        db.get(`SELECT * FROM long_goals WHERE user_id = ?`, [userId]),
+        db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [userId]),
         guildId
-            ? db.get(`SELECT * FROM goals WHERE user_id = ? AND guild_id = ?`, [userId, guildId])
+            ? db.get(`SELECT * FROM goals WHERE guild_id = ? AND discord_user_id = ?`, [guildId, userId])
             : null,
     ]);
 
@@ -106,10 +104,10 @@ async function buildOverviewPayload(userId, guildId) {
         }
 
         lines.push('**Long-term Goal**');
-        lines.push(`🎯 Level ${longGoal.target_level} by **${longGoal.deadline}**`);
+        lines.push(`🎯 Level ${longGoal.target_level} by **${longGoal.deadline ?? 'no deadline'}**`);
         if (currentLevel !== null) lines.push(`Current level: ${currentLevel}`);
-        lines.push(`Pace: ${fmtPace(longGoal.pace_mode)} — ${longGoal.days_per_level.toFixed(1)} days/level`);
-        lines.push(`Daily target: ${longGoal.daily_lessons} lessons · ~${longGoal.daily_reviews} reviews`);
+        lines.push(`Pace: ${fmtPace(longGoal.pace_mode)} — ${(longGoal.days_per_level ?? 0).toFixed(1)} days/level`);
+        lines.push(`Daily target: ${longGoal.daily_lessons ?? 0} lessons · ~${longGoal.daily_reviews ?? 0} reviews`);
         if (proj) {
             if (proj.underWaniKaniMinimum) {
                 lines.push('⛔ Pace is below WaniKani minimum — not achievable');
@@ -120,21 +118,20 @@ async function buildOverviewPayload(userId, guildId) {
             }
         }
         lines.push('');
-        lines.push('**Alerts**');
-        lines.push(`• Daily pace DM: ${longGoal.notify_pace_daily ? 'on' : 'off'}`);
-        lines.push(`• Reviews-available DM: ${longGoal.notify_reviews_available ? `on (≥ ${longGoal.notify_review_threshold})` : 'off'}`);
+        lines.push(`**Alerts:** ${longGoal.notify_enabled ? '🔔 on' : '🔕 off'}`);
     } else {
         lines.push('**Long-term Goal:** not set');
     }
 
     if (guildId) {
         lines.push('');
-        const hasDailyNumbers = dailyGoal && (dailyGoal.daily_lessons || dailyGoal.daily_reviews || dailyGoal.daily_all);
+        const hasDailyNumbers = dailyGoal && (dailyGoal.daily_lessons || dailyGoal.daily_all_lessons || dailyGoal.daily_reviews || dailyGoal.daily_all_reviews);
         if (hasDailyNumbers) {
             lines.push('**Daily Goals** (this server)');
-            if (dailyGoal.daily_lessons) lines.push(`• Lessons: **${dailyGoal.daily_lessons}**/day`);
-            if (dailyGoal.daily_reviews) lines.push(`• Reviews: **${dailyGoal.daily_reviews}**/day`);
-            if (dailyGoal.daily_all)     lines.push('• Clear queue daily: **on**');
+            if (dailyGoal.daily_all_lessons)  lines.push('• Lessons: **all**/day');
+            else if (dailyGoal.daily_lessons) lines.push(`• Lessons: **${dailyGoal.daily_lessons}**/day`);
+            if (dailyGoal.daily_all_reviews)  lines.push('• Clear review queue daily: **on**');
+            else if (dailyGoal.daily_reviews) lines.push(`• Reviews: **${dailyGoal.daily_reviews}**/day`);
         } else if (longGoal) {
             lines.push('**Daily Goals** (this server): derived from long-term goal');
         } else {
@@ -201,15 +198,15 @@ async function startLtWizardDM(interaction, client) {
     try {
         const dm = await interaction.user.createDM();
         await dm.send({
-            embeds: [base('🎯 Long-Term Goal Wizard').setDescription(
-                'Click **Start Wizard** to begin. You\'ll enter a target level, deadline, and choose a pace.'
+            embeds: [base('🎯 Set a Long-Term Goal').setDescription(
+                'Click **Get Started** to set your target level, deadline, and pace.'
             )],
             components: [new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(id('lt_start')).setLabel('Start Wizard').setEmoji('🚀').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId(id('lt_start')).setLabel('Get Started').setEmoji('🎯').setStyle(ButtonStyle.Primary),
             )],
         });
         return interaction.editReply({
-            embeds: [success('Check Your DMs! 📬', 'The long-term goal wizard has been sent to your DMs.')],
+            embeds: [success('Check Your DMs! 📬', 'A long-term goal setup has been sent to your DMs.')],
             components: [],
         });
     } catch (e) {
@@ -328,7 +325,7 @@ async function handleLtPace(interaction, paceKey) {
     const state = wizard.get(interaction.user.id);
     if (!state) {
         return interaction.update({
-            embeds: [error('Wizard Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
             components: [],
         });
     }
@@ -336,7 +333,7 @@ async function handleLtPace(interaction, paceKey) {
     const chosen = presets[paceKey];
     if (!chosen) {
         return interaction.update({
-            embeds: [error('Unknown Pace', 'That pace option is no longer available. Start the wizard again.')],
+            embeds: [error('Unknown Pace', 'That pace option is no longer available. Please start over.')],
             components: [],
         });
     }
@@ -351,11 +348,24 @@ async function handleLtCustomize(interaction) {
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return interaction.update({
-            embeds: [error('Wizard Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
             components: [],
         });
     }
     const chosen = buildPresetMap(state)[state.chosenPaceKey];
+    const currentLessons = state.customLessons ?? chosen.projection.lessonsPerDay;
+
+    // Pre-calculate reviews from the current lesson count so the field shows an accurate estimate.
+    const derivedDays = ITEMS_PER_LEVEL / currentLessons;
+    const previewProj = projectPace({
+        targetLevel: state.targetLevel,
+        currentLevel: state.currentLevel,
+        deadline: state.deadline,
+        hitRate: state.hitRate,
+        daysPerLevel: derivedDays,
+    });
+    const prefilledReviews = state.customReviews ?? previewProj.reviewsPerDay;
+
     await interaction.showModal(
         new ModalBuilder()
             .setCustomId(id('m_lt_custom'))
@@ -367,7 +377,7 @@ async function handleLtCustomize(interaction) {
                         .setLabel('Daily lessons')
                         .setStyle(TextInputStyle.Short)
                         .setMinLength(1).setMaxLength(4)
-                        .setValue(String(state.customLessons ?? chosen.projection.lessonsPerDay))
+                        .setValue(String(currentLessons))
                         .setRequired(true),
                 ),
                 new ActionRowBuilder().addComponents(
@@ -376,7 +386,7 @@ async function handleLtCustomize(interaction) {
                         .setLabel('Daily reviews (estimate)')
                         .setStyle(TextInputStyle.Short)
                         .setMinLength(1).setMaxLength(4)
-                        .setValue(String(state.customReviews ?? chosen.projection.reviewsPerDay))
+                        .setValue(String(prefilledReviews))
                         .setRequired(true),
                 ),
             )
@@ -385,7 +395,8 @@ async function handleLtCustomize(interaction) {
 
 async function handleLtCustomModal(interaction) {
     const lessons = parseInt(interaction.fields.getTextInputValue('lessons').trim(), 10);
-    const reviews = parseInt(interaction.fields.getTextInputValue('reviews').trim(), 10);
+    const reviewsRaw = interaction.fields.getTextInputValue('reviews').trim();
+    const reviewsInput = parseInt(reviewsRaw, 10);
 
     if (!Number.isInteger(lessons) || lessons < 1 || lessons > 500) {
         return respondModal(interaction, {
@@ -393,25 +404,39 @@ async function handleLtCustomModal(interaction) {
             components: ltConfirmRows(),
         });
     }
-    if (!Number.isInteger(reviews) || reviews < 1 || reviews > 2000) {
-        return respondModal(interaction, {
-            embeds: [error('Invalid Reviews', 'Daily reviews must be between 1 and 2000.')],
-            components: ltConfirmRows(),
-        });
-    }
 
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return respondModal(interaction, {
-            embeds: [error('Wizard Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
             components: [],
         });
     }
 
-    wizard.update(interaction.user.id, { customLessons: lessons, customReviews: reviews });
+    // Derive days/level from lessons and re-run projection so feasibility + finish date are accurate.
+    const derivedDaysPerLevel = ITEMS_PER_LEVEL / lessons;
+    const freshProj = projectPace({
+        targetLevel: state.targetLevel,
+        currentLevel: state.currentLevel,
+        deadline: state.deadline,
+        hitRate: state.hitRate,
+        daysPerLevel: derivedDaysPerLevel,
+    });
+
+    // Use auto-calculated reviews unless the user explicitly changed the field.
+    const autoReviews = freshProj.reviewsPerDay;
+    const finalReviews = (Number.isInteger(reviewsInput) && reviewsInput >= 1 && reviewsInput <= 2000 && reviewsInput !== autoReviews)
+        ? reviewsInput
+        : autoReviews;
+
+    wizard.update(interaction.user.id, { customLessons: lessons, customReviews: finalReviews, customDaysPerLevel: derivedDaysPerLevel });
     const updated = wizard.get(interaction.user.id);
     const chosen = buildPresetMap(updated)[updated.chosenPaceKey];
-    const override = { ...chosen, projection: { ...chosen.projection, lessonsPerDay: lessons, reviewsPerDay: reviews } };
+    const override = {
+        ...chosen,
+        daysPerLevel: derivedDaysPerLevel,
+        projection: { ...freshProj, lessonsPerDay: lessons, reviewsPerDay: finalReviews },
+    };
 
     return respondModal(interaction, {
         embeds: [ltConfirmEmbed(updated, override, { customized: true })],
@@ -423,21 +448,30 @@ async function handleLtConfirm(interaction) {
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return interaction.update({
-            embeds: [error('Wizard Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
             components: [],
         });
     }
     const chosen = buildPresetMap(state)[state.chosenPaceKey];
     const finalLessons = state.customLessons ?? chosen.projection.lessonsPerDay;
     const finalReviews = state.customReviews ?? chosen.projection.reviewsPerDay;
+    const finalDaysPerLevel = state.customDaysPerLevel ?? chosen.daysPerLevel;
 
+    const wanikaniUserId = await getWanikaniUserId(interaction.user.id);
+    if (!wanikaniUserId) {
+        return interaction.update({
+            embeds: [error('No WaniKani Account', 'Run `/setup apikey:<token>` in a server to link your WaniKani account first.')],
+            components: [],
+        });
+    }
     await db.run(
         `INSERT INTO long_goals (
-            user_id, target_level, deadline, pace_mode,
+            discord_user_id, wanikani_user_id, target_level, deadline, pace_mode,
             days_per_level, items_per_level,
-            daily_lessons, daily_reviews, hit_rate, created_at
+            daily_lessons, daily_reviews, hit_rate
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
+        ON CONFLICT(discord_user_id) DO UPDATE SET
+            wanikani_user_id = excluded.wanikani_user_id,
             target_level = excluded.target_level,
             deadline = excluded.deadline,
             pace_mode = excluded.pace_mode,
@@ -446,12 +480,11 @@ async function handleLtConfirm(interaction) {
             daily_lessons = excluded.daily_lessons,
             daily_reviews = excluded.daily_reviews,
             hit_rate = excluded.hit_rate,
-            created_at = excluded.created_at`,
+            updated_at = CURRENT_TIMESTAMP`,
         [
-            interaction.user.id, state.targetLevel, state.deadline, chosen.key,
-            chosen.daysPerLevel, ITEMS_PER_LEVEL,
+            interaction.user.id, wanikaniUserId, state.targetLevel, state.deadline, chosen.key,
+            finalDaysPerLevel, ITEMS_PER_LEVEL,
             finalLessons, finalReviews, state.hitRate,
-            new Date().toISOString(),
         ]
     );
     wizard.remove(interaction.user.id);
@@ -491,8 +524,8 @@ async function showDailyModal(interaction) {
         });
     }
     const existing = await db.get(
-        `SELECT daily_lessons, daily_reviews, daily_all FROM goals WHERE user_id = ? AND guild_id = ?`,
-        [interaction.user.id, interaction.guildId]
+        `SELECT daily_lessons, daily_reviews, daily_all_reviews, daily_all_lessons FROM goals WHERE guild_id = ? AND discord_user_id = ?`,
+        [interaction.guildId, interaction.user.id]
     );
     await interaction.showModal(
         new ModalBuilder()
@@ -506,7 +539,7 @@ async function showDailyModal(interaction) {
                         .setStyle(TextInputStyle.Short)
                         .setMaxLength(5)
                         .setPlaceholder("e.g. 20")
-                        .setValue(existing?.daily_lessons ? String(existing.daily_lessons) : '')
+                        .setValue(existing?.daily_all_lessons ? 'all' : (existing?.daily_lessons ? String(existing.daily_lessons) : ''))
                         .setRequired(false),
                 ),
                 new ActionRowBuilder().addComponents(
@@ -516,7 +549,7 @@ async function showDailyModal(interaction) {
                         .setStyle(TextInputStyle.Short)
                         .setMaxLength(5)
                         .setPlaceholder("e.g. 100")
-                        .setValue(existing?.daily_all ? 'all' : (existing?.daily_reviews ? String(existing.daily_reviews) : ''))
+                        .setValue(existing?.daily_all_reviews ? 'all' : (existing?.daily_reviews ? String(existing.daily_reviews) : ''))
                         .setRequired(false),
                 ),
             )
@@ -534,10 +567,10 @@ async function handleDailyModal(interaction) {
     const lessonsRaw = interaction.fields.getTextInputValue('lessons').trim().toLowerCase();
     const reviewsRaw = interaction.fields.getTextInputValue('reviews').trim().toLowerCase();
 
-    let dailyLessons = 0, dailyReviews = 0, dailyAll = 0;
+    let dailyLessons = 0, dailyAllLessons = 0, dailyReviews = 0, dailyAllReviews = 0;
 
     if (lessonsRaw === 'all') {
-        dailyAll = 1;
+        dailyAllLessons = 1;
     } else if (lessonsRaw !== '') {
         const n = parseInt(lessonsRaw, 10);
         if (!Number.isInteger(n) || n < 0 || n > 500) {
@@ -550,7 +583,7 @@ async function handleDailyModal(interaction) {
     }
 
     if (reviewsRaw === 'all') {
-        dailyAll = 1;
+        dailyAllReviews = 1;
     } else if (reviewsRaw !== '') {
         const n = parseInt(reviewsRaw, 10);
         if (!Number.isInteger(n) || n < 0 || n > 2000) {
@@ -563,29 +596,28 @@ async function handleDailyModal(interaction) {
     }
 
     const { user: { id: userId }, guildId } = interaction;
-    const existing = await db.get(
-        `SELECT daily_lessons FROM goals WHERE user_id = ? AND guild_id = ?`,
-        [userId, guildId]
+    await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+    await db.run(
+        `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
+        [guildId, userId]
     );
-    if (existing) {
-        await db.run(
-            `UPDATE goals SET daily_lessons = ?, daily_reviews = ?, daily_all = ? WHERE user_id = ? AND guild_id = ?`,
-            [dailyLessons, dailyReviews, dailyAll, userId, guildId]
-        );
-    } else {
-        await db.run(
-            `INSERT INTO goals (user_id, guild_id, daily_lessons, daily_reviews, daily_all) VALUES (?, ?, ?, ?, ?)`,
-            [userId, guildId, dailyLessons, dailyReviews, dailyAll]
-        );
-    }
+    await db.run(
+        `INSERT INTO goals (guild_id, discord_user_id, daily_lessons, daily_all_lessons, daily_reviews, daily_all_reviews)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+            daily_lessons = excluded.daily_lessons,
+            daily_all_lessons = excluded.daily_all_lessons,
+            daily_reviews = excluded.daily_reviews,
+            daily_all_reviews = excluded.daily_all_reviews,
+            updated_at = CURRENT_TIMESTAMP`,
+        [guildId, userId, dailyLessons, dailyAllLessons, dailyReviews, dailyAllReviews]
+    );
 
-    const summaryParts = dailyAll
-        ? ['Clear queue daily: **on**']
-        : [
-            dailyLessons ? `Lessons: **${dailyLessons}**/day` : null,
-            dailyReviews ? `Reviews: **${dailyReviews}**/day` : null,
-            (!dailyLessons && !dailyReviews) ? 'No specific targets set.' : null,
-        ].filter(Boolean);
+    const summaryParts = [
+        dailyAllLessons ? 'Lessons: **all**/day' : (dailyLessons ? `Lessons: **${dailyLessons}**/day` : null),
+        dailyAllReviews ? 'Clear review queue daily: **on**' : (dailyReviews ? `Reviews: **${dailyReviews}**/day` : null),
+        (!dailyAllLessons && !dailyLessons && !dailyAllReviews && !dailyReviews) ? 'No specific targets set.' : null,
+    ].filter(Boolean);
 
     return respondModal(interaction, {
         embeds: [success('Daily Goals Updated', summaryParts.join('\n') + '\nProgress appears in the daily summary.')],
@@ -599,7 +631,7 @@ async function handleDailyModal(interaction) {
 
 async function showAlertConfig(interaction) {
     await interaction.deferUpdate();
-    const goal = await db.get(`SELECT * FROM long_goals WHERE user_id = ?`, [interaction.user.id]);
+    const goal = await db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [interaction.user.id]);
     if (!goal) {
         return interaction.editReply({
             embeds: [error('No Long-Term Goal', 'Set a long-term goal first before configuring alerts.')],
@@ -612,88 +644,36 @@ async function showAlertConfig(interaction) {
     });
 }
 
-async function toggleAlertPace(interaction) {
+async function toggleAlerts(interaction) {
     await interaction.deferUpdate();
-    const goal = await db.get(`SELECT * FROM long_goals WHERE user_id = ?`, [interaction.user.id]);
+    const goal = await db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [interaction.user.id]);
     if (!goal) return interaction.editReply({ embeds: [error('No Goal', 'Long-term goal not found.')], components: [] });
-    const newVal = goal.notify_pace_daily ? 0 : 1;
-    await db.run(`UPDATE long_goals SET notify_pace_daily = ? WHERE user_id = ?`, [newVal, interaction.user.id]);
-    goal.notify_pace_daily = newVal;
-    return interaction.editReply({ embeds: [alertEmbed(goal)], components: [alertButtons(goal)] });
-}
-
-async function toggleAlertReviews(interaction) {
-    await interaction.deferUpdate();
-    const goal = await db.get(`SELECT * FROM long_goals WHERE user_id = ?`, [interaction.user.id]);
-    if (!goal) return interaction.editReply({ embeds: [error('No Goal', 'Long-term goal not found.')], components: [] });
-    const newVal = goal.notify_reviews_available ? 0 : 1;
-    await db.run(`UPDATE long_goals SET notify_reviews_available = ? WHERE user_id = ?`, [newVal, interaction.user.id]);
-    goal.notify_reviews_available = newVal;
-    return interaction.editReply({ embeds: [alertEmbed(goal)], components: [alertButtons(goal)] });
-}
-
-async function showThresholdModal(interaction) {
-    const goal = await db.get(`SELECT notify_review_threshold FROM long_goals WHERE user_id = ?`, [interaction.user.id]);
-    await interaction.showModal(
-        new ModalBuilder()
-            .setCustomId(id('m_threshold'))
-            .setTitle('Set Review Alert Threshold')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('threshold')
-                        .setLabel('Alert when review queue reaches (1–1000)')
-                        .setStyle(TextInputStyle.Short)
-                        .setMinLength(1).setMaxLength(4)
-                        .setValue(String(goal?.notify_review_threshold ?? 50))
-                        .setRequired(true),
-                ),
-            )
+    const newVal = goal.notify_enabled ? 0 : 1;
+    await db.run(
+        `UPDATE long_goals SET notify_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
+        [newVal, interaction.user.id]
     );
-}
-
-async function handleThresholdModal(interaction) {
-    const n = parseInt(interaction.fields.getTextInputValue('threshold').trim(), 10);
-    if (!Number.isInteger(n) || n < 1 || n > 1000) {
-        return respondModal(interaction, {
-            embeds: [error('Invalid Threshold', 'Enter a number between 1 and 1000.')],
-            components: [],
-        });
-    }
-    await db.run(`UPDATE long_goals SET notify_review_threshold = ? WHERE user_id = ?`, [n, interaction.user.id]);
-    const goal = await db.get(`SELECT * FROM long_goals WHERE user_id = ?`, [interaction.user.id]);
-    return respondModal(interaction, { embeds: [alertEmbed(goal)], components: [alertButtons(goal)] });
+    goal.notify_enabled = newVal;
+    return interaction.editReply({ embeds: [alertEmbed(goal)], components: [alertButtons(goal)] });
 }
 
 function alertEmbed(goal) {
     return base('🔔 Alert Configuration').setDescription([
-        '**Daily Pace DM**',
-        `Status: ${goal.notify_pace_daily ? '🔔 **on**' : '🔕 off'}`,
-        'Sends a DM if you complete fewer than 50% of your daily lesson target by 10 PM.',
+        `**Notifications:** ${goal.notify_enabled ? '🔔 **on**' : '🔕 off'}`,
         '',
-        '**Reviews-Available DM**',
-        `Status: ${goal.notify_reviews_available ? `🔔 **on** (≥ ${goal.notify_review_threshold} reviews)` : '🔕 off'}`,
-        'Sends a DM when your review queue exceeds the threshold. Max once every 4 hours.',
+        'When on, you\'ll receive a DM:',
+        '• If you fall behind your daily lesson target (checked nightly).',
+        '• When your review queue piles up to a high level (rate-limited).',
     ].join('\n'));
 }
 
 function alertButtons(goal) {
     return new ActionRowBuilder().addComponents(
         new ButtonBuilder()
-            .setCustomId(id('alert_pace'))
-            .setLabel(goal.notify_pace_daily ? 'Disable pace DM' : 'Enable pace DM')
-            .setEmoji(goal.notify_pace_daily ? '🔕' : '🔔')
-            .setStyle(goal.notify_pace_daily ? ButtonStyle.Danger : ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId(id('alert_reviews'))
-            .setLabel(goal.notify_reviews_available ? 'Disable reviews DM' : 'Enable reviews DM')
-            .setEmoji(goal.notify_reviews_available ? '🔕' : '🔔')
-            .setStyle(goal.notify_reviews_available ? ButtonStyle.Danger : ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId(id('alert_threshold'))
-            .setLabel(`Set threshold (${goal.notify_review_threshold})`)
-            .setEmoji('⚙️')
-            .setStyle(ButtonStyle.Secondary),
+            .setCustomId(id('alert_toggle'))
+            .setLabel(goal.notify_enabled ? 'Disable notifications' : 'Enable notifications')
+            .setEmoji(goal.notify_enabled ? '🔕' : '🔔')
+            .setStyle(goal.notify_enabled ? ButtonStyle.Danger : ButtonStyle.Success),
         new ButtonBuilder()
             .setCustomId(id('back'))
             .setLabel('Back')
@@ -724,8 +704,8 @@ function showClearConfirm(interaction) {
 async function execClear(interaction) {
     const userId = interaction.user.id;
     const [ltResult] = await Promise.all([
-        db.run(`DELETE FROM long_goals WHERE user_id = ?`, [userId]),
-        db.run(`DELETE FROM goals WHERE user_id = ?`, [userId]),
+        db.run(`DELETE FROM long_goals WHERE discord_user_id = ?`, [userId]),
+        db.run(`DELETE FROM goals WHERE discord_user_id = ?`, [userId]),
     ]);
     return interaction.update({
         embeds: [success(
@@ -755,7 +735,6 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
         embed.addFields({
             name: `${opt.label} — ${opt.daysPerLevel.toFixed(1)} days/level`,
             value: [
-                opt.summary,
                 `**${p.lessonsPerDay}** lessons/day · **~${p.reviewsPerDay}** reviews/day`,
                 p.underWaniKaniMinimum
                     ? '⛔ Below WaniKani SRS minimum — not achievable'

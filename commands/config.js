@@ -34,18 +34,14 @@ module.exports = {
         .addBooleanOption(o =>
             o.setName('levelup').setDescription('Level-up announcements: true=enable, false=disable'))
         .addBooleanOption(o =>
-            o.setName('reviews_cleared').setDescription('Reviews-cleared celebration: true=enable, false=disable'))
-        .addBooleanOption(o =>
             o.setName('daily').setDescription('Daily summary post: true=enable, false=disable'))
-        .addStringOption(o =>
-            o.setName('daily_time').setDescription('Daily summary time, HH:MM 24h'))
         .addBooleanOption(o =>
             o.setName('weekly').setDescription('Weekly leaderboard: true=enable, false=disable'))
         .addStringOption(o =>
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
         .addStringOption(o =>
-            o.setName('weekly_time').setDescription('Weekly leaderboard time, HH:MM 24h'))
+            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, UTC)'))
         .addChannelOption(o =>
             o.setName('channel').setDescription('Output channel or thread for bot posts')
                 .addChannelTypes(...OUTPUT_CHANNEL_TYPES))
@@ -65,31 +61,23 @@ module.exports = {
 
         const burn = interaction.options.getBoolean('burn');
         const levelup = interaction.options.getBoolean('levelup');
-        const reviewsCleared = interaction.options.getBoolean('reviews_cleared');
         const daily = interaction.options.getBoolean('daily');
-        const dailyTime = interaction.options.getString('daily_time');
         const weekly = interaction.options.getBoolean('weekly');
         const weeklyDay = interaction.options.getString('weekly_day');
-        const weeklyTime = interaction.options.getString('weekly_time');
+        const time = interaction.options.getString('time');
         const channel = interaction.options.getChannel('channel');
         const modrole = interaction.options.getRole('modrole');
 
-        const noneSet = [burn, levelup, reviewsCleared, daily, dailyTime, weekly, weeklyDay, weeklyTime, channel, modrole]
+        const noneSet = [burn, levelup, daily, weekly, weeklyDay, time, channel, modrole]
             .every(v => v === null);
 
         if (noneSet) {
             return showSettings(interaction, guildId);
         }
 
-        if (dailyTime !== null && !VALID_TIME.test(dailyTime)) {
+        if (time !== null && !VALID_TIME.test(time)) {
             return interaction.reply({
-                embeds: [error('Invalid daily_time', 'Use 24-hour `HH:MM`, e.g. `15:00`.')],
-                flags: MessageFlags.Ephemeral,
-            });
-        }
-        if (weeklyTime !== null && !VALID_TIME.test(weeklyTime)) {
-            return interaction.reply({
-                embeds: [error('Invalid weekly_time', 'Use 24-hour `HH:MM`, e.g. `20:00`.')],
+                embeds: [error('Invalid time', 'Use 24-hour `HH:MM` UTC, e.g. `15:00`.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
@@ -100,30 +88,25 @@ module.exports = {
         let scheduleChanged = false;
 
         if (burn !== null) {
-            fields.push('burn_celebrations = ?');
+            fields.push('burn_celebrations_enabled = ?');
             params.push(burn ? 1 : 0);
             summary.push(`Burn celebrations: **${burn ? 'on' : 'off'}**`);
         }
         if (levelup !== null) {
-            fields.push('level_up_announcements = ?');
+            fields.push('level_up_announcements_enabled = ?');
             params.push(levelup ? 1 : 0);
             summary.push(`Level-up announcements: **${levelup ? 'on' : 'off'}**`);
         }
-        if (reviewsCleared !== null) {
-            fields.push('reviews_cleared_announcements = ?');
-            params.push(reviewsCleared ? 1 : 0);
-            summary.push(`Reviews-cleared celebrations: **${reviewsCleared ? 'on' : 'off'}**`);
-        }
         if (daily !== null) {
-            fields.push('daily_enabled = ?');
+            fields.push('daily_summary_enabled = ?');
             params.push(daily ? 1 : 0);
             summary.push(`Daily summary: **${daily ? 'on' : 'off'}**`);
             scheduleChanged = true;
         }
-        if (dailyTime !== null) {
-            fields.push('daily_time = ?');
-            params.push(dailyTime);
-            summary.push(`Daily summary time: **${dailyTime}**`);
+        if (time !== null) {
+            fields.push('daily_summary_time = ?', 'weekly_leaderboard_time = ?');
+            params.push(time, time);
+            summary.push(`Scheduled message time: **${time} UTC**`);
             scheduleChanged = true;
         }
         if (weekly !== null) {
@@ -138,14 +121,8 @@ module.exports = {
             summary.push(`Weekly leaderboard day: **${weeklyDay[0].toUpperCase() + weeklyDay.slice(1)}**`);
             scheduleChanged = true;
         }
-        if (weeklyTime !== null) {
-            fields.push('weekly_leaderboard_time = ?');
-            params.push(weeklyTime);
-            summary.push(`Weekly leaderboard time: **${weeklyTime}**`);
-            scheduleChanged = true;
-        }
         if (channel !== null) {
-            fields.push('channel_id = ?');
+            fields.push('announcement_channel_id = ?');
             params.push(channel.id);
             summary.push(`Output channel: <#${channel.id}>`);
             scheduleChanged = true;
@@ -156,6 +133,7 @@ module.exports = {
             summary.push(`Mod role: <@&${modrole.id}>`);
         }
 
+        fields.push('updated_at = CURRENT_TIMESTAMP');
         params.push(guildId);
         await db.run(
             `UPDATE guild_settings SET ${fields.join(', ')} WHERE guild_id = ?`,
@@ -173,8 +151,8 @@ module.exports = {
 
 async function showSettings(interaction, guildId) {
     const s = await db.get(`SELECT * FROM guild_settings WHERE guild_id = ?`, [guildId]);
-    const channelStr = s.channel_id
-        ? `<#${s.channel_id}>`
+    const channelStr = s.announcement_channel_id
+        ? `<#${s.announcement_channel_id}>`
         : '*(not set — falls back to channel named 日本語上手 if present)*';
     const modRoleStr = s.mod_role_id
         ? `<@&${s.mod_role_id}>`
@@ -183,22 +161,22 @@ async function showSettings(interaction, guildId) {
     const embed = base('⚙️ Server Settings')
         .addFields(
             { name: 'Output channel', value: channelStr, inline: false },
+            { name: 'Scheduled time (UTC)', value: `**${s.daily_summary_time}**`, inline: true },
             {
                 name: 'Daily summary',
-                value: s.daily_enabled ? `on at **${s.daily_time}** UTC` : 'off',
+                value: s.daily_summary_enabled ? 'on' : 'off',
                 inline: true,
             },
             {
                 name: 'Weekly leaderboard',
                 value: s.weekly_leaderboard_enabled
-                    ? `on, **${dayName(s.weekly_leaderboard_day)} ${s.weekly_leaderboard_time}** UTC`
+                    ? `on, **${dayName(s.weekly_leaderboard_day)}**`
                     : 'off',
                 inline: true,
             },
             { name: 'Mod role', value: modRoleStr, inline: false },
-            { name: 'Level-up announcements', value: s.level_up_announcements ? 'on' : 'off', inline: true },
-            { name: 'Burn celebrations', value: s.burn_celebrations ? 'on' : 'off', inline: true },
-            { name: 'Reviews-cleared celebrations', value: s.reviews_cleared_announcements ? 'on' : 'off', inline: true },
+            { name: 'Level-up announcements', value: s.level_up_announcements_enabled ? 'on' : 'off', inline: true },
+            { name: 'Burn celebrations', value: s.burn_celebrations_enabled ? 'on' : 'off', inline: true },
         );
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

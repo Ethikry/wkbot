@@ -10,8 +10,8 @@ module.exports = {
 
     async execute(interaction) {
         const row = await db.get(
-            `SELECT current_streak, longest_streak, last_review_date FROM streaks WHERE user_id = ? AND guild_id = ?`,
-            [interaction.user.id, interaction.guild.id]
+            `SELECT current_streak, longest_streak, last_review_date FROM streaks WHERE guild_id = ? AND discord_user_id = ?`,
+            [interaction.guild.id, interaction.user.id]
         );
 
         if (!row) {

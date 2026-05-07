@@ -1,7 +1,7 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { success, error } = require('../helpers/embeds');
-const { decrypt } = require('../helpers/crypto');
 const { wkFetch } = require('../helpers/wanikaniData');
+const { getDecryptedToken } = require('../helpers/userLink');
 const db = require('../db');
 
 module.exports = {
@@ -14,11 +14,8 @@ module.exports = {
         const userId = interaction.user.id;
         const guildId = interaction.guild.id;
 
-        const row = await db.get(
-            `SELECT api_key FROM apikeys WHERE user_id = ? AND guild_id = ?`,
-            [userId, guildId]
-        );
-        if (!row) {
+        const apiKey = await getDecryptedToken(userId);
+        if (!apiKey) {
             return interaction.reply({
                 embeds: [error('No API Key', 'Set your key with `/setup` first.')],
                 flags: MessageFlags.Ephemeral,
@@ -28,12 +25,21 @@ module.exports = {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         try {
-            const userJson = await wkFetch('/user', decrypt(row.api_key));
+            const userJson = await wkFetch('/user', apiKey);
             const onVacation = !!userJson.data.current_vacation_started_at;
             const newPing = onVacation ? 0 : 1;
             await db.run(
-                `UPDATE apikeys SET ping_enabled = ? WHERE user_id = ? AND guild_id = ?`,
-                [newPing, userId, guildId]
+                `INSERT INTO reminder_settings (guild_id, discord_user_id, reviews_ping_enabled)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                    reviews_ping_enabled = excluded.reviews_ping_enabled,
+                    updated_at = CURRENT_TIMESTAMP`,
+                [guildId, userId, newPing]
+            );
+            await db.run(
+                `UPDATE wanikani_accounts SET current_vacation_started_at = ?, last_user_sync_at = CURRENT_TIMESTAMP
+                 WHERE discord_user_id = ?`,
+                [userJson.data.current_vacation_started_at ?? null, userId]
             );
             return interaction.editReply({
                 embeds: [success(
