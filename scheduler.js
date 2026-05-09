@@ -3,26 +3,27 @@ const { EmbedBuilder } = require('discord.js');
 const db = require('./db');
 const { decrypt } = require('./helpers/crypto');
 const {
-    wkFetch,
-    fetchAllPages,
     getWaniKaniData,
     getReviewsCompletedSince,
-    getLessonsCompletedSince,
     getBurnedCount,
     getResetsSince,
     clearCacheForApiKey,
 } = require('./helpers/wanikaniData');
+const wkSync = require('./helpers/wkSync');
 const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, COLOR_SUCCESS, FOOTER } = require('./helpers/embeds');
 const { recordPoll, evaluateAllGoal } = require('./helpers/zerostate');
 const { pickShameLine } = require('./helpers/shame');
+const { logReminderEvent } = require('./helpers/reminderEvents');
+const { evaluateAchievements } = require('./helpers/achievements');
 
 const guildJobs = new Map();
-let pollJob = null;
+let summaryRefreshJobHandle = null;
+let slowDetectionJobHandle = null;
+let dailySyncJobHandle = null;
 let paceAlertJobHandle = null;
 
-const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
 const TWENTY_HOURS_MS = 20 * 60 * 60 * 1000;
-const REVIEWS_AVAILABLE_DM_THRESHOLD = 50;
 const MIDNIGHT_UTC_TODAY = () => {
     const d = new Date();
     d.setUTCHours(0, 0, 0, 0);
@@ -109,8 +110,7 @@ async function fetchUserSummaries(guild, rows) {
         const member = await guild.members.fetch(row.discord_user_id).catch(() => null);
         const username = member ? member.displayName : 'Unknown';
         try {
-            const apiKey = decrypt(row.api_token_encrypted);
-            const data = await getWaniKaniData(apiKey);
+            const data = await getWaniKaniData(row);
             await recordPoll(row.discord_user_id, guild.id, data.dueRightNow, row.wanikani_user_id).catch(err =>
                 console.error(`[recordPoll] ${row.discord_user_id}@${guild.id}:`, err.message)
             );
@@ -264,10 +264,23 @@ async function dailyJob(client, guildId) {
             await appendGoalProgress(guildId, guild, embed);
 
             const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
-            await channel.send({
+            const sent = await channel.send({
                 content: pingList.length ? pingList.join(' ') : undefined,
                 embeds: [embed],
             });
+            // Log one daily_summary event per pinged member so /reminders history reflects them.
+            for (const row of rows) {
+                logReminderEvent({
+                    guildId,
+                    discordUserId: row.discord_user_id,
+                    wanikaniUserId: row.wanikani_user_id,
+                    reminderType: 'daily_summary',
+                    deliveryTarget: 'channel',
+                    channelId: channel.id,
+                    messageId: sent?.id ?? null,
+                    status: 'sent',
+                }).catch(e => console.error('[logReminderEvent/daily]', e.message));
+            }
         }
     }
 
@@ -391,81 +404,268 @@ async function checkUserResets(apiKey, discordUserId, guildId, wanikaniUserId, l
     );
 }
 
-async function pollUsersJob(client) {
+// ── summary refresh + per-account review timers ─────────────────────────
+//
+// summaryRefreshJob runs every 5 minutes. It refreshes wk_summary_cache /
+// wk_summary_buckets per account (cheap on 304s) and reschedules a per-account
+// timer that fires exactly at the next review unlock — so the DM goes out at
+// unlock time rather than up-to-15-minutes-late as in the old poll.
+//
+// Per-guild work (queue_history bookkeeping, cleared-queue announcement) runs
+// in the same job because it also depends on the freshly-synced summary.
+
+const reviewTimers = new Map(); // wanikani_user_id -> NodeJS.Timeout
+
+async function summaryRefreshJob(client) {
+    const accounts = await db.all(
+        `SELECT DISTINCT wanikani_user_id, discord_user_id, api_token_encrypted
+         FROM wanikani_accounts`
+    );
+    for (const account of accounts) {
+        try {
+            await wkSync.syncSummary(account);
+            await scheduleNextReviewTimer(client, account);
+        } catch (err) {
+            console.error(`[summaryRefresh] ${account.wanikani_user_id}:`, err.message);
+        }
+    }
+
     for (const guild of client.guilds.cache.values()) {
         try {
             const settings = await getOrCreateSettings(guild.id);
             const channel = await resolveOutputChannel(guild, settings);
-
             const rows = await getGuildMembers(guild.id);
+            for (const row of rows) {
+                try {
+                    await maybeAnnounceClearedQueue(client, guild, channel, settings, row);
+                } catch (err) {
+                    console.error(`[summaryRefresh/guild] ${row.discord_user_id}@${guild.id}:`, err.message);
+                }
+            }
+        } catch (err) {
+            console.error('[summaryRefresh] guild loop:', err);
+        }
+    }
+}
 
+async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) {
+    const cache = await db.get(
+        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+        [row.wanikani_user_id]
+    );
+    const dueRightNow = cache?.review_count_now ?? 0;
+
+    let cleared = false;
+    if (
+        channel &&
+        settings.reviews_cleared_announcements_enabled &&
+        row.cleared_enabled !== 0 &&
+        dueRightNow === 0
+    ) {
+        const prev = await db.get(
+            `SELECT queue_size FROM queue_history
+             WHERE guild_id = ? AND discord_user_id = ?
+             ORDER BY recorded_at DESC LIMIT 1`,
+            [guild.id, row.discord_user_id]
+        );
+        if (prev && prev.queue_size > 0) cleared = true;
+    }
+
+    await recordPoll(row.discord_user_id, guild.id, dueRightNow, row.wanikani_user_id);
+
+    if (!cleared) return;
+    try {
+        const reviewsToday = await getReviewsCompletedSince(row, MIDNIGHT_UTC_TODAY())
+            .catch(() => null);
+        const description = reviewsToday !== null
+            ? `<@${row.discord_user_id}> just cleared their review queue — **${reviewsToday}** reviews done today!`
+            : `<@${row.discord_user_id}> just cleared their review queue — nice!`;
+        const embed = new EmbedBuilder()
+            .setColor(COLOR_SUCCESS)
+            .setTitle('🧹 Reviews cleared!')
+            .setDescription(description)
+            .setTimestamp()
+            .setFooter(FOOTER);
+        const sent = await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
+        await db.run(
+            `INSERT INTO bot_user_state (guild_id, discord_user_id, wanikani_user_id, last_reviews_cleared_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                 last_reviews_cleared_at = excluded.last_reviews_cleared_at,
+                 updated_at = CURRENT_TIMESTAMP`,
+            [guild.id, row.discord_user_id, row.wanikani_user_id, new Date().toISOString()]
+        );
+        await logReminderEvent({
+            guildId: guild.id,
+            discordUserId: row.discord_user_id,
+            wanikaniUserId: row.wanikani_user_id,
+            reminderType: 'reviews_cleared',
+            deliveryTarget: 'channel',
+            channelId: channel.id,
+            messageId: sent?.id ?? null,
+            reviewCount: reviewsToday,
+            status: 'sent',
+        }).catch(e => console.error('[logReminderEvent]', e.message));
+    } catch (err) {
+        console.error(`[cleared] ${row.discord_user_id}@${guild.id}:`, err.message);
+        await logReminderEvent({
+            guildId: guild.id,
+            discordUserId: row.discord_user_id,
+            wanikaniUserId: row.wanikani_user_id,
+            reminderType: 'reviews_cleared',
+            deliveryTarget: 'channel',
+            channelId: channel?.id ?? null,
+            status: 'failed',
+            error: err.message,
+        }).catch(() => {});
+    }
+}
+
+async function scheduleNextReviewTimer(client, account) {
+    const wkId = account.wanikani_user_id;
+    const existing = reviewTimers.get(wkId);
+    if (existing) {
+        clearTimeout(existing);
+        reviewTimers.delete(wkId);
+    }
+
+    const next = await db.get(
+        `SELECT available_at FROM wk_summary_buckets
+         WHERE wanikani_user_id = ?
+           AND bucket_type = 'review'
+           AND available_at > datetime('now')
+         ORDER BY available_at ASC LIMIT 1`,
+        [wkId]
+    );
+    if (!next) return;
+    let ms = new Date(next.available_at).getTime() - Date.now();
+    // Sanity bounds: don't queue absurdly long timers (summaryRefreshJob will
+    // re-schedule), and add a tiny buffer so the first sync picks up the unlock.
+    if (ms > 24 * 60 * 60 * 1000) return;
+    if (ms < 0) ms = 0;
+    ms += 30 * 1000;
+
+    const timer = setTimeout(() => {
+        reviewTimers.delete(wkId);
+        reviewTimerFired(client, account).catch(err =>
+            console.error(`[reviewTimer] ${wkId}:`, err.message)
+        );
+    }, ms);
+    reviewTimers.set(wkId, timer);
+}
+
+async function reviewTimerFired(client, account) {
+    // Refresh /summary so review_count_now reflects the unlock we're firing for.
+    try { await wkSync.syncSummary(account); } catch (e) { /* keep going */ }
+
+    const goal = await db.get(
+        `SELECT notify_enabled, last_alerted_at, target_level, deadline
+         FROM long_goals WHERE discord_user_id = ?`,
+        [account.discord_user_id]
+    );
+    if (!goal || goal.notify_enabled !== 1) {
+        await scheduleNextReviewTimer(client, account);
+        return;
+    }
+    if (goal.last_alerted_at) {
+        const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
+        if (ageMs >= 0 && ageMs < ONE_HOUR_MS) {
+            await scheduleNextReviewTimer(client, account);
+            return;
+        }
+    }
+
+    const cache = await db.get(
+        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+        [account.wanikani_user_id]
+    );
+    const dueRightNow = cache?.review_count_now ?? 0;
+    if (dueRightNow <= 0) {
+        await scheduleNextReviewTimer(client, account);
+        return;
+    }
+
+    const user = await client.users.fetch(account.discord_user_id).catch(() => null);
+    if (user) {
+        const embed = new EmbedBuilder()
+            .setColor(COLOR_PRIMARY)
+            .setTitle('📚 New reviews available')
+            .setDescription([
+                `You have **${dueRightNow}** review${dueRightNow === 1 ? '' : 's'} ready right now.`,
+                `Goal: level ${goal.target_level}${goal.deadline ? ` by ${goal.deadline}` : ''}.`,
+                '',
+                'Disable with `/goals` → Configure alerts.',
+            ].join('\n'))
+            .setTimestamp()
+            .setFooter(FOOTER);
+        try {
+            const sent = await user.send({ embeds: [embed] });
+            await db.run(
+                `UPDATE long_goals SET last_alerted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
+                [new Date().toISOString(), account.discord_user_id]
+            );
+            await logReminderEvent({
+                discordUserId: account.discord_user_id,
+                wanikaniUserId: account.wanikani_user_id,
+                reminderType: 'reviews_available',
+                deliveryTarget: 'dm',
+                reviewCount: dueRightNow,
+                messageId: sent?.id ?? null,
+                status: 'sent',
+            }).catch(e => console.error('[logReminderEvent]', e.message));
+        } catch (err) {
+            console.warn(`[reviewDM] ${account.discord_user_id}: ${err.message}`);
+            await logReminderEvent({
+                discordUserId: account.discord_user_id,
+                wanikaniUserId: account.wanikani_user_id,
+                reminderType: 'reviews_available',
+                deliveryTarget: 'dm',
+                reviewCount: dueRightNow,
+                status: 'failed',
+                error: err.message,
+            }).catch(() => {});
+        }
+    }
+
+    await scheduleNextReviewTimer(client, account);
+}
+
+// ── slow-loop detection (hourly) ────────────────────────────────────────
+// Replaces the old 15-minute pollUsersJob. Level-up / burn / reset detection
+// is not time-critical, so it runs once per hour against freshly-synced caches.
+
+async function slowDetectionJob(client) {
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            const settings = await getOrCreateSettings(guild.id);
+            const channel = await resolveOutputChannel(guild, settings);
+            const rows = await getGuildMembers(guild.id);
             for (const row of rows) {
                 try {
                     const apiKey = decrypt(row.api_token_encrypted);
-                    const data = await getWaniKaniData(apiKey);
-                    const level = data.userData.level;
-                    const dueRightNow = data.dueRightNow;
-                    const burned = settings.burn_celebrations_enabled
-                        ? await getBurnedCount(apiKey).catch(() => null)
-                        : null;
-
-                    let cleared = false;
-                    if (
-                        channel &&
-                        settings.reviews_cleared_announcements_enabled &&
-                        row.cleared_enabled !== 0 &&
-                        dueRightNow === 0
-                    ) {
-                        const prev = await db.get(
-                            `SELECT queue_size FROM queue_history
-                             WHERE guild_id = ? AND discord_user_id = ?
-                             ORDER BY recorded_at DESC LIMIT 1`,
-                            [guild.id, row.discord_user_id]
-                        );
-                        if (prev && prev.queue_size > 0) cleared = true;
-                    }
-
-                    await recordPoll(row.discord_user_id, guild.id, dueRightNow, row.wanikani_user_id);
-
-                    if (cleared) {
-                        try {
-                            const reviewsToday = await getReviewsCompletedSince(apiKey, MIDNIGHT_UTC_TODAY())
-                                .catch(() => null);
-                            const description = reviewsToday !== null
-                                ? `<@${row.discord_user_id}> just cleared their review queue — **${reviewsToday}** reviews done today!`
-                                : `<@${row.discord_user_id}> just cleared their review queue — nice!`;
-                            const embed = new EmbedBuilder()
-                                .setColor(COLOR_SUCCESS)
-                                .setTitle('🧹 Reviews cleared!')
-                                .setDescription(description)
-                                .setTimestamp()
-                                .setFooter(FOOTER);
-                            await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
-                            await db.run(
-                                `INSERT INTO bot_user_state (guild_id, discord_user_id, wanikani_user_id, last_reviews_cleared_at)
-                                 VALUES (?, ?, ?, ?)
-                                 ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-                                     last_reviews_cleared_at = excluded.last_reviews_cleared_at,
-                                     updated_at = CURRENT_TIMESTAMP`,
-                                [guild.id, row.discord_user_id, row.wanikani_user_id, new Date().toISOString()]
-                            );
-                        } catch (err) {
-                            console.error(`[poll/cleared] ${row.discord_user_id}@${guild.id}:`, err.message);
-                        }
-                    }
-
-                    // Level-up: compare against the level we last persisted on wanikani_accounts.
-                    const account = await db.get(
+                    const accountBefore = await db.get(
                         `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
                         [row.wanikani_user_id]
                     );
-                    const previousLevel = account?.level ?? null;
+                    const previousLevel = accountBefore?.level ?? null;
+
+                    await wkSync.syncUser(row);
+                    await wkSync.syncAssignments(row);
+
+                    const accountAfter = await db.get(
+                        `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+                        [row.wanikani_user_id]
+                    );
+                    const level = accountAfter?.level ?? previousLevel;
+                    const burned = settings.burn_celebrations_enabled
+                        ? await getBurnedCount(row).catch(() => null)
+                        : null;
+
                     const state = await db.get(
                         `SELECT last_reset_checked_at FROM bot_user_state
                          WHERE guild_id = ? AND discord_user_id = ?`,
                         [guild.id, row.discord_user_id]
                     );
-
                     await checkUserResets(apiKey, row.discord_user_id, guild.id, row.wanikani_user_id, state?.last_reset_checked_at ?? null);
 
                     if (
@@ -483,7 +683,6 @@ async function pollUsersJob(client) {
                         await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
                     }
 
-                    // Burn-delta: compare to in-memory cached count from a previous tick this process.
                     const burnKey = `${guild.id}::${row.discord_user_id}`;
                     const previousBurned = burnedCountByMember.get(burnKey);
                     if (
@@ -504,66 +703,60 @@ async function pollUsersJob(client) {
                     }
                     if (burned !== null) burnedCountByMember.set(burnKey, burned);
 
-                    // Persist the latest level + vacation status on the WK account row.
-                    await db.run(
-                        `UPDATE wanikani_accounts
-                         SET level = ?,
-                             current_vacation_started_at = ?,
-                             last_user_sync_at = CURRENT_TIMESTAMP,
-                             updated_at = CURRENT_TIMESTAMP
-                         WHERE wanikani_user_id = ?`,
-                        [level, data.userData.current_vacation_started_at ?? null, row.wanikani_user_id]
-                    );
-
-                    await maybeSendReviewsAvailableDM(client, row.discord_user_id, dueRightNow);
+                    // Achievement check — runs against freshly-synced state.
+                    await evaluateAchievements({
+                        discordUserId: row.discord_user_id,
+                        wanikaniUserId: row.wanikani_user_id,
+                    }).catch(e => console.error('[achievements]', e.message));
                 } catch (err) {
-                    console.error(`[poll] ${row.discord_user_id}@${guild.id}:`, err.message);
+                    console.error(`[slowDetection] ${row.discord_user_id}@${guild.id}:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[poll] guild loop:', err);
+            console.error('[slowDetection] guild loop:', err);
         }
     }
 }
 
-async function maybeSendReviewsAvailableDM(client, discordUserId, dueRightNow) {
-    if (dueRightNow <= 0) return;
-    const goal = await db.get(
-        `SELECT notify_enabled, last_alerted_at, target_level, deadline
-         FROM long_goals WHERE discord_user_id = ?`,
-        [discordUserId]
+// ── daily globals + slow-changing per-user data ─────────────────────────
+
+async function dailyGlobalsAndUserSyncJob() {
+    // Pick any active user's API key for global resources (subjects, SRS).
+    // Subjects are public per WK docs, but the API still requires auth.
+    const someAccount = await db.get(
+        `SELECT api_token_encrypted FROM wanikani_accounts LIMIT 1`
     );
-    if (!goal || goal.notify_enabled !== 1) return;
-    if (dueRightNow < REVIEWS_AVAILABLE_DM_THRESHOLD) return;
-    if (goal.last_alerted_at) {
-        const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
-        if (ageMs >= 0 && ageMs < FOUR_HOURS_MS) return;
+    if (someAccount) {
+        try {
+            const { decrypt } = require('./helpers/crypto');
+            const apiKey = decrypt(someAccount.api_token_encrypted);
+            await wkSync.syncSpacedRepetitionSystems(apiKey).catch(e =>
+                console.error('[dailyGlobals] srs:', e.message));
+            await wkSync.syncSubjects(apiKey).catch(e =>
+                console.error('[dailyGlobals] subjects:', e.message));
+        } catch (err) {
+            console.error('[dailyGlobals]', err.message);
+        }
     }
 
-    const user = await client.users.fetch(discordUserId).catch(() => null);
-    if (!user) return;
-
-    const embed = new EmbedBuilder()
-        .setColor(COLOR_PRIMARY)
-        .setTitle('📚 Reviews piling up')
-        .setDescription([
-            `You have **${dueRightNow}** reviews due (alert kicks in at ${REVIEWS_AVAILABLE_DM_THRESHOLD}).`,
-            `Goal: level ${goal.target_level}${goal.deadline ? ` by ${goal.deadline}` : ''}.`,
-            '',
-            'Disable with `/goals` → Configure alerts.',
-        ].join('\n'))
-        .setTimestamp()
-        .setFooter(FOOTER);
-
-    try {
-        await user.send({ embeds: [embed] });
-        await db.run(
-            `UPDATE long_goals SET last_alerted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
-            [new Date().toISOString(), discordUserId]
-        );
-    } catch (err) {
-        console.warn(`[reviewDM] ${discordUserId}: ${err.message}`);
+    const accounts = await db.all(
+        `SELECT wanikani_user_id, discord_user_id, api_token_encrypted FROM wanikani_accounts`
+    );
+    for (const account of accounts) {
+        try {
+            await wkSync.syncLevelProgressions(account);
+            await wkSync.syncReviewStatistics(account);
+            await wkSync.syncStudyMaterials(account);
+        } catch (err) {
+            console.error(`[dailyUserSync] ${account.wanikani_user_id}:`, err.message);
+        }
     }
+}
+
+// Back-compat: pollUsersJob now just runs the slow-loop detection so any
+// callers (tests, manual triggers) keep working.
+async function pollUsersJob(client) {
+    return slowDetectionJob(client);
 }
 
 async function paceAlertJob(client) {
@@ -635,28 +828,68 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
     const today = utcDateStr();
     const yesterday = utcDateStr(-1);
     const sinceISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { ensureUserSynced, ensureAssignmentsSynced, ensureReviewStatsSynced, getCompletedSince, getSrsBreakdown } = require('./helpers/wanikaniData');
 
     for (const row of rows) {
         try {
-            const apiKey = decrypt(row.api_token_encrypted);
-            const [reviewsDone, lessonsDone, userJson] = await Promise.all([
-                getReviewsCompletedSince(apiKey, sinceISO),
-                getLessonsCompletedSince(apiKey, sinceISO),
-                wkFetch('/user', apiKey),
-            ]);
-            const level = userJson.data.level;
+            // Sync the data we need first; the helpers below all read from cache.
+            await ensureUserSynced(row, 0);
+            await ensureAssignmentsSynced(row, 0);
+            await ensureReviewStatsSynced(row, 0);
+
+            const acct = await db.get(
+                `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+                [row.wanikani_user_id]
+            );
+            const level = acct?.level ?? 0;
+            const { reviewsCompleted, lessonsCompleted } = await getCompletedSince(row, sinceISO);
+            const srs = await getSrsBreakdown(row);
+            const totals = await db.get(
+                `SELECT COUNT(*) AS total_assignments,
+                        SUM(CASE WHEN started_at IS NOT NULL THEN 1 ELSE 0 END) AS total_started
+                 FROM wk_assignments
+                 WHERE wanikani_user_id = ? AND hidden = 0`,
+                [row.wanikani_user_id]
+            );
+            const summaryRow = await db.get(
+                `SELECT lesson_count, review_count_now, review_count_24h
+                 FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+                [row.wanikani_user_id]
+            );
 
             await db.run(
                 `INSERT INTO daily_snapshots (
                     guild_id, discord_user_id, wanikani_user_id, snapshot_date,
-                    level, reviews_completed, lessons_completed
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    level, reviews_completed, lessons_completed,
+                    lessons_available, reviews_available, reviews_24h,
+                    apprentice_count, guru_count, master_count, enlightened_count, burned_count,
+                    total_assignments, total_subjects_started
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(guild_id, discord_user_id, snapshot_date) DO UPDATE SET
                     level = excluded.level,
                     reviews_completed = excluded.reviews_completed,
-                    lessons_completed = excluded.lessons_completed`,
-                [guildId, row.discord_user_id, row.wanikani_user_id, today, level, reviewsDone, lessonsDone]
+                    lessons_completed = excluded.lessons_completed,
+                    lessons_available = excluded.lessons_available,
+                    reviews_available = excluded.reviews_available,
+                    reviews_24h = excluded.reviews_24h,
+                    apprentice_count = excluded.apprentice_count,
+                    guru_count = excluded.guru_count,
+                    master_count = excluded.master_count,
+                    enlightened_count = excluded.enlightened_count,
+                    burned_count = excluded.burned_count,
+                    total_assignments = excluded.total_assignments,
+                    total_subjects_started = excluded.total_subjects_started`,
+                [
+                    guildId, row.discord_user_id, row.wanikani_user_id, today,
+                    level, reviewsCompleted, lessonsCompleted,
+                    summaryRow?.lesson_count ?? 0, summaryRow?.review_count_now ?? 0, summaryRow?.review_count_24h ?? 0,
+                    srs.apprentice, srs.guru, srs.master, srs.enlightened, srs.burned,
+                    totals?.total_assignments ?? 0, totals?.total_started ?? 0,
+                ]
             );
+
+            // Need reviewsDone for the streak logic below.
+            const reviewsDone = reviewsCompleted;
 
             const streak = await db.get(
                 `SELECT current_streak, longest_streak, last_review_date FROM streaks
@@ -690,11 +923,14 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                 );
             }
 
-            // Snapshot review_statistics for /mistakes baselines.
-            const recentStats = await fetchAllPages(
-                `/review_statistics?updated_after=${encodeURIComponent(sinceISO)}`,
-                apiKey
-            ).catch(() => []);
+            // Snapshot review_statistics for /mistakes baselines, reading from
+            // the cache we just refreshed (no extra API calls).
+            const recentStats = await db.all(
+                `SELECT subject_id, meaning_incorrect, reading_incorrect, percentage_correct
+                 FROM wk_review_statistics
+                 WHERE wanikani_user_id = ? AND data_updated_at >= ?`,
+                [row.wanikani_user_id, sinceISO]
+            );
 
             for (const s of recentStats) {
                 await db.run(
@@ -707,10 +943,10 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                         reading_incorrect = excluded.reading_incorrect,
                         percentage_correct = excluded.percentage_correct`,
                     [
-                        row.wanikani_user_id, s.data.subject_id, today,
-                        s.data.meaning_incorrect || 0,
-                        s.data.reading_incorrect || 0,
-                        s.data.percentage_correct || 0,
+                        row.wanikani_user_id, s.subject_id, today,
+                        s.meaning_incorrect || 0,
+                        s.reading_incorrect || 0,
+                        s.percentage_correct || 0,
                     ]
                 );
             }
@@ -764,10 +1000,27 @@ async function scheduleAll(client) {
             console.error(`[scheduleAll] guild=${guild.id}:`, err);
         }
     }
-    if (!pollJob) {
-        pollJob = cron.schedule(
-            '*/15 * * * *',
-            () => pollUsersJob(client).catch(err => console.error('[pollUsersJob]', err)),
+    // Summary refresh + per-account review-unlock timers (every 5 min, cheap thanks to ETag).
+    if (!summaryRefreshJobHandle) {
+        summaryRefreshJobHandle = cron.schedule(
+            '*/5 * * * *',
+            () => summaryRefreshJob(client).catch(err => console.error('[summaryRefreshJob]', err)),
+            { timezone: 'UTC' }
+        );
+    }
+    // Level-up / burn / reset detection (hourly — not time-critical).
+    if (!slowDetectionJobHandle) {
+        slowDetectionJobHandle = cron.schedule(
+            '0 * * * *',
+            () => slowDetectionJob(client).catch(err => console.error('[slowDetectionJob]', err)),
+            { timezone: 'UTC' }
+        );
+    }
+    // Daily globals (subjects, SRS systems) + slow per-user data (level progressions, review stats).
+    if (!dailySyncJobHandle) {
+        dailySyncJobHandle = cron.schedule(
+            '0 4 * * *',
+            () => dailyGlobalsAndUserSyncJob().catch(err => console.error('[dailyGlobalsJob]', err)),
             { timezone: 'UTC' }
         );
     }
@@ -778,6 +1031,10 @@ async function scheduleAll(client) {
             { timezone: 'UTC' }
         );
     }
+
+    // Bootstrap: kick off an initial summary refresh so per-account timers are
+    // populated immediately rather than waiting up to 5 minutes for the first cron tick.
+    summaryRefreshJob(client).catch(err => console.error('[summaryRefreshJob/bootstrap]', err));
 }
 
 module.exports = {
@@ -786,7 +1043,10 @@ module.exports = {
     rescheduleGuild,
     dailyJob,
     leaderboardJob,
-    pollUsersJob,
+    pollUsersJob,           // back-compat: now delegates to slowDetectionJob
+    summaryRefreshJob,
+    slowDetectionJob,
+    dailyGlobalsAndUserSyncJob,
     paceAlertJob,
     updateSnapshotsAndStreaks,
     utcDateStr,
