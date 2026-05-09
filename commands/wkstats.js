@@ -1,7 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpers/wanikaniData');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
-const { decrypt } = require('../helpers/crypto');
 const { base, error, renderMonthlyHeatmap, HEATMAP_LEGEND } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
 const db = require('../db');
@@ -37,8 +36,7 @@ module.exports = {
         await interaction.deferReply();
 
         try {
-            const apiKey = decrypt(account.api_token_encrypted);
-            const data = await getWaniKaniData(apiKey);
+            const data = await getWaniKaniData(account);
             const { userData, pendingLessons, dueRightNow, dueNext24Hours } = data;
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
 
@@ -47,8 +45,8 @@ module.exports = {
             );
 
             const [srs, levelProgress, snapshots] = await Promise.all([
-                getSrsBreakdown(apiKey),
-                getLevelProgress(apiKey, userData.level),
+                getSrsBreakdown(account),
+                getLevelProgress(account, userData.level),
                 db.all(
                     `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
                      WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date >= date('now', ?)`,
