@@ -11,8 +11,9 @@ const {
 } = require('./helpers/wanikaniData');
 const wkSync = require('./helpers/wkSync');
 const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, COLOR_SUCCESS, FOOTER } = require('./helpers/embeds');
-const { recordPoll, evaluateAllGoal } = require('./helpers/zerostate');
+const { recordPoll } = require('./helpers/zerostate');
 const { pickShameLine } = require('./helpers/shame');
+const { generateShameLine } = require('./helpers/anthropic');
 const { logReminderEvent } = require('./helpers/reminderEvents');
 const { evaluateAchievements } = require('./helpers/achievements');
 
@@ -163,90 +164,6 @@ function summaryEmbed(title, description, summaries) {
     return embed;
 }
 
-async function appendGoalProgress(guildId, guild, embed) {
-    const rows = await db.all(
-        `SELECT
-             gm.discord_user_id,
-             COALESCE(rs.shame_enabled, 0) AS shame_enabled,
-             COALESCE(g.daily_lessons, lg.daily_lessons, 0) AS daily_lessons,
-             COALESCE(g.daily_all_lessons, 0) AS daily_all_lessons,
-             COALESCE(g.daily_reviews, lg.daily_reviews, 0) AS daily_reviews,
-             COALESCE(g.daily_all_reviews, 0) AS daily_all_reviews,
-             CASE WHEN g.discord_user_id IS NOT NULL THEN 'local' ELSE 'long' END AS source
-         FROM guild_members gm
-         LEFT JOIN goals g
-             ON g.guild_id = gm.guild_id AND g.discord_user_id = gm.discord_user_id
-         LEFT JOIN long_goals lg ON lg.discord_user_id = gm.discord_user_id
-         LEFT JOIN reminder_settings rs
-             ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
-         WHERE gm.guild_id = ?
-           AND (g.discord_user_id IS NOT NULL OR lg.discord_user_id IS NOT NULL)`,
-        [guildId]
-    );
-    const today = utcDateStr();
-    const lines = [];
-
-    for (const g of rows) {
-        const hasLesson = (g.daily_lessons || 0) > 0;
-        const hasLessonsAll = g.daily_all_lessons === 1;
-        const hasReview = (g.daily_reviews || 0) > 0;
-        const hasAll = g.daily_all_reviews === 1;
-        if (!hasLesson && !hasLessonsAll && !hasReview && !hasAll) continue;
-
-        const member = await guild.members.fetch(g.discord_user_id).catch(() => null);
-        if (!member) continue;
-        const name = member.displayName;
-
-        const snap = await db.get(
-            `SELECT reviews_completed, lessons_completed FROM daily_snapshots
-             WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
-            [guildId, g.discord_user_id, today]
-        );
-        const r = snap?.reviews_completed ?? 0;
-        const l = snap?.lessons_completed ?? 0;
-        const lOk = !hasLesson || l >= g.daily_lessons;
-        const rOk = !hasReview || r >= g.daily_reviews;
-
-        let allOk = true;
-        let allLabel = null;
-        if (hasAll) {
-            const result = await evaluateAllGoal(g.discord_user_id, guildId, r);
-            allOk = result.ok;
-            allLabel = formatAllGoalLabel(result);
-        }
-
-        const fullSuccess = lOk && rOk && allOk;
-        const icon = fullSuccess ? '✅' : '⏳';
-        const sourceTag = g.source === 'long' ? ' 🎯' : '';
-        const parts = [];
-        if (hasLessonsAll) parts.push(`${l} lessons (all)`);
-        else if (hasLesson) parts.push(`${l}/${g.daily_lessons} lessons`);
-        if (hasReview) parts.push(`${r}/${g.daily_reviews} reviews`);
-        if (allLabel) parts.push(allLabel);
-
-        let line = `${icon} **${name}**${sourceTag} — ${parts.join(' · ')}`;
-        if (!fullSuccess && g.shame_enabled === 1) {
-            line += `\n  💢 _${pickShameLine()}_`;
-        }
-        lines.push(line);
-    }
-
-    if (lines.length) {
-        embed.addFields({ name: '🎯 Goal Progress', value: lines.join('\n') });
-    }
-}
-
-function formatAllGoalLabel(result) {
-    switch (result.reason) {
-        case 'cleared': return 'queue cleared 🧹';
-        case 'kept_up': return 'queue kept up 📈';
-        case 'no_reviews': return 'queue pending';
-        case 'queue_grew': return 'queue grew 📉';
-        case 'insufficient_history': return 'queue tracking…';
-        default: return 'queue pending';
-    }
-}
-
 async function dailyJob(client, guildId) {
     console.log(`[daily] guild=${guildId}`);
     const guild = client.guilds.cache.get(guildId);
@@ -261,7 +178,6 @@ async function dailyJob(client, guildId) {
         if (channel) {
             const summaries = await fetchUserSummaries(guild, rows);
             const embed = summaryEmbed('📅 Daily WaniKani Summary', "Today's status:", summaries);
-            await appendGoalProgress(guildId, guild, embed);
 
             const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
             const sent = await channel.send({
@@ -285,6 +201,30 @@ async function dailyJob(client, guildId) {
     }
 
     await updateSnapshotsAndStreaks(guildId, rows);
+}
+
+async function fetchShameContext(discordUserId) {
+    const account = await db.get(
+        `SELECT wanikani_user_id, level FROM wanikani_accounts WHERE discord_user_id = ?`,
+        [discordUserId]
+    );
+    if (!account) return { level: null, knownKanji: '' };
+
+    const rows = await db.all(
+        `SELECT s.characters
+         FROM wk_assignments a
+         JOIN wk_subjects s ON s.subject_id = a.subject_id
+         WHERE a.wanikani_user_id = ?
+           AND s.subject_type = 'kanji'
+           AND a.srs_stage >= 5
+           AND a.hidden = 0
+           AND s.characters IS NOT NULL`,
+        [account.wanikani_user_id]
+    );
+    return {
+        level: account.level,
+        knownKanji: rows.map(r => r.characters).join(''),
+    };
 }
 
 async function leaderboardJob(client, guildId) {
@@ -340,9 +280,20 @@ async function leaderboardJob(client, guildId) {
     }
 
     const shameTargets = enriched.filter(e => e.shameEnabled && e.reviews === 0);
-    const shameBlock = shameTargets.length
-        ? `\n\n**🥶 Shame Corner**\n` + shameTargets.map(e => `<@${e.userId}> — _${pickShameLine()}_`).join('\n')
-        : '';
+    const shameLines = await Promise.all(shameTargets.map(async e => {
+        const user = `<@${e.userId}>`;
+        const ctx = await fetchShameContext(e.userId);
+        const generated = await generateShameLine({
+            user,
+            name: e.name,
+            lessons: e.lessons,
+            medal: e.medal,
+            level: ctx.level,
+            knownKanji: ctx.knownKanji,
+        });
+        return generated ?? pickShameLine({ user });
+    }));
+    const shameBlock = shameLines.length ? '\n\n' + shameLines.join('\n\n') : '';
 
     const embed = new EmbedBuilder()
         .setColor(COLOR_PRIMARY)
