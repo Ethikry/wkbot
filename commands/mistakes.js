@@ -118,13 +118,26 @@ module.exports = {
             const subjects = await getSubjectsByIds(apiKey, subjectIdsErrored);
             const subjectMap = new Map(subjects.map(s => [s.id, s.data]));
 
+            // User-defined meaning synonyms from wk_study_materials.
+            const placeholders2 = subjectIdsErrored.map(() => '?').join(',');
+            const synonymRows = subjectIdsErrored.length
+                ? await db.all(
+                    `SELECT subject_id, meaning_synonyms_json FROM wk_study_materials
+                     WHERE wanikani_user_id = ? AND subject_id IN (${placeholders2})`,
+                    [wanikaniUserId, ...subjectIdsErrored]
+                )
+                : [];
+            const synonymMap = new Map(synonymRows.map(r => [r.subject_id, r.meaning_synonyms_json ? JSON.parse(r.meaning_synonyms_json) : []]));
+
             const items = errored.map(s => {
                 const subj = subjectMap.get(s.data.subject_id);
                 if (!subj) return null;
+                const meanings = (subj.meanings || []).map(m => m.meaning).filter(Boolean);
+                const synonyms = synonymMap.get(s.data.subject_id) ?? [];
                 return {
                     subjectId: s.data.subject_id,
                     characters: subj.characters || subj.slug || '?',
-                    meanings: (subj.meanings || []).map(m => m.meaning).filter(Boolean),
+                    meanings: [...meanings, ...synonyms],
                     readings: (subj.readings || []).filter(r => r.accepted_answer).map(r => r.reading),
                     srsStage: srsMap.get(s.data.subject_id) ?? 0,
                 };

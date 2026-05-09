@@ -440,8 +440,29 @@ const SCHEMA_V1 = [
     )`,
 ];
 
+// Seed values for the built-in achievements. INSERT OR IGNORE so re-running
+// the migration is safe and never clobbers any locally-edited descriptions.
+const ACHIEVEMENTS_V2 = [
+    ['first_burn',     'First Burn',          'Burn your first WaniKani item.',                      'burn'],
+    ['100_burns',      'Centennial Burner',   'Burn 100 items.',                                     'burn'],
+    ['500_burns',      'Pyromancer',          'Burn 500 items.',                                     'burn'],
+    ['1000_burns',     'Inferno',             'Burn 1,000 items.',                                   'burn'],
+    ['level_10',       'Pleasant',            'Reach WaniKani level 10.',                            'milestone'],
+    ['level_30',       'Painful',             'Reach WaniKani level 30.',                            'milestone'],
+    ['level_60',       'Reality',             'Reach WaniKani level 60 — the top.',                  'milestone'],
+    ['streak_7',       'One Week Strong',     'Maintain a 7-day review streak.',                     'streak'],
+    ['streak_30',      'One Month Strong',    'Maintain a 30-day review streak.',                    'streak'],
+    ['streak_100',     'Hundred-Day Hero',    'Maintain a 100-day review streak.',                   'streak'],
+    ['500_reviews',    'Half-Thousand Club',  'Complete 500 reviews tracked by the bot.',            'volume'],
+    ['5000_reviews',   'Five-Thousand Club',  'Complete 5,000 reviews tracked by the bot.',          'volume'],
+].map(([key, name, description, category]) => (
+    `INSERT OR IGNORE INTO achievement_definitions (achievement_key, name, description, category)
+     VALUES (${[key, name, description, category].map(s => `'${s.replace(/'/g, "''")}'`).join(', ')})`
+));
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
+    { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
 ];
 
 async function runMigrations({ get, all, run }) {
