@@ -9,8 +9,7 @@ const {
     MessageFlags,
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
-const { getApiKeyForUser } = require('../helpers/userKey');
-const { getWanikaniUserId } = require('../helpers/userLink');
+const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
 const { getWaniKaniData, getHitRate, getPersonalPace } = require('../helpers/wanikaniData');
 const {
     paceOptionsFor,
@@ -87,9 +86,9 @@ async function buildOverviewPayload(userId, guildId) {
         let currentLevel = null;
         let proj = null;
         try {
-            const apiKey = await getApiKeyForUser(userId, guildId);
-            if (apiKey) {
-                const wk = await getWaniKaniData(apiKey);
+            const account = await getAccountForDiscordUser(userId);
+            if (account) {
+                const wk = await getWaniKaniData(account);
                 currentLevel = wk.userData.level;
                 proj = projectPace({
                     targetLevel: longGoal.target_level,
@@ -188,8 +187,8 @@ function showGoalTypeSelector(interaction) {
 
 async function startLtWizardDM(interaction, client) {
     await interaction.deferUpdate();
-    const apiKey = await getApiKeyForUser(interaction.user.id, interaction.guildId);
-    if (!apiKey) {
+    const account = await getAccountForDiscordUser(interaction.user.id);
+    if (!account) {
         return interaction.editReply({
             embeds: [error('No API Key', 'Run `/setup apikey:<token>` in a server first so the bot can read your WaniKani data.')],
             components: [backRow()],
@@ -265,8 +264,8 @@ async function handleLtInitModal(interaction) {
 
     await interaction.deferUpdate();
     try {
-        const apiKey = await getApiKeyForUser(interaction.user.id, interaction.guildId);
-        if (!apiKey) {
+        const account = await getAccountForDiscordUser(interaction.user.id);
+        if (!account) {
             return interaction.editReply({
                 embeds: [error('No API Key', 'Run `/setup apikey:<token>` in a server to register your WaniKani token.')],
                 components: [],
@@ -276,9 +275,9 @@ async function handleLtInitModal(interaction) {
         let wkData, hitRateData, personalPace;
         try {
             [wkData, hitRateData, personalPace] = await Promise.all([
-                getWaniKaniData(apiKey),
-                getHitRate(apiKey, 30).catch(() => null),
-                getPersonalPace(apiKey).catch(() => null),
+                getWaniKaniData(account),
+                getHitRate(account, 30).catch(() => null),
+                getPersonalPace(account).catch(() => null),
             ]);
         } catch (apiErr) {
             if (apiErr.message?.includes('401') || apiErr.message?.includes('403')) {
@@ -663,7 +662,7 @@ function alertEmbed(goal) {
         '',
         'When on, you\'ll receive a DM:',
         '• If you fall behind your daily lesson target (checked nightly).',
-        '• When your review queue piles up to a high level (rate-limited).',
+        '• When new reviews become available (rate-limited to once per hour).',
     ].join('\n'));
 }
 
