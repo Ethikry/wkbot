@@ -50,13 +50,17 @@ function bucketEmoji(reviews) {
     return '🟥';
 }
 
-function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6) {
-    const today = new Date();
+function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, tz = 'UTC') {
+    let validTz = 'UTC';
+    try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); validTz = tz; } catch { /* invalid → UTC */ }
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: validTz, year: 'numeric', month: '2-digit', day: '2-digit',
+    });
     const cells = [];
     for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(today);
+        const d = new Date();
         d.setUTCDate(d.getUTCDate() - i);
-        const dateStr = d.toISOString().slice(0, 10);
+        const dateStr = fmt.format(d);
         const reviews = snapshotsByDate.get(dateStr) ?? 0;
         cells.push(bucketEmoji(reviews));
     }

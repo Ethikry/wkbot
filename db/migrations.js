@@ -19,9 +19,9 @@ const SCHEMA_V1 = [
         announcement_channel_id TEXT,
         reminder_channel_id TEXT,
         leaderboard_channel_id TEXT,
-        timezone TEXT NOT NULL DEFAULT 'UTC',
+        timezone TEXT NOT NULL DEFAULT 'Asia/Tokyo',
         daily_summary_enabled INTEGER NOT NULL DEFAULT 1,
-        daily_summary_time TEXT NOT NULL DEFAULT '15:00',
+        daily_summary_time TEXT NOT NULL DEFAULT '00:00',
         morning_ping_enabled INTEGER NOT NULL DEFAULT 0,
         morning_ping_time TEXT NOT NULL DEFAULT '08:00',
         shame_mode_enabled INTEGER NOT NULL DEFAULT 0,
@@ -460,9 +460,26 @@ const ACHIEVEMENTS_V2 = [
      VALUES (${[key, name, description, category].map(s => `'${s.replace(/'/g, "''")}'`).join(', ')})`
 ));
 
+const SCHEMA_V3 = [
+    `ALTER TABLE long_goals ADD COLUMN last_alerted_review_count INTEGER`,
+];
+
+// Switch the legacy 'UTC' / '15:00' defaults to JST midnight. The wall-clock
+// UTC instant for an existing guild on those defaults is unchanged (15:00 UTC
+// == 00:00 Asia/Tokyo); the timezone label just becomes honest.
+const SCHEMA_V4 = [
+    `UPDATE guild_settings
+        SET timezone = 'Asia/Tokyo',
+            daily_summary_time = '00:00',
+            updated_at = CURRENT_TIMESTAMP
+      WHERE timezone = 'UTC' AND daily_summary_time = '15:00'`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
+    { version: 3, name: 'long_goals_alerted_count', statements: SCHEMA_V3 },
+    { version: 4, name: 'jst_default_timezone', statements: SCHEMA_V4 },
 ];
 
 async function runMigrations({ get, all, run }) {

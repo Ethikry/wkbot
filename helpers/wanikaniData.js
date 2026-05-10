@@ -290,6 +290,23 @@ async function getLessonsCompletedSince(account, isoDate) {
     return (await getCompletedSince(account, isoDate)).lessonsCompleted;
 }
 
+// Cache-backed variant that returns the activity rows so callers can bucket
+// them (e.g. into per-day snapshots). Triggers a sync if the cache is older
+// than maxStaleMs (default 4 min — short enough to feel live in the 5-min
+// summary loop, but rate-limited so back-to-back calls don't hammer the API).
+async function getCompletedItemsSince(account, isoDate, maxStaleMs = 4 * 60 * 1000) {
+    await ensureAssignmentsSynced(account, maxStaleMs);
+    return db.all(
+        `SELECT subject_id, started_at, data_updated_at
+         FROM wk_assignments
+         WHERE wanikani_user_id = ?
+           AND started_at IS NOT NULL
+           AND data_updated_at >= ?
+           AND hidden = 0`,
+        [account.wanikani_user_id, isoDate]
+    );
+}
+
 async function getRandomKanjiAtLevel(apiKey, level) {
     await ensureSubjectsSynced(apiKey);
     const rows = await db.all(
@@ -323,19 +340,27 @@ async function getSubjectsPerLevel(apiKey, level) {
 
 async function getLevelProgress(account, level) {
     await ensureAssignmentsSynced(account);
+    // WaniKani's level-up rule is "90% of current-level kanji are *currently*
+    // at Guru+ (srs_stage >= passing_stage)". Using passed_at would count items
+    // that were ever guru'd but have since been failed back below Guru.
+    const passingStage = (await db.get(
+        `SELECT MIN(passing_stage_position) AS stage FROM wk_spaced_repetition_systems`
+    ))?.stage ?? 5;
+
     const tally = async (subjectType) => {
         const row = await db.get(
             `SELECT COUNT(*) AS total,
-                    SUM(CASE WHEN passed_at IS NOT NULL THEN 1 ELSE 0 END) AS passed
+                    SUM(CASE WHEN srs_stage >= ? THEN 1 ELSE 0 END) AS passed
              FROM wk_assignments
              WHERE wanikani_user_id = ? AND level = ? AND subject_type = ? AND hidden = 0`,
-            [account.wanikani_user_id, level, subjectType]
+            [passingStage, account.wanikani_user_id, level, subjectType]
         );
         const total = row?.total ?? 0;
         const passed = row?.passed ?? 0;
-        return { total, passed, percent: total > 0 ? Math.round((passed / total) * 100) : 0 };
+        const ratio = total > 0 ? passed / total : 0;
+        return { total, passed, ratio, percent: Math.round(ratio * 100) };
     };
-    return { kanji: await tally('kanji'), radicals: await tally('radical'), threshold: 90 };
+    return { kanji: await tally('kanji'), radicals: await tally('radical'), thresholdRatio: 0.9, threshold: 90 };
 }
 
 // Approximation of recent accuracy. review_statistics totals are cumulative per
@@ -487,6 +512,7 @@ module.exports = {
     getWaniKaniData,
     getSrsBreakdown,
     getCompletedSince,
+    getCompletedItemsSince,
     getReviewsCompletedSince,
     getLessonsCompletedSince,
     getBurnedCount,
