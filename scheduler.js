@@ -376,6 +376,10 @@ async function summaryRefreshJob(client) {
         try {
             await wkSync.syncSummary(account);
             await scheduleNextReviewTimer(client, account);
+            await maybeResetGoalAlertBaseline(account);
+            await updateSnapshotsAndStreaksForAccount(account).catch(err =>
+                console.error(`[summaryRefresh/snapshots] ${account.wanikani_user_id}:`, err.message)
+            );
         } catch (err) {
             console.error(`[summaryRefresh] ${account.wanikani_user_id}:`, err.message);
         }
@@ -396,6 +400,32 @@ async function summaryRefreshJob(client) {
         } catch (err) {
             console.error('[summaryRefresh] guild loop:', err);
         }
+    }
+}
+
+// Reset the goal-alert baseline whenever the queue is observed empty so that
+// the next batch of unlocks correctly registers as "new reviews". Also keeps
+// the baseline in sync if the user does reviews without ever fully clearing —
+// once the count drops below the prior alert level, we shrink the baseline so
+// growth back above it triggers exactly one alert.
+async function maybeResetGoalAlertBaseline(account) {
+    const cache = await db.get(
+        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+        [account.wanikani_user_id]
+    );
+    const dueRightNow = cache?.review_count_now ?? 0;
+    const goal = await db.get(
+        `SELECT last_alerted_review_count FROM long_goals WHERE discord_user_id = ?`,
+        [account.discord_user_id]
+    );
+    if (!goal) return;
+    const prev = goal.last_alerted_review_count ?? 0;
+    if (dueRightNow < prev) {
+        await db.run(
+            `UPDATE long_goals SET last_alerted_review_count = ?, updated_at = CURRENT_TIMESTAMP
+             WHERE discord_user_id = ?`,
+            [dueRightNow, account.discord_user_id]
+        );
     }
 }
 
@@ -428,9 +458,19 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
     try {
         const reviewsToday = await getReviewsCompletedSince(row, MIDNIGHT_UTC_TODAY())
             .catch(() => null);
-        const description = reviewsToday !== null
+        const nextBucket = await db.get(
+            `SELECT available_at, subject_count FROM wk_summary_buckets
+             WHERE wanikani_user_id = ? AND bucket_type = 'review'
+               AND available_at > datetime('now')
+             ORDER BY available_at ASC LIMIT 1`,
+            [row.wanikani_user_id]
+        );
+        const head = reviewsToday !== null
             ? `<@${row.discord_user_id}> just cleared their review queue — **${reviewsToday}** reviews done today!`
             : `<@${row.discord_user_id}> just cleared their review queue — nice!`;
+        const description = nextBucket
+            ? `${head}\nNext batch: **+${nextBucket.subject_count}** <t:${Math.floor(new Date(nextBucket.available_at).getTime() / 1000)}:R>.`
+            : head;
         const embed = new EmbedBuilder()
             .setColor(COLOR_SUCCESS)
             .setTitle('🧹 Reviews cleared!')
@@ -510,7 +550,7 @@ async function reviewTimerFired(client, account) {
     try { await wkSync.syncSummary(account); } catch (e) { /* keep going */ }
 
     const goal = await db.get(
-        `SELECT notify_enabled, last_alerted_at, target_level, deadline
+        `SELECT notify_enabled, last_alerted_at, last_alerted_review_count, target_level, deadline
          FROM long_goals WHERE discord_user_id = ?`,
         [account.discord_user_id]
     );
@@ -518,42 +558,80 @@ async function reviewTimerFired(client, account) {
         await scheduleNextReviewTimer(client, account);
         return;
     }
-    if (goal.last_alerted_at) {
-        const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
-        if (ageMs >= 0 && ageMs < ONE_HOUR_MS) {
-            await scheduleNextReviewTimer(client, account);
-            return;
-        }
-    }
 
     const cache = await db.get(
         `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
         [account.wanikani_user_id]
     );
     const dueRightNow = cache?.review_count_now ?? 0;
+
+    // When the queue empties, reset the alert baseline so the next unlock
+    // is correctly recognised as "new reviews".
     if (dueRightNow <= 0) {
+        if ((goal.last_alerted_review_count ?? 0) !== 0) {
+            await db.run(
+                `UPDATE long_goals SET last_alerted_review_count = 0, updated_at = CURRENT_TIMESTAMP
+                 WHERE discord_user_id = ?`,
+                [account.discord_user_id]
+            );
+        }
         await scheduleNextReviewTimer(client, account);
         return;
     }
 
+    // Only alert when the count actually grew since the last alert — otherwise
+    // a non-empty queue would re-page the user every time a new bucket unlocks.
+    const prevCount = goal.last_alerted_review_count ?? 0;
+    if (dueRightNow <= prevCount) {
+        await scheduleNextReviewTimer(client, account);
+        return;
+    }
+
+    // Small floor against the 5-minute summaryRefreshJob racing the timer for
+    // the same unlock — avoids double-DM during the overlap window.
+    if (goal.last_alerted_at) {
+        const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
+        if (ageMs >= 0 && ageMs < 5 * 60 * 1000) {
+            await scheduleNextReviewTimer(client, account);
+            return;
+        }
+    }
+
+    const nextBucket = await db.get(
+        `SELECT available_at, subject_count FROM wk_summary_buckets
+         WHERE wanikani_user_id = ? AND bucket_type = 'review'
+           AND available_at > datetime('now')
+         ORDER BY available_at ASC LIMIT 1`,
+        [account.wanikani_user_id]
+    );
+
     const user = await client.users.fetch(account.discord_user_id).catch(() => null);
     if (user) {
+        const lines = [
+            `You have **${dueRightNow}** review${dueRightNow === 1 ? '' : 's'} ready right now.`,
+        ];
+        if (nextBucket) {
+            const ts = Math.floor(new Date(nextBucket.available_at).getTime() / 1000);
+            lines.push(`Next batch: **+${nextBucket.subject_count}** <t:${ts}:R> (<t:${ts}:t>).`);
+        }
+        lines.push(
+            `Goal: level ${goal.target_level}${goal.deadline ? ` by ${goal.deadline}` : ''}.`,
+            '',
+            'Disable with `/goals` → Configure alerts.'
+        );
         const embed = new EmbedBuilder()
             .setColor(COLOR_PRIMARY)
             .setTitle('📚 New reviews available')
-            .setDescription([
-                `You have **${dueRightNow}** review${dueRightNow === 1 ? '' : 's'} ready right now.`,
-                `Goal: level ${goal.target_level}${goal.deadline ? ` by ${goal.deadline}` : ''}.`,
-                '',
-                'Disable with `/goals` → Configure alerts.',
-            ].join('\n'))
+            .setDescription(lines.join('\n'))
             .setTimestamp()
             .setFooter(FOOTER);
         try {
             const sent = await user.send({ embeds: [embed] });
             await db.run(
-                `UPDATE long_goals SET last_alerted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
-                [new Date().toISOString(), account.discord_user_id]
+                `UPDATE long_goals
+                 SET last_alerted_at = ?, last_alerted_review_count = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE discord_user_id = ?`,
+                [new Date().toISOString(), dueRightNow, account.discord_user_id]
             );
             await logReminderEvent({
                 discordUserId: account.discord_user_id,
@@ -775,17 +853,33 @@ async function paceAlertJob(client) {
     }
 }
 
+// Number of days the per-call lookback covers. Choosing 3 means we backfill
+// "today / yesterday / day-before" on every run — enough to recover from a
+// missed cron without making the loop expensive.
+const SNAPSHOT_LOOKBACK_DAYS = 3;
+
 async function updateSnapshotsAndStreaks(guildId, rows) {
-    const today = utcDateStr();
-    const yesterday = utcDateStr(-1);
-    const sinceISO = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    const { ensureUserSynced, ensureAssignmentsSynced, ensureReviewStatsSynced, getCompletedSince, getSrsBreakdown } = require('./helpers/wanikaniData');
+    const settings = await getOrCreateSettings(guildId);
+    const tz = isValidTimezone(settings.timezone) ? settings.timezone : 'UTC';
+    const {
+        ensureUserSynced, ensureReviewStatsSynced,
+        getCompletedItemsSince, getSrsBreakdown,
+    } = require('./helpers/wanikaniData');
+
+    // Build the list of guild-local days we'll write snapshots for, with the
+    // window boundaries needed to bucket assignments updates into them.
+    const days = [];
+    for (let i = SNAPSHOT_LOOKBACK_DAYS - 1; i >= 0; i--) {
+        const dateKey = localDateStr(tz, -i);
+        const startISO = localDayStartISO(tz, dateKey);
+        const endISO = localDayStartISO(tz, localDateStr(tz, -i + 1));
+        days.push({ dateKey, startISO, endISO });
+    }
+    const earliestStartISO = days[0].startISO;
 
     for (const row of rows) {
         try {
-            // Sync the data we need first; the helpers below all read from cache.
             await ensureUserSynced(row, 0);
-            await ensureAssignmentsSynced(row, 0);
             await ensureReviewStatsSynced(row, 0);
 
             const acct = await db.get(
@@ -793,7 +887,10 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                 [row.wanikani_user_id]
             );
             const level = acct?.level ?? 0;
-            const { reviewsCompleted, lessonsCompleted } = await getCompletedSince(row, sinceISO);
+            // ensureAssignmentsSynced is invoked inside getCompletedItemsSince
+            // with a 4-min staleness floor — back-to-back callers (e.g. the
+            // 5-min summaryRefreshJob) won't pile up redundant syncs.
+            const items = await getCompletedItemsSince(row, earliestStartISO);
             const srs = await getSrsBreakdown(row);
             const totals = await db.get(
                 `SELECT COUNT(*) AS total_assignments,
@@ -808,81 +905,125 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                 [row.wanikani_user_id]
             );
 
-            await db.run(
-                `INSERT INTO daily_snapshots (
-                    guild_id, discord_user_id, wanikani_user_id, snapshot_date,
-                    level, reviews_completed, lessons_completed,
-                    lessons_available, reviews_available, reviews_24h,
-                    apprentice_count, guru_count, master_count, enlightened_count, burned_count,
-                    total_assignments, total_subjects_started
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(guild_id, discord_user_id, snapshot_date) DO UPDATE SET
-                    level = excluded.level,
-                    reviews_completed = excluded.reviews_completed,
-                    lessons_completed = excluded.lessons_completed,
-                    lessons_available = excluded.lessons_available,
-                    reviews_available = excluded.reviews_available,
-                    reviews_24h = excluded.reviews_24h,
-                    apprentice_count = excluded.apprentice_count,
-                    guru_count = excluded.guru_count,
-                    master_count = excluded.master_count,
-                    enlightened_count = excluded.enlightened_count,
-                    burned_count = excluded.burned_count,
-                    total_assignments = excluded.total_assignments,
-                    total_subjects_started = excluded.total_subjects_started`,
-                [
-                    guildId, row.discord_user_id, row.wanikani_user_id, today,
-                    level, reviewsCompleted, lessonsCompleted,
-                    summaryRow?.lesson_count ?? 0, summaryRow?.review_count_now ?? 0, summaryRow?.review_count_24h ?? 0,
-                    srs.apprentice, srs.guru, srs.master, srs.enlightened, srs.burned,
-                    totals?.total_assignments ?? 0, totals?.total_started ?? 0,
-                ]
-            );
+            // Bucket activity into per-day counts. Reviews = item already
+            // started before the day; lessons = item started during the day.
+            const byDay = new Map(days.map(d => [d.dateKey, { reviews: 0, lessons: 0 }]));
+            for (const it of items) {
+                const updatedAt = new Date(it.data_updated_at).getTime();
+                const startedAt = new Date(it.started_at).getTime();
+                for (const d of days) {
+                    const start = new Date(d.startISO).getTime();
+                    const end = new Date(d.endISO).getTime();
+                    if (updatedAt >= start && updatedAt < end) {
+                        const bucket = byDay.get(d.dateKey);
+                        if (startedAt < start) bucket.reviews++;
+                        else bucket.lessons++;
+                        break;
+                    }
+                }
+            }
 
-            // Need reviewsDone for the streak logic below.
-            const reviewsDone = reviewsCompleted;
-
-            const streak = await db.get(
-                `SELECT current_streak, longest_streak, last_review_date FROM streaks
-                 WHERE guild_id = ? AND discord_user_id = ?`,
-                [guildId, row.discord_user_id]
-            );
-
-            if (reviewsDone > 0) {
-                let current;
-                if (!streak) current = 1;
-                else if (streak.last_review_date === today) current = streak.current_streak;
-                else if (streak.last_review_date === yesterday) current = streak.current_streak + 1;
-                else current = 1;
-                const longest = Math.max(current, streak?.longest_streak ?? 0);
-
+            for (const d of days) {
+                const counts = byDay.get(d.dateKey);
+                const isToday = d.dateKey === days[days.length - 1].dateKey;
                 await db.run(
-                    `INSERT INTO streaks (guild_id, discord_user_id, current_streak, longest_streak, last_review_date)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-                        current_streak = excluded.current_streak,
-                        longest_streak = excluded.longest_streak,
-                        last_review_date = excluded.last_review_date,
-                        updated_at = CURRENT_TIMESTAMP`,
-                    [guildId, row.discord_user_id, current, longest, today]
-                );
-            } else if (streak && streak.last_review_date && streak.last_review_date < yesterday) {
-                await db.run(
-                    `UPDATE streaks SET current_streak = 0, updated_at = CURRENT_TIMESTAMP
-                     WHERE guild_id = ? AND discord_user_id = ?`,
-                    [guildId, row.discord_user_id]
+                    `INSERT INTO daily_snapshots (
+                        guild_id, discord_user_id, wanikani_user_id, snapshot_date,
+                        level, reviews_completed, lessons_completed,
+                        lessons_available, reviews_available, reviews_24h,
+                        apprentice_count, guru_count, master_count, enlightened_count, burned_count,
+                        total_assignments, total_subjects_started
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(guild_id, discord_user_id, snapshot_date) DO UPDATE SET
+                        level = excluded.level,
+                        reviews_completed = excluded.reviews_completed,
+                        lessons_completed = excluded.lessons_completed,
+                        lessons_available = CASE WHEN ? THEN excluded.lessons_available ELSE daily_snapshots.lessons_available END,
+                        reviews_available = CASE WHEN ? THEN excluded.reviews_available ELSE daily_snapshots.reviews_available END,
+                        reviews_24h = CASE WHEN ? THEN excluded.reviews_24h ELSE daily_snapshots.reviews_24h END,
+                        apprentice_count = excluded.apprentice_count,
+                        guru_count = excluded.guru_count,
+                        master_count = excluded.master_count,
+                        enlightened_count = excluded.enlightened_count,
+                        burned_count = excluded.burned_count,
+                        total_assignments = excluded.total_assignments,
+                        total_subjects_started = excluded.total_subjects_started`,
+                    [
+                        guildId, row.discord_user_id, row.wanikani_user_id, d.dateKey,
+                        level, counts.reviews, counts.lessons,
+                        // The "available" counters are point-in-time, so they
+                        // only make sense for today's row. For backfilled
+                        // rows we keep whatever was there before (CASE above).
+                        isToday ? (summaryRow?.lesson_count ?? 0) : 0,
+                        isToday ? (summaryRow?.review_count_now ?? 0) : 0,
+                        isToday ? (summaryRow?.review_count_24h ?? 0) : 0,
+                        srs.apprentice, srs.guru, srs.master, srs.enlightened, srs.burned,
+                        totals?.total_assignments ?? 0, totals?.total_started ?? 0,
+                        isToday ? 1 : 0, isToday ? 1 : 0, isToday ? 1 : 0,
+                    ]
                 );
             }
 
-            // Snapshot review_statistics for /mistakes baselines, reading from
-            // the cache we just refreshed (no extra API calls).
+            // Recompute the streak from the snapshot history rather than
+            // incrementing — self-heals when a day's row was missed and now
+            // gets backfilled. Walk back from "today or yesterday" while
+            // reviews_completed > 0.
+            const today = days[days.length - 1].dateKey;
+            const yesterday = days[days.length - 2].dateKey;
+            const history = await db.all(
+                `SELECT snapshot_date, reviews_completed FROM daily_snapshots
+                 WHERE guild_id = ? AND discord_user_id = ?
+                 ORDER BY snapshot_date DESC
+                 LIMIT 365`,
+                [guildId, row.discord_user_id]
+            );
+            const histMap = new Map(history.map(h => [h.snapshot_date, h.reviews_completed]));
+
+            let currentStreak = 0;
+            let lastReviewDate = null;
+            // Anchor the streak at the most recent active day (today or yesterday).
+            let cursor = (histMap.get(today) ?? 0) > 0
+                ? today
+                : ((histMap.get(yesterday) ?? 0) > 0 ? yesterday : null);
+            while (cursor) {
+                const reviews = histMap.get(cursor) ?? 0;
+                if (reviews <= 0) break;
+                currentStreak++;
+                if (!lastReviewDate) lastReviewDate = cursor;
+                // Step one calendar day backward in guild-local terms.
+                const [yy, mm, dd] = cursor.split('-').map(Number);
+                const prev = new Date(Date.UTC(yy, mm - 1, dd));
+                prev.setUTCDate(prev.getUTCDate() - 1);
+                cursor = prev.toISOString().slice(0, 10);
+            }
+
+            const prior = await db.get(
+                `SELECT longest_streak, last_review_date FROM streaks
+                 WHERE guild_id = ? AND discord_user_id = ?`,
+                [guildId, row.discord_user_id]
+            );
+            const longest = Math.max(currentStreak, prior?.longest_streak ?? 0);
+            const persistedLastDate = lastReviewDate ?? prior?.last_review_date ?? null;
+
+            await db.run(
+                `INSERT INTO streaks (guild_id, discord_user_id, current_streak, longest_streak, last_review_date)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
+                    current_streak = excluded.current_streak,
+                    longest_streak = excluded.longest_streak,
+                    last_review_date = excluded.last_review_date,
+                    updated_at = CURRENT_TIMESTAMP`,
+                [guildId, row.discord_user_id, currentStreak, longest, persistedLastDate]
+            );
+
+            // Snapshot review_statistics for /mistakes baselines using today's
+            // local date so the /mistakes baseline join (Bug 3) lines up.
             const recentStats = await db.all(
                 `SELECT subject_id, meaning_incorrect, reading_incorrect, percentage_correct
                  FROM wk_review_statistics
                  WHERE wanikani_user_id = ? AND data_updated_at >= ?`,
-                [row.wanikani_user_id, sinceISO]
+                [row.wanikani_user_id, earliestStartISO]
             );
-
             for (const s of recentStats) {
                 await db.run(
                     `INSERT INTO review_stat_snapshots (
@@ -913,10 +1054,68 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
     }
 }
 
+// Per-account variant called from the 5-minute summaryRefreshJob. Looks up
+// every guild this user belongs to and runs updateSnapshotsAndStreaks against
+// it, so a user's heatmap and streak come alive within minutes of a review
+// rather than waiting for the nightly daily job.
+async function updateSnapshotsAndStreaksForAccount(account) {
+    const memberships = await db.all(
+        `SELECT guild_id FROM guild_members WHERE discord_user_id = ?`,
+        [account.discord_user_id]
+    );
+    for (const m of memberships) {
+        const row = {
+            discord_user_id: account.discord_user_id,
+            wanikani_user_id: account.wanikani_user_id,
+            api_token_encrypted: account.api_token_encrypted,
+        };
+        await updateSnapshotsAndStreaks(m.guild_id, [row]);
+    }
+}
+
 function utcDateStr(dayOffset = 0) {
     const d = new Date();
     d.setUTCDate(d.getUTCDate() + dayOffset);
     return d.toISOString().slice(0, 10);
+}
+
+// Returns YYYY-MM-DD for `dayOffset` days from today in `tz`. Falls back to
+// UTC if the timezone is invalid. Used for snapshot date keys so a guild's
+// "today" matches what the user perceives, not whatever UTC happens to be.
+function localDateStr(tz, dayOffset = 0) {
+    const zone = isValidTimezone(tz) ? tz : 'UTC';
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+    });
+    const base = new Date();
+    if (dayOffset !== 0) {
+        // Shifting in UTC and then formatting in the target zone is correct as
+        // long as the offset is in days — DST transitions don't move the
+        // calendar date the formatter emits.
+        base.setUTCDate(base.getUTCDate() + dayOffset);
+    }
+    return fmt.format(base); // en-CA gives YYYY-MM-DD
+}
+
+// Start-of-day ISO timestamp (UTC instant) for the given guild-local date.
+function localDayStartISO(tz, dateStr) {
+    const zone = isValidTimezone(tz) ? tz : 'UTC';
+    // Use Intl to figure out the offset of `dateStr 00:00` in `zone`.
+    const [y, m, d] = dateStr.split('-').map(Number);
+    // Compute the UTC instant whose wall-clock time in `zone` is exactly the
+    // start of `dateStr`. Iterate once to correct for the offset.
+    const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
+    const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false,
+    });
+    const parts = Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p => [p.type, p.value]));
+    const localY = +parts.year, localM = +parts.month, localD = +parts.day;
+    const localH = parts.hour === '24' ? 0 : +parts.hour;
+    const localMin = +parts.minute;
+    const wallMs = Date.UTC(localY, localM - 1, localD, localH, localMin);
+    const offsetMs = wallMs - guess;
+    return new Date(guess - offsetMs).toISOString();
 }
 
 async function scheduleGuild(client, guildId) {

@@ -44,18 +44,35 @@ module.exports = {
                 console.error('[wkstats recordPoll]', err.message)
             );
 
+            const guildSettings = await db.get(
+                `SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]
+            );
+            const tz = guildSettings?.timezone || 'UTC';
+            // Compute the lookback start in guild-local terms so a heatmap row
+            // we just wrote with a guild-local date isn't filtered out by a
+            // UTC `date('now', ...)` boundary.
+            const startFmt = new Intl.DateTimeFormat('en-CA', {
+                timeZone: (() => { try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); return tz; } catch { return 'UTC'; } })(),
+                year: 'numeric', month: '2-digit', day: '2-digit',
+            });
+            const lookbackStart = (() => {
+                const d = new Date();
+                d.setUTCDate(d.getUTCDate() - (HEATMAP_DAYS - 1));
+                return startFmt.format(d);
+            })();
+
             const [srs, levelProgress, snapshots] = await Promise.all([
                 getSrsBreakdown(account),
                 getLevelProgress(account, userData.level),
                 db.all(
                     `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
-                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date >= date('now', ?)`,
-                    [guildId, userId, `-${HEATMAP_DAYS - 1} days`]
+                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date >= ?`,
+                    [guildId, userId, lookbackStart]
                 ),
             ]);
 
             const snapshotsByDate = new Map(snapshots.map(s => [s.snapshot_date, s.reviews_completed]));
-            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6);
+            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6, tz);
             const totalReviews = snapshots.reduce((acc, s) => acc + (s.reviews_completed || 0), 0);
             const totalLessons = snapshots.reduce((acc, s) => acc + (s.lessons_completed || 0), 0);
             const levelProgressLine = formatLevelProgress(userData.level, levelProgress);
@@ -105,17 +122,19 @@ function formatLevelProgress(level, progress) {
     const lines = [];
 
     if (k.total > 0) {
-        const ready = k.percent >= progress.threshold;
+        const ready = k.ratio >= progress.thresholdRatio;
         lines.push(
-            `Kanji passed: **${k.passed}/${k.total}** (${k.percent}%)` +
+            `Kanji at Guru+: **${k.passed}/${k.total}** (${k.percent}%)` +
             (ready ? ' — ready to level up! 🎉' : ` — need ${progress.threshold}%`)
         );
     } else {
-        lines.push('Kanji passed: *(none unlocked yet at this level)*');
+        lines.push('Kanji at Guru+: *(none unlocked yet at this level)*');
     }
 
+    // Radicals don't gate level-up directly (only kanji 90% does), but they're
+    // a useful signal of how far through the level the user is.
     if (r.total > 0) {
-        lines.push(`Radicals passed: **${r.passed}/${r.total}** (${r.percent}%)`);
+        lines.push(`Radicals at Guru+: **${r.passed}/${r.total}** (${r.percent}%)`);
     }
 
     return lines.join('\n');

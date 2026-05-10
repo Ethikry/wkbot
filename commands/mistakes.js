@@ -80,26 +80,40 @@ module.exports = {
                 currentStats.push(...page);
             }
 
-            // Step 3: oldest stored snapshot per subject — used as the pre-window baseline
+            // Step 3: oldest stored snapshot per subject within the window — the
+            // pre-window baseline. The previous query used `GROUP BY ... HAVING
+            // snapshot_date = MIN(snapshot_date)`, which under SQLite returns
+            // bare columns from an arbitrary row in the group; the join below
+            // is the correct "row whose snapshot_date equals the minimum" pattern.
             const placeholders = subjectIds.map(() => '?').join(',');
             const snapRows = await db.all(
-                `SELECT subject_id, meaning_incorrect, reading_incorrect
-                 FROM review_stat_snapshots
-                 WHERE wanikani_user_id = ? AND subject_id IN (${placeholders})
-                 GROUP BY subject_id
-                 HAVING snapshot_date = MIN(snapshot_date)`,
-                [wanikaniUserId, ...subjectIds]
+                `SELECT s.subject_id, s.meaning_incorrect, s.reading_incorrect
+                 FROM review_stat_snapshots s
+                 JOIN (
+                     SELECT subject_id, MIN(snapshot_date) AS min_date
+                     FROM review_stat_snapshots
+                     WHERE wanikani_user_id = ?
+                       AND snapshot_date >= ?
+                       AND subject_id IN (${placeholders})
+                     GROUP BY subject_id
+                 ) m ON s.subject_id = m.subject_id AND s.snapshot_date = m.min_date
+                 WHERE s.wanikani_user_id = ?`,
+                [wanikaniUserId, sinceISO.slice(0, 10), ...subjectIds, wanikaniUserId]
             );
             const baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
 
-            // Step 4: diff — items where error counts increased since the baseline
+            // Step 4: diff — items where error counts increased since the baseline.
+            // If a subject has no in-window baseline, fall back to its current totals
+            // (treat as zero-delta) rather than 0 — otherwise every item with any
+            // historical mistake would falsely match.
             const srsMap = new Map(reviewed.map(a => [a.data.subject_id, a.data.srs_stage]));
             const errored = currentStats.filter(s => {
                 const base = baselineMap.get(s.data.subject_id);
-                const prevMeaning = base?.meaning_incorrect ?? 0;
-                const prevReading = base?.reading_incorrect ?? 0;
-                return (s.data.meaning_incorrect || 0) > prevMeaning ||
-                       (s.data.reading_incorrect || 0) > prevReading;
+                const curMeaning = s.data.meaning_incorrect || 0;
+                const curReading = s.data.reading_incorrect || 0;
+                const prevMeaning = base ? base.meaning_incorrect : curMeaning;
+                const prevReading = base ? base.reading_incorrect : curReading;
+                return curMeaning > prevMeaning || curReading > prevReading;
             });
 
             const noSnapshotData = baselineMap.size === 0;
