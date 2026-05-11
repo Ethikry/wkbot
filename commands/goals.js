@@ -10,7 +10,7 @@ const {
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
-const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal } = require('../helpers/wanikaniData');
+const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal, computeFastestPaceDays } = require('../helpers/wanikaniData');
 const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const {
     paceOptionsFor,
@@ -92,7 +92,10 @@ async function buildOverviewPayload(userId, guildId) {
                 const wk = await getWaniKaniData(account);
                 currentLevel = wk.userData.level;
                 if (longGoal.deadline) {
-                    const itemCounts = await getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null);
+                    const [itemCounts, fastest] = await Promise.all([
+                        getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null),
+                        computeFastestPaceDays(account, currentLevel, longGoal.target_level).catch(() => null),
+                    ]);
                     proj = projectPace({
                         targetLevel: longGoal.target_level,
                         currentLevel,
@@ -100,6 +103,7 @@ async function buildOverviewPayload(userId, guildId) {
                         hitRate: longGoal.hit_rate,
                         dailyLessons: longGoal.daily_lessons,
                         itemCounts,
+                        srsDaysPerLevel: fastest?.avgDaysPerLevel,
                     });
                 }
             }
@@ -315,16 +319,18 @@ async function handleLtInitModal(interaction) {
             }
             throw apiErr;
         }
-        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts });
+        const fastest = await computeFastestPaceDays(account, currentLevel, targetLevel).catch(() => null);
+        const srsDaysPerLevel = fastest?.avgDaysPerLevel;
+        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts, srsDaysPerLevel });
 
         wizard.set(interaction.user.id, {
             targetLevel, currentLevel, deadline,
-            hitRate, hitRateSampleSize, itemCounts,
+            hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel,
             chosenPaceKey: null, customLessons: null, customHitRate: null,
         });
 
         return interaction.editReply({
-            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options })],
+            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options })],
             components: ltPaceRows(options),
         });
     } catch (e) {
@@ -441,6 +447,7 @@ async function handleLtCustomModal(interaction) {
         hitRate: finalHitRate,
         dailyLessons: lessons,
         itemCounts: state.itemCounts,
+        srsDaysPerLevel: state.srsDaysPerLevel,
     });
 
     wizard.update(interaction.user.id, { customLessons: lessons, customHitRate });
@@ -745,13 +752,20 @@ async function execClear(interaction) {
 // Shared render helpers
 // ---------------------------------------------------------------------------
 
-function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options }) {
+function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options }) {
     const levelsRemaining = Math.max(1, targetLevel - currentLevel);
     const counts = itemCounts && Number.isFinite(itemCounts.total) ? itemCounts : null;
     const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
     const itemsLine = counts
         ? `**Lessons remaining to reach L${targetLevel}:** ${counts.total} (${counts.radicals} radicals · ${counts.kanji} kanji · ${vocabTotal} vocab)${counts.source === 'fallback' ? ' — estimated' : ''}`
         : `**Lessons remaining to reach L${targetLevel}:** ~${levelsRemaining * 140} estimated`;
+    // Prefer the user-specific SRS floor (computed from wk_srs_stages for the
+    // remaining level range — picks up L1-2 acceleration). Fall back to the
+    // static constant when the SRS cache wasn't ready.
+    const srsFloor = srsDaysPerLevel ?? MIN_DAYS_PER_LEVEL_SRS;
+    const srsLine = srsDaysPerLevel
+        ? `Projections assume you clear reviews each day; the SRS floor for **L${currentLevel + 1}–L${targetLevel}** is **${srsFloor.toFixed(2)} days/level** (radicals→Guru, then kanji→Guru) before hit-rate adjustment.`
+        : `Projections assume you clear reviews each day; the SRS floor is ~${srsFloor.toFixed(2)} days/level before hit-rate adjustment.`;
     const embed = base('🎯 Choose Your Pace').setDescription([
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
@@ -759,7 +773,7 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
         `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleSize ? ` (${hitRateSampleSize} reviewed items)` : ' — defaulted'}`,
         '',
         'Plans cover **every item you have not started yet** through the target level.',
-        `Projections assume you clear reviews each day; the SRS floor is ~${MIN_DAYS_PER_LEVEL_SRS.toFixed(2)} days/level before hit-rate adjustment.`,
+        srsLine,
     ].join('\n'));
     for (const opt of options) {
         const p = opt.projection;
@@ -846,6 +860,7 @@ function buildPresetMap(state) {
             deadline: state.deadline,
             hitRate: state.hitRate,
             itemCounts: state.itemCounts,
+            srsDaysPerLevel: state.srsDaysPerLevel,
         }).map(o => [o.key, o])
     );
 }
@@ -868,6 +883,7 @@ function buildCustomOption(state, projection = null) {
         hitRate,
         dailyLessons: lessonsPerDay,
         itemCounts: state.itemCounts,
+        srsDaysPerLevel: state.srsDaysPerLevel,
     });
     return {
         key: 'custom',
@@ -899,8 +915,8 @@ function fmtPace(mode) {
     switch (mode) {
         case 'goal':        return '🎯 Goal Rate';
         case 'fastest':     return '🚀 Fastest SRS';
-        case 'ten':         return '📚 10/day';
-        case 'five':        return '🌱 5/day';
+        case 'ten':         return '📚 Comfortable';
+        case 'five':        return '🌱 Relaxed';
         case 'custom':      return '🛠️ Custom';
         default:            return mode || 'custom';
     }

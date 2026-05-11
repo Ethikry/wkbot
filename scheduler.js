@@ -629,15 +629,16 @@ async function reviewTimerFired(client, account) {
 
     const user = await client.users.fetch(account.discord_user_id).catch(() => null);
     if (user) {
+        const newlyAvailable = Math.max(0, dueRightNow - prevCount);
         const lines = [
-            `You have **${dueRightNow}** review${dueRightNow === 1 ? '' : 's'} ready right now.`,
+            `**${newlyAvailable}** new review${newlyAvailable === 1 ? '' : 's'} just became available.`,
+            `Total in queue: **${dueRightNow}**.`,
         ];
         if (nextBucket) {
             const ts = Math.floor(new Date(nextBucket.available_at).getTime() / 1000);
             lines.push(`Next batch: **+${nextBucket.subject_count}** <t:${ts}:R> (<t:${ts}:t>).`);
         }
         lines.push(
-            `Goal: level ${goal.target_level}${goal.deadline ? ` by ${goal.deadline}` : ''}.`,
             '',
             'Disable with `/goals` → Configure alerts.'
         );
