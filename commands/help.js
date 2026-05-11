@@ -14,6 +14,7 @@ module.exports = {
                     name: '👤 Personal',
                     value: [
                         '`/setup` — link your read-only WaniKani API token; toggle daily ping, shame, and the cleared-queue announcement',
+                        '`/reviews` — current lessons and reviews, plus today\'s completed counts',
                         '`/wkstats` — level progress, lessons, reviews, SRS breakdown, 30-day heatmap',
                         '`/streak` — current and longest review streak',
                         '`/mistakes` — items you missed in the past 7 days (answers in spoilers)',
