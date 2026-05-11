@@ -349,60 +349,99 @@ async function getSubjectsPerLevel(apiKey, level) {
 }
 
 // Counts the lessons the user still has to complete to reach `targetLevel`,
-// accounting for current state: subjects at level <= targetLevel that either
-// don't have an assignment yet (not unlocked) or have an assignment with
-// started_at IS NULL (sitting in the lesson queue). Items the user has
-// already lesson'd — even if not yet at Guru — are excluded.
+// accounting for current state: subjects from currentLevel through targetLevel
+// that either don't have an assignment yet (not unlocked) or have an assignment
+// with started_at IS NULL (sitting in the lesson queue). Items the user has
+// already lesson'd, even if not yet at Guru, are excluded.
 //
-// Also returns `currentLevel` items remaining specifically in (currentLevel,
-// targetLevel] so callers can show breakdown.
+// Also returns a byLevel array ordered by subject level so callers can inspect
+// or present the level-by-level workload without depending on API sort order.
 //
 // Falls back to a level-count × ~140-items estimate when the subjects cache
 // is empty (first-run / sync failure).
-async function getRemainingLessonsForGoal(account, targetLevel) {
+async function getRemainingLessonsForGoal(account, targetLevel, currentLevelOverride = null) {
     const apiKey = decryptForAccount(account);
     await Promise.all([
         ensureSubjectsSynced(apiKey),
         ensureAssignmentsSynced(account),
     ]);
     const wkId = account.wanikani_user_id;
+    const acct = currentLevelOverride
+        ? null
+        : await db.get(
+            `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+            [wkId]
+        );
+    const currentLevel = currentLevelOverride ?? acct?.level ?? account.level ?? 1;
     const rows = await db.all(
-        `SELECT s.subject_type, COUNT(*) AS n
+        `SELECT s.level, s.subject_type, COUNT(*) AS n
          FROM wk_subjects s
          LEFT JOIN wk_assignments a
            ON a.subject_id = s.subject_id
           AND a.wanikani_user_id = ?
           AND a.hidden = 0
-         WHERE s.level <= ?
+         WHERE s.level >= ?
+           AND s.level <= ?
            AND s.hidden_at IS NULL
            AND (a.assignment_id IS NULL OR a.started_at IS NULL)
-         GROUP BY s.subject_type`,
-        [wkId, targetLevel]
+         GROUP BY s.level, s.subject_type
+         ORDER BY s.level ASC`,
+        [wkId, currentLevel, targetLevel]
     );
-    const out = { radicals: 0, kanji: 0, vocabulary: 0, kanaVocabulary: 0, total: 0, source: 'cache' };
+    const out = {
+        radicals: 0,
+        kanji: 0,
+        vocabulary: 0,
+        kanaVocabulary: 0,
+        total: 0,
+        source: 'cache',
+        byLevel: [],
+    };
+    const byLevel = new Map();
     for (const r of rows) {
-        if (r.subject_type === 'radical') out.radicals = r.n;
-        else if (r.subject_type === 'kanji') out.kanji = r.n;
-        else if (r.subject_type === 'vocabulary') out.vocabulary = r.n;
-        else if (r.subject_type === 'kana_vocabulary') out.kanaVocabulary = r.n;
+        const level = r.level ?? 0;
+        if (!byLevel.has(level)) {
+            byLevel.set(level, { level, radicals: 0, kanji: 0, vocabulary: 0, kanaVocabulary: 0, total: 0 });
+        }
+        const levelCounts = byLevel.get(level);
+        if (r.subject_type === 'radical') out.radicals += r.n;
+        else if (r.subject_type === 'kanji') out.kanji += r.n;
+        else if (r.subject_type === 'vocabulary') out.vocabulary += r.n;
+        else if (r.subject_type === 'kana_vocabulary') out.kanaVocabulary += r.n;
+        if (r.subject_type === 'radical') levelCounts.radicals += r.n;
+        else if (r.subject_type === 'kanji') levelCounts.kanji += r.n;
+        else if (r.subject_type === 'vocabulary') levelCounts.vocabulary += r.n;
+        else if (r.subject_type === 'kana_vocabulary') levelCounts.kanaVocabulary += r.n;
+        levelCounts.total += r.n;
         out.total += r.n;
     }
+    out.byLevel = Array.from(byLevel.values()).sort((a, b) => a.level - b.level);
+
     if (out.total === 0) {
-        // Subjects cache likely empty or this account has fully cleared the
-        // queue. Fall back to a coarse per-level average so the wizard still
-        // produces a sane number.
-        const acct = await db.get(
-            `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
-            [wkId]
+        const subjectCount = await db.get(
+            `SELECT COUNT(*) AS n FROM wk_subjects
+             WHERE level >= ? AND level <= ? AND hidden_at IS NULL`,
+            [currentLevel, targetLevel]
         );
-        const currentLevel = acct?.level ?? 1;
-        const levelsRemaining = Math.max(0, targetLevel - currentLevel);
+        if ((subjectCount?.n ?? 0) > 0) return out;
+
+        // Subjects cache is likely empty. Fall back to a coarse per-level
+        // average so the wizard still produces a sane number.
+        const levelsRemaining = Math.max(0, targetLevel - currentLevel + 1);
         if (levelsRemaining > 0) {
             out.radicals = levelsRemaining * 25;
             out.kanji = levelsRemaining * 30;
             out.vocabulary = levelsRemaining * 85;
             out.total = out.radicals + out.kanji + out.vocabulary;
             out.source = 'fallback';
+            out.byLevel = Array.from({ length: levelsRemaining }, (_, i) => ({
+                level: currentLevel + i,
+                radicals: 25,
+                kanji: 30,
+                vocabulary: 85,
+                kanaVocabulary: 0,
+                total: 140,
+            }));
         }
     }
     return out;
