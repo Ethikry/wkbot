@@ -53,18 +53,19 @@ module.exports = {
 
             const embed = base(`📚 ${username}'s Reviews`)
                 .setURL('https://www.wanikani.com/dashboard')
-                .setDescription([
-                    '**Available now**',
-                    `Level: **${data.userData.level}**`,
-                    `Lessons: **${data.pendingLessons}**`,
-                    `Reviews: **${data.dueRightNow}**`,
-                    '',
-                    '**Completed today**',
-                    `Lessons: **${completed.lessonsCompleted}** · Reviews: **${completed.reviewsCompleted}**`,
-                ].join('\n'));
+                .addFields(
+                    { name: 'Level', value: `**${data.userData.level}**`, inline: true },
+                    { name: 'Lessons', value: `**${data.pendingLessons}**`, inline: true },
+                    { name: 'Reviews', value: `**${data.dueRightNow}**`, inline: true },
+                    {
+                        name: '✅ Completed Today',
+                        value: `**${completed.lessonsCompleted}** lessons · **${completed.reviewsCompleted}** reviews`,
+                        inline: false,
+                    },
+                );
 
             if (data.userData.current_vacation_started_at) {
-                embed.addFields({ name: 'Status', value: '🏖️ Vacation mode is active.', inline: false });
+                embed.setDescription('🏖️ Currently in vacation mode');
             }
 
             return interaction.editReply({ embeds: [embed] });
