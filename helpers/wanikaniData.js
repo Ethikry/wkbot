@@ -60,16 +60,30 @@ async function wkRequest(pathOrUrl, apiKey, opts = {}) {
                 clearTimeout(timer);
                 const retryAfter = parseInt(res.headers.get('Retry-After') || '60', 10);
                 if (attempt < retries) {
+                    console.warn('[wanikani] rate limited; retrying', {
+                        url,
+                        attempt: attempt + 1,
+                        retries,
+                        retryAfterSeconds: retryAfter,
+                    });
                     await sleep(retryAfter * 1000);
                     continue;
                 }
                 const body = await res.text().catch(() => '');
-                throw new Error(`WaniKani API rate-limited: ${body.slice(0, 200)}`);
+                const err = new Error(`WaniKani API rate-limited: ${body.slice(0, 200)}`);
+                err.status = res.status;
+                err.url = url;
+                err.responseBody = body.slice(0, 500);
+                throw err;
             }
 
             if (!res.ok) {
                 const body = await res.text().catch(() => '');
-                throw new Error(`WaniKani API ${res.status}: ${body.slice(0, 200)}`);
+                const err = new Error(`WaniKani API ${res.status}: ${body.slice(0, 200)}`);
+                err.status = res.status;
+                err.url = url;
+                err.responseBody = body.slice(0, 500);
+                throw err;
             }
 
             const raw = await res.json();
@@ -90,9 +104,19 @@ async function wkRequest(pathOrUrl, apiKey, opts = {}) {
             clearTimeout(timer);
             lastErr = err;
             if (attempt < retries && (err.name === 'AbortError' || err.code === 'ECONNRESET')) {
+                err.url = url;
+                err.attempt = attempt + 1;
+                console.warn('[wanikani] transient request failure; retrying', {
+                    url,
+                    attempt: attempt + 1,
+                    retries,
+                    timeoutMs,
+                }, err);
                 await sleep(1000 * (attempt + 1));
                 continue;
             }
+            err.url = err.url ?? url;
+            err.attempt = err.attempt ?? attempt + 1;
             if (attempt >= retries) break;
         }
     }

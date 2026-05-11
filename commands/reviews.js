@@ -48,7 +48,7 @@ module.exports = {
             ]);
 
             await recordPoll(userId, guildId, data.dueRightNow, account.wanikani_user_id).catch(err =>
-                console.error('[reviews recordPoll]', err.message)
+                console.error('[reviews recordPoll]', err)
             );
 
             const embed = base(`📚 ${username}'s Reviews`)

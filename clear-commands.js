@@ -1,4 +1,6 @@
 require("dotenv").config();
+const { installConsoleLogger } = require("./helpers/logger");
+installConsoleLogger();
 
 const { REST, Routes } = require("discord.js");
 

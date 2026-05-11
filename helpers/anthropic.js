@@ -98,7 +98,7 @@ async function generateShameLine({ user, name, lessons, medal, level, knownKanji
         const text = textBlock?.text?.trim();
         return text || null;
     } catch (err) {
-        console.error('[anthropic/generateShameLine]', err.message);
+        console.error('[anthropic/generateShameLine]', err);
         return null;
     } finally {
         clearTimeout(timer);

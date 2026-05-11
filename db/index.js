@@ -10,22 +10,28 @@ function getRaw() {
     return dbInstance;
 }
 
+function withSqlContext(err, operation, sql) {
+    err.operation = operation;
+    err.sql = sql.replace(/\s+/g, ' ').trim().slice(0, 500);
+    return err;
+}
+
 function get(sql, params = []) {
     return new Promise((resolve, reject) => {
-        getRaw().get(sql, params, (err, row) => err ? reject(err) : resolve(row));
+        getRaw().get(sql, params, (err, row) => err ? reject(withSqlContext(err, 'db.get', sql)) : resolve(row));
     });
 }
 
 function all(sql, params = []) {
     return new Promise((resolve, reject) => {
-        getRaw().all(sql, params, (err, rows) => err ? reject(err) : resolve(rows));
+        getRaw().all(sql, params, (err, rows) => err ? reject(withSqlContext(err, 'db.all', sql)) : resolve(rows));
     });
 }
 
 function run(sql, params = []) {
     return new Promise((resolve, reject) => {
         getRaw().run(sql, params, function (err) {
-            if (err) reject(err);
+            if (err) reject(withSqlContext(err, 'db.run', sql));
             else resolve({ lastID: this.lastID, changes: this.changes });
         });
     });
