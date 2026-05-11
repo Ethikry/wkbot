@@ -262,23 +262,33 @@ async function getBurnedCount(account) {
     return row?.n ?? 0;
 }
 
-// Returns { reviewsCompleted, lessonsCompleted } in a single fetch.
-// Reviews-completed = assignments started before the cutoff that were updated within the window.
-// Lessons-completed = assignments where started_at is within the window itself.
+// Returns { reviewsCompleted, lessonsCompleted }.
+// Review records are deprecated in WK API v2, so reviewsCompleted is the count
+// of unique subject review-stat rows updated in the window. This tracks reviewed
+// items, not repeated same-item reviews inside the same window.
 async function getCompletedSince(account, isoDate) {
     const apiKey = decryptForAccount(account);
-    const items = await fetchAllPages(
-        `/assignments?updated_after=${encodeURIComponent(isoDate)}&started=true`,
-        apiKey
-    );
+    const [assignments, reviewStats] = await Promise.all([
+        fetchAllPages(
+            `/assignments?updated_after=${encodeURIComponent(isoDate)}&started=true`,
+            apiKey
+        ),
+        fetchAllPages(
+            `/review_statistics?updated_after=${encodeURIComponent(isoDate)}&hidden=false`,
+            apiKey
+        ),
+    ]);
     const cutoff = new Date(isoDate);
-    let reviewsCompleted = 0, lessonsCompleted = 0;
-    for (const a of items) {
+    let lessonsCompleted = 0;
+    for (const a of assignments) {
         const startedAt = a.data?.started_at;
         if (!startedAt) continue;
-        if (new Date(startedAt) < cutoff) reviewsCompleted++;
-        else lessonsCompleted++;
+        if (new Date(startedAt) >= cutoff) lessonsCompleted++;
     }
+    const reviewedSubjectIds = new Set(
+        reviewStats.map(s => s.data?.subject_id).filter(id => id !== undefined && id !== null)
+    );
+    const reviewsCompleted = reviewedSubjectIds.size;
     return { reviewsCompleted, lessonsCompleted };
 }
 
@@ -333,9 +343,17 @@ async function getLevelProgress(account, level) {
         );
         const total = row?.total ?? 0;
         const passed = row?.passed ?? 0;
-        return { total, passed, percent: total > 0 ? Math.round((passed / total) * 100) : 0 };
+        const threshold = subjectType === 'kanji' ? Math.ceil(total * 0.9) : total;
+        const denominator = Math.max(1, threshold);
+        return {
+            total,
+            passed,
+            threshold,
+            percent: total > 0 ? Math.min(100, Math.floor((passed / denominator) * 100)) : 0,
+            remaining: Math.max(0, threshold - passed),
+        };
     };
-    return { kanji: await tally('kanji'), radicals: await tally('radical'), threshold: 90 };
+    return { kanji: await tally('kanji'), radicals: await tally('radical') };
 }
 
 // Approximation of recent accuracy. review_statistics totals are cumulative per

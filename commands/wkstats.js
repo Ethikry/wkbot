@@ -3,6 +3,7 @@ const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpe
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { base, error, renderMonthlyHeatmap, HEATMAP_LEGEND } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
+const { DEFAULT_TIME_ZONE, addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 const HEATMAP_DAYS = 30;
@@ -27,7 +28,10 @@ module.exports = {
         }
 
         // Make sure /wkstats works as the user's first interaction in a server.
-        await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+        await db.run(
+            `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+            [guildId, DEFAULT_TIME_ZONE]
+        );
         await db.run(
             `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
             [guildId, userId]
@@ -36,6 +40,10 @@ module.exports = {
         await interaction.deferReply();
 
         try {
+            const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
+            const timeZone = resolveTimeZone(settings?.timezone);
+            const today = botDateKey(new Date(), timeZone);
+            const heatmapStart = addDaysToDateKey(today, -(HEATMAP_DAYS - 1));
             const data = await getWaniKaniData(account);
             const { userData, pendingLessons, dueRightNow, dueNext24Hours } = data;
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
@@ -49,13 +57,14 @@ module.exports = {
                 getLevelProgress(account, userData.level),
                 db.all(
                     `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
-                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date >= date('now', ?)`,
-                    [guildId, userId, `-${HEATMAP_DAYS - 1} days`]
+                     WHERE guild_id = ? AND discord_user_id = ?
+                       AND snapshot_date >= ? AND snapshot_date <= ?`,
+                    [guildId, userId, heatmapStart, today]
                 ),
             ]);
 
             const snapshotsByDate = new Map(snapshots.map(s => [s.snapshot_date, s.reviews_completed]));
-            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6);
+            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6, timeZone);
             const totalReviews = snapshots.reduce((acc, s) => acc + (s.reviews_completed || 0), 0);
             const totalLessons = snapshots.reduce((acc, s) => acc + (s.lessons_completed || 0), 0);
             const levelProgressLine = formatLevelProgress(userData.level, levelProgress);
@@ -105,10 +114,10 @@ function formatLevelProgress(level, progress) {
     const lines = [];
 
     if (k.total > 0) {
-        const ready = k.percent >= progress.threshold;
+        const ready = k.passed >= k.threshold;
         lines.push(
-            `Kanji passed: **${k.passed}/${k.total}** (${k.percent}%)` +
-            (ready ? ' — ready to level up! 🎉' : ` — need ${progress.threshold}%`)
+            `Kanji to level up: ${progressBar(k.passed, k.threshold)} **${k.passed}/${k.threshold}** (${k.percent}%)` +
+            (ready ? ' — ready to level up! 🎉' : ` — ${k.remaining} to go`)
         );
     } else {
         lines.push('Kanji passed: *(none unlocked yet at this level)*');
@@ -119,4 +128,10 @@ function formatLevelProgress(level, progress) {
     }
 
     return lines.join('\n');
+}
+
+function progressBar(value, goal, width = 12) {
+    const ratio = goal > 0 ? Math.min(1, value / goal) : 0;
+    const filled = Math.round(ratio * width);
+    return `[${'█'.repeat(filled)}${'░'.repeat(width - filled)}]`;
 }

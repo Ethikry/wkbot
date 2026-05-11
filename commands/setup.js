@@ -2,6 +2,7 @@ const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { isApiKeyFormatValid } = require('../helpers/apikeyTest');
 const { encrypt } = require('../helpers/crypto');
 const { success, error, base } = require('../helpers/embeds');
+const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const db = require('../db');
 
 const WK_REVISION = '20170710';
@@ -174,8 +175,8 @@ async function upsertDiscordUser(discordUserId, displayName, globalName) {
 
 async function upsertGuildSettings(guildId) {
     await db.run(
-        `INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`,
-        [guildId]
+        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+        [guildId, DEFAULT_TIME_ZONE]
     );
 }
 
