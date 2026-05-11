@@ -2,6 +2,7 @@ const { SlashCommandBuilder, ChannelType, MessageFlags } = require('discord.js')
 const { isModerator } = require('../helpers/permissions');
 const { success, error, base } = require('../helpers/embeds');
 const { rescheduleGuild } = require('../scheduler');
+const { DEFAULT_TIME_ZONE, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 const VALID_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -21,7 +22,10 @@ function dayName(n) {
 }
 
 async function ensureSettings(guildId) {
-    await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+    await db.run(
+        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+        [guildId, DEFAULT_TIME_ZONE]
+    );
 }
 
 module.exports = {
@@ -161,8 +165,8 @@ async function showSettings(interaction, guildId) {
     const embed = base('⚙️ Server Settings')
         .addFields(
             { name: 'Output channel', value: channelStr, inline: false },
-            { name: 'Timezone', value: `**${s.timezone}**`, inline: true },
-            { name: 'Scheduled time', value: `**${s.daily_summary_time}** ${s.timezone}`, inline: true },
+            { name: 'Timezone', value: `**${resolveTimeZone(s.timezone)}**`, inline: true },
+            { name: 'Scheduled time', value: `**${s.daily_summary_time}** ${resolveTimeZone(s.timezone)}`, inline: true },
             {
                 name: 'Daily summary',
                 value: s.daily_summary_enabled ? 'on' : 'off',

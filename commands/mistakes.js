@@ -3,26 +3,10 @@ const { fetchAllPages, getSubjectsByIds } = require('../helpers/wanikaniData');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { decrypt } = require('../helpers/crypto');
 const { base, error } = require('../helpers/embeds');
+const { botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
-function srsGroup(stage) {
-    if (stage >= 1 && stage <= 4) return 'apprentice';
-    if (stage === 5 || stage === 6) return 'guru';
-    if (stage === 7) return 'master';
-    if (stage === 8) return 'enlightened';
-    if (stage === 9) return 'burned';
-    return 'other';
-}
-
-const GROUP_ORDER = ['burned', 'enlightened', 'master', 'guru', 'apprentice', 'other'];
-const GROUP_HEADER = {
-    burned: '🔥 Burned',
-    enlightened: '✨ Enlightened',
-    master: '🌳 Master',
-    guru: '🌿 Guru',
-    apprentice: '🌱 Apprentice',
-    other: '❔ Other',
-};
+const MISTAKE_WINDOW_DAYS = 7;
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -32,6 +16,7 @@ module.exports = {
 
     async execute(interaction) {
         const userId = interaction.user.id;
+        const guildId = interaction.guild.id;
 
         const account = await getAccountForDiscordUser(userId);
         if (!account?.api_token_encrypted) {
@@ -46,89 +31,92 @@ module.exports = {
         try {
             const apiKey = decrypt(account.api_token_encrypted);
             const wanikaniUserId = account.wanikani_user_id;
-            const since = new Date();
-            since.setUTCDate(since.getUTCDate() - 7);
-            const sinceISO = since.toISOString();
+            const cutoff = new Date(Date.now() - MISTAKE_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+            const sinceISO = cutoff.toISOString();
 
-            // Step 1: assignments updated in window with started_at before the window = reviewed items
-            const recentAssignments = await fetchAllPages(
-                `/assignments?updated_after=${encodeURIComponent(sinceISO)}&started=true`,
+            // Review records are deprecated in WaniKani API v2, so use review_statistics:
+            // these are the subjects whose cumulative review stats changed during the window.
+            const currentStats = await fetchAllPages(
+                `/review_statistics?updated_after=${encodeURIComponent(sinceISO)}&hidden=false`,
                 apiKey
             );
-            const cutoff = new Date(sinceISO);
-            const reviewed = recentAssignments.filter(a =>
-                a.data.started_at && new Date(a.data.started_at) < cutoff
-            );
 
-            if (reviewed.length === 0) {
+            if (currentStats.length === 0) {
                 return interaction.editReply({
                     embeds: [base('📭 No Data Yet')
-                        .setDescription('No reviews found in the past 7 days. Check back after you\'ve done some reviews!')],
+                        .setDescription('No reviewed items were found in the past 7 days. Check back after WaniKani records new review activity.')],
                 });
             }
 
-            const subjectIds = [...new Set(reviewed.map(a => a.data.subject_id))];
-
-            // Step 2: current review_statistics for those subjects
-            const currentStats = [];
-            for (let i = 0; i < subjectIds.length; i += 500) {
-                const chunk = subjectIds.slice(i, i + 500);
-                const page = await fetchAllPages(
-                    `/review_statistics?subject_ids=${chunk.join(',')}`,
-                    apiKey
-                );
-                currentStats.push(...page);
+            const subjectIds = [
+                ...new Set(currentStats.map(s => s.data?.subject_id).filter(id => id !== undefined && id !== null)),
+            ];
+            if (subjectIds.length === 0) {
+                return interaction.editReply({
+                    embeds: [base('📭 No Data Yet')
+                        .setDescription('No review-stat subjects were found in the past 7 days.')],
+                });
             }
 
-            // Step 3: oldest stored snapshot per subject within the window — the
-            // pre-window baseline. The previous query used `GROUP BY ... HAVING
-            // snapshot_date = MIN(snapshot_date)`, which under SQLite returns
-            // bare columns from an arbitrary row in the group; the join below
-            // is the correct "row whose snapshot_date equals the minimum" pattern.
+            // Latest stored daily snapshot at or before the window start. This
+            // is the pre-window cumulative incorrect count for each subject.
+            const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
+            const cutoffDateKey = botDateKey(cutoff, resolveTimeZone(settings?.timezone));
             const placeholders = subjectIds.map(() => '?').join(',');
             const snapRows = await db.all(
-                `SELECT s.subject_id, s.meaning_incorrect, s.reading_incorrect
+                `WITH latest AS (
+                    SELECT subject_id, MAX(snapshot_date) AS snapshot_date
+                    FROM review_stat_snapshots
+                    WHERE wanikani_user_id = ?
+                      AND subject_id IN (${placeholders})
+                      AND snapshot_date <= ?
+                    GROUP BY subject_id
+                 )
+                 SELECT s.subject_id, s.meaning_incorrect, s.reading_incorrect
                  FROM review_stat_snapshots s
-                 JOIN (
-                     SELECT subject_id, MIN(snapshot_date) AS min_date
-                     FROM review_stat_snapshots
-                     WHERE wanikani_user_id = ?
-                       AND snapshot_date >= ?
-                       AND subject_id IN (${placeholders})
-                     GROUP BY subject_id
-                 ) m ON s.subject_id = m.subject_id AND s.snapshot_date = m.min_date
+                 JOIN latest l
+                   ON l.subject_id = s.subject_id
+                  AND l.snapshot_date = s.snapshot_date
                  WHERE s.wanikani_user_id = ?`,
-                [wanikaniUserId, sinceISO.slice(0, 10), ...subjectIds, wanikaniUserId]
+                [wanikaniUserId, ...subjectIds, cutoffDateKey, wanikaniUserId]
             );
             const baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
 
-            // Step 4: diff — items where error counts increased since the baseline.
-            // If a subject has no in-window baseline, fall back to its current totals
-            // (treat as zero-delta) rather than 0 — otherwise every item with any
-            // historical mistake would falsely match.
-            const srsMap = new Map(reviewed.map(a => [a.data.subject_id, a.data.srs_stage]));
-            const errored = currentStats.filter(s => {
-                const base = baselineMap.get(s.data.subject_id);
-                const curMeaning = s.data.meaning_incorrect || 0;
-                const curReading = s.data.reading_incorrect || 0;
-                const prevMeaning = base ? base.meaning_incorrect : curMeaning;
-                const prevReading = base ? base.reading_incorrect : curReading;
-                return curMeaning > prevMeaning || curReading > prevReading;
-            });
+            let skippedForBaseline = 0;
+            const errored = currentStats.map(s => {
+                const createdAt = s.data.created_at ? new Date(s.data.created_at) : null;
+                const meaningTotal = s.data.meaning_incorrect || 0;
+                const readingTotal = s.data.reading_incorrect || 0;
 
-            const noSnapshotData = baselineMap.size === 0;
+                if (createdAt && createdAt >= cutoff) {
+                    if (meaningTotal === 0 && readingTotal === 0) return null;
+                    return { stat: s, meaningDelta: meaningTotal, readingDelta: readingTotal };
+                }
+
+                const base = baselineMap.get(s.data.subject_id);
+                if (!base) {
+                    skippedForBaseline++;
+                    return null;
+                }
+                const prevMeaning = base?.meaning_incorrect ?? 0;
+                const prevReading = base?.reading_incorrect ?? 0;
+                const meaningDelta = Math.max(0, meaningTotal - prevMeaning);
+                const readingDelta = Math.max(0, readingTotal - prevReading);
+                if (meaningDelta === 0 && readingDelta === 0) return null;
+                return { stat: s, meaningDelta, readingDelta };
+            }).filter(Boolean);
 
             if (errored.length === 0) {
-                const desc = noSnapshotData
-                    ? 'No baseline data yet — snapshots are recorded during the daily summary. Check back tomorrow for accurate 7-day tracking.'
+                const desc = skippedForBaseline > 0
+                    ? `No confirmed mistakes found. The bot is still building a pre-window baseline for ${skippedForBaseline} recently reviewed item${skippedForBaseline === 1 ? '' : 's'}.`
                     : 'You haven\'t missed a single review in the past 7 days. Nice.';
                 return interaction.editReply({
-                    embeds: [base(noSnapshotData ? '📊 Building Baseline…' : '🎯 No Mistakes!')
+                    embeds: [base(skippedForBaseline > 0 ? '📊 Building Baseline…' : '🎯 No Mistakes!')
                         .setDescription(desc)],
                 });
             }
 
-            const subjectIdsErrored = errored.map(s => s.data.subject_id);
+            const subjectIdsErrored = errored.map(e => e.stat.data.subject_id);
             const subjects = await getSubjectsByIds(apiKey, subjectIdsErrored);
             const subjectMap = new Map(subjects.map(s => [s.id, s.data]));
 
@@ -143,41 +131,31 @@ module.exports = {
                 : [];
             const synonymMap = new Map(synonymRows.map(r => [r.subject_id, r.meaning_synonyms_json ? JSON.parse(r.meaning_synonyms_json) : []]));
 
-            const items = errored.map(s => {
-                const subj = subjectMap.get(s.data.subject_id);
+            const items = errored.map(e => {
+                const subjectId = e.stat.data.subject_id;
+                const subj = subjectMap.get(subjectId);
                 if (!subj) return null;
                 const meanings = (subj.meanings || []).map(m => m.meaning).filter(Boolean);
-                const synonyms = synonymMap.get(s.data.subject_id) ?? [];
+                const synonyms = synonymMap.get(subjectId) ?? [];
                 return {
-                    subjectId: s.data.subject_id,
+                    subjectId,
                     characters: subj.characters || subj.slug || '?',
                     meanings: [...meanings, ...synonyms],
                     readings: (subj.readings || []).filter(r => r.accepted_answer).map(r => r.reading),
-                    srsStage: srsMap.get(s.data.subject_id) ?? 0,
+                    meaningDelta: e.meaningDelta,
+                    readingDelta: e.readingDelta,
                 };
             }).filter(Boolean);
 
-            items.sort((a, b) => b.srsStage - a.srsStage);
-
-            const grouped = new Map();
-            for (const it of items) {
-                const g = srsGroup(it.srsStage);
-                if (!grouped.has(g)) grouped.set(g, []);
-                grouped.get(g).push(it);
-            }
+            items.sort((a, b) =>
+                totalMistakes(b) - totalMistakes(a) ||
+                a.characters.localeCompare(b.characters)
+            );
 
             const embed = base(`📝 Mistakes — Past 7 Days (${items.length})`)
-                .setDescription('Answers hidden in spoilers — click to reveal.');
+                .setDescription('Review items with incorrect-answer counts that increased during the past week. Answers are hidden in spoilers.');
 
-            for (const groupKey of GROUP_ORDER) {
-                const groupItems = grouped.get(groupKey);
-                if (!groupItems?.length) continue;
-                embed.addFields({
-                    name: `${GROUP_HEADER[groupKey]} (${groupItems.length})`,
-                    value: clipFieldValue(groupItems.map(formatMistakeLine).join('\n')),
-                    inline: false,
-                });
-            }
+            for (const field of listFields(items)) embed.addFields(field);
 
             return interaction.editReply({ embeds: [embed] });
         } catch (err) {
@@ -193,13 +171,44 @@ function formatMistakeLine(it) {
     const meaning = it.meanings.length ? it.meanings.join(', ') : '—';
     const reading = it.readings.length ? it.readings.join(', ') : null;
     const answer = reading ? `${reading} · ${meaning}` : meaning;
-    return `**${it.characters}** ||${answer}||`;
+    return `**${it.characters}** ${mistakeSummary(it)} ||${answer}||`;
 }
 
-function clipFieldValue(s) {
-    const MAX = 1024;
-    if (s.length <= MAX) return s;
-    const truncated = s.slice(0, MAX - 20);
-    const lastNewline = truncated.lastIndexOf('\n');
-    return (lastNewline > 0 ? truncated.slice(0, lastNewline) : truncated) + '\n*…and more*';
+function mistakeSummary(it) {
+    const parts = [];
+    if (it.meaningDelta > 0) parts.push(`meaning +${it.meaningDelta}`);
+    if (it.readingDelta > 0) parts.push(`reading +${it.readingDelta}`);
+    return `(${parts.join(', ')})`;
+}
+
+function totalMistakes(it) {
+    return it.meaningDelta + it.readingDelta;
+}
+
+function listFields(items) {
+    const MAX_ITEM_FIELDS = 24;
+    const fields = [];
+    let lines = [];
+    for (const item of items) {
+        const next = formatMistakeLine(item);
+        const candidate = [...lines, next].join('\n');
+        if (candidate.length > 1024 && lines.length > 0) {
+            fields.push({ name: fields.length === 0 ? 'Items' : 'Items continued', value: lines.join('\n'), inline: false });
+            if (fields.length >= MAX_ITEM_FIELDS) {
+                lines = [];
+                break;
+            }
+            lines = [next];
+        } else {
+            lines.push(next);
+        }
+    }
+    if (lines.length && fields.length < MAX_ITEM_FIELDS) {
+        fields.push({ name: fields.length === 0 ? 'Items' : 'Items continued', value: lines.join('\n'), inline: false });
+    }
+    const displayed = fields.reduce((acc, f) => acc + f.value.split('\n').length, 0);
+    if (displayed < items.length) {
+        fields.push({ name: 'More', value: `And ${items.length - displayed} more item${items.length - displayed === 1 ? '' : 's'}.`, inline: false });
+    }
+    return fields;
 }

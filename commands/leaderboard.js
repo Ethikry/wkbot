@@ -1,5 +1,6 @@
 const { SlashCommandBuilder } = require('discord.js');
 const { base, error } = require('../helpers/embeds');
+const { addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 module.exports = {
@@ -12,9 +13,9 @@ module.exports = {
         await interaction.deferReply();
 
         const guildId = interaction.guild.id;
-        const since = new Date();
-        since.setUTCDate(since.getUTCDate() - 7);
-        const sinceStr = since.toISOString().slice(0, 10);
+        const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
+        const timeZone = resolveTimeZone(settings?.timezone);
+        const sinceStr = addDaysToDateKey(botDateKey(new Date(), timeZone), -7);
 
         const rows = await db.all(
             `SELECT discord_user_id,

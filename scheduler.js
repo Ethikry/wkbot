@@ -16,6 +16,13 @@ const { pickShameLine } = require('./helpers/shame');
 const { generateShameLine } = require('./helpers/anthropic');
 const { logReminderEvent } = require('./helpers/reminderEvents');
 const { evaluateAchievements } = require('./helpers/achievements');
+const {
+    DEFAULT_TIME_ZONE,
+    addDaysToDateKey,
+    botDateKey,
+    resolveTimeZone,
+    startOfBotDayUtcIso,
+} = require('./helpers/botTime');
 
 const guildJobs = new Map();
 let summaryRefreshJobHandle = null;
@@ -25,10 +32,9 @@ let paceAlertJobHandle = null;
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const TWENTY_HOURS_MS = 20 * 60 * 60 * 1000;
-const MIDNIGHT_UTC_TODAY = () => {
-    const d = new Date();
-    d.setUTCHours(0, 0, 0, 0);
-    return d.toISOString();
+const START_OF_BOT_DAY = (timeZone) => {
+    const resolved = resolveTimeZone(timeZone);
+    return startOfBotDayUtcIso(botDateStr(0, resolved), resolved);
 };
 
 // Transient burn-count cache. The new schema deliberately doesn't persist this:
@@ -59,17 +65,11 @@ function cronExpr(time, dayOfWeek) {
     return `${m} ${h} * * ${dow}`;
 }
 
-function isValidTimezone(tz) {
-    try {
-        new Intl.DateTimeFormat('en-US', { timeZone: tz });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 async function getOrCreateSettings(guildId) {
-    await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+    await db.run(
+        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+        [guildId, DEFAULT_TIME_ZONE]
+    );
     return db.get(`SELECT * FROM guild_settings WHERE guild_id = ?`, [guildId]);
 }
 
@@ -235,9 +235,8 @@ async function leaderboardJob(client, guildId) {
     const channel = await resolveOutputChannel(guild, settings);
     if (!channel) return;
 
-    const since = new Date();
-    since.setUTCDate(since.getUTCDate() - 7);
-    const sinceStr = since.toISOString().slice(0, 10);
+    const timeZone = resolveTimeZone(settings.timezone);
+    const sinceStr = botDateStr(-7, timeZone);
 
     const rows = await db.all(
         `SELECT
@@ -456,7 +455,7 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
 
     if (!cleared) return;
     try {
-        const reviewsToday = await getReviewsCompletedSince(row, MIDNIGHT_UTC_TODAY())
+        const reviewsToday = await getReviewsCompletedSince(row, START_OF_BOT_DAY(settings.timezone))
             .catch(() => null);
         const nextBucket = await db.get(
             `SELECT available_at, subject_count FROM wk_summary_buckets
@@ -790,7 +789,6 @@ async function pollUsersJob(client) {
 
 async function paceAlertJob(client) {
     const goals = await db.all(`SELECT * FROM long_goals WHERE notify_enabled = 1`);
-    const today = utcDateStr();
 
     for (const goal of goals) {
         try {
@@ -807,10 +805,12 @@ async function paceAlertJob(client) {
 
             let lessonsToday = 0;
             for (const m of memberRows) {
+                const settings = await getOrCreateSettings(m.guild_id);
+                const todayForGuild = botDateStr(0, settings.timezone);
                 const snap = await db.get(
                     `SELECT lessons_completed FROM daily_snapshots
                      WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
-                    [m.guild_id, goal.discord_user_id, today]
+                    [m.guild_id, goal.discord_user_id, todayForGuild]
                 );
                 if (snap?.lessons_completed > lessonsToday) {
                     lessonsToday = snap.lessons_completed;
@@ -860,7 +860,7 @@ const SNAPSHOT_LOOKBACK_DAYS = 3;
 
 async function updateSnapshotsAndStreaks(guildId, rows) {
     const settings = await getOrCreateSettings(guildId);
-    const tz = isValidTimezone(settings.timezone) ? settings.timezone : 'UTC';
+    const timeZone = resolveTimeZone(settings.timezone);
     const {
         ensureUserSynced, ensureReviewStatsSynced,
         getCompletedItemsSince, getSrsBreakdown,
@@ -870,9 +870,9 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
     // window boundaries needed to bucket assignments updates into them.
     const days = [];
     for (let i = SNAPSHOT_LOOKBACK_DAYS - 1; i >= 0; i--) {
-        const dateKey = localDateStr(tz, -i);
-        const startISO = localDayStartISO(tz, dateKey);
-        const endISO = localDayStartISO(tz, localDateStr(tz, -i + 1));
+        const dateKey = botDateStr(-i, timeZone);
+        const startISO = startOfBotDayUtcIso(dateKey, timeZone);
+        const endISO = startOfBotDayUtcIso(botDateStr(-i + 1, timeZone), timeZone);
         days.push({ dateKey, startISO, endISO });
     }
     const earliestStartISO = days[0].startISO;
@@ -936,8 +936,8 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(guild_id, discord_user_id, snapshot_date) DO UPDATE SET
                         level = excluded.level,
-                        reviews_completed = excluded.reviews_completed,
-                        lessons_completed = excluded.lessons_completed,
+                        reviews_completed = CASE WHEN ? THEN excluded.reviews_completed ELSE max(daily_snapshots.reviews_completed, excluded.reviews_completed) END,
+                        lessons_completed = CASE WHEN ? THEN excluded.lessons_completed ELSE max(daily_snapshots.lessons_completed, excluded.lessons_completed) END,
                         lessons_available = CASE WHEN ? THEN excluded.lessons_available ELSE daily_snapshots.lessons_available END,
                         reviews_available = CASE WHEN ? THEN excluded.reviews_available ELSE daily_snapshots.reviews_available END,
                         reviews_24h = CASE WHEN ? THEN excluded.reviews_24h ELSE daily_snapshots.reviews_24h END,
@@ -959,6 +959,7 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                         isToday ? (summaryRow?.review_count_24h ?? 0) : 0,
                         srs.apprentice, srs.guru, srs.master, srs.enlightened, srs.burned,
                         totals?.total_assignments ?? 0, totals?.total_started ?? 0,
+                        isToday ? 1 : 0, isToday ? 1 : 0,
                         isToday ? 1 : 0, isToday ? 1 : 0, isToday ? 1 : 0,
                     ]
                 );
@@ -1017,12 +1018,12 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
             );
 
             // Snapshot review_statistics for /mistakes baselines using today's
-            // local date so the /mistakes baseline join (Bug 3) lines up.
+            // local date so the baseline join lines up with bot-day history.
             const recentStats = await db.all(
                 `SELECT subject_id, meaning_incorrect, reading_incorrect, percentage_correct
                  FROM wk_review_statistics
-                 WHERE wanikani_user_id = ? AND data_updated_at >= ?`,
-                [row.wanikani_user_id, earliestStartISO]
+                 WHERE wanikani_user_id = ? AND hidden = 0`,
+                [row.wanikani_user_id]
             );
             for (const s of recentStats) {
                 await db.run(
@@ -1045,8 +1046,8 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
 
             await db.run(
                 `DELETE FROM review_stat_snapshots
-                 WHERE wanikani_user_id = ? AND snapshot_date < date('now', '-14 days')`,
-                [row.wanikani_user_id]
+                 WHERE wanikani_user_id = ? AND snapshot_date < ?`,
+                [row.wanikani_user_id, botDateStr(-14, timeZone)]
             );
         } catch (err) {
             console.error(`[snapshot] ${row.discord_user_id}@${guildId}:`, err.message);
@@ -1073,55 +1074,18 @@ async function updateSnapshotsAndStreaksForAccount(account) {
     }
 }
 
+function botDateStr(dayOffset = 0, timeZone = undefined) {
+    return addDaysToDateKey(botDateKey(new Date(), resolveTimeZone(timeZone)), dayOffset);
+}
+
 function utcDateStr(dayOffset = 0) {
-    const d = new Date();
-    d.setUTCDate(d.getUTCDate() + dayOffset);
-    return d.toISOString().slice(0, 10);
-}
-
-// Returns YYYY-MM-DD for `dayOffset` days from today in `tz`. Falls back to
-// UTC if the timezone is invalid. Used for snapshot date keys so a guild's
-// "today" matches what the user perceives, not whatever UTC happens to be.
-function localDateStr(tz, dayOffset = 0) {
-    const zone = isValidTimezone(tz) ? tz : 'UTC';
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-        timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
-    });
-    const base = new Date();
-    if (dayOffset !== 0) {
-        // Shifting in UTC and then formatting in the target zone is correct as
-        // long as the offset is in days — DST transitions don't move the
-        // calendar date the formatter emits.
-        base.setUTCDate(base.getUTCDate() + dayOffset);
-    }
-    return fmt.format(base); // en-CA gives YYYY-MM-DD
-}
-
-// Start-of-day ISO timestamp (UTC instant) for the given guild-local date.
-function localDayStartISO(tz, dateStr) {
-    const zone = isValidTimezone(tz) ? tz : 'UTC';
-    // Use Intl to figure out the offset of `dateStr 00:00` in `zone`.
-    const [y, m, d] = dateStr.split('-').map(Number);
-    // Compute the UTC instant whose wall-clock time in `zone` is exactly the
-    // start of `dateStr`. Iterate once to correct for the offset.
-    const guess = Date.UTC(y, m - 1, d, 0, 0, 0);
-    const fmt = new Intl.DateTimeFormat('en-US', {
-        timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', hour12: false,
-    });
-    const parts = Object.fromEntries(fmt.formatToParts(new Date(guess)).map(p => [p.type, p.value]));
-    const localY = +parts.year, localM = +parts.month, localD = +parts.day;
-    const localH = parts.hour === '24' ? 0 : +parts.hour;
-    const localMin = +parts.minute;
-    const wallMs = Date.UTC(localY, localM - 1, localD, localH, localMin);
-    const offsetMs = wallMs - guess;
-    return new Date(guess - offsetMs).toISOString();
+    return botDateStr(dayOffset);
 }
 
 async function scheduleGuild(client, guildId) {
     clearGuildJobs(guildId);
     const settings = await getOrCreateSettings(guildId);
-    const tz = isValidTimezone(settings.timezone) ? settings.timezone : 'UTC';
+    const tz = resolveTimeZone(settings.timezone);
 
     addJob(guildId, cron.schedule(
         cronExpr(settings.daily_summary_time),
@@ -1199,5 +1163,6 @@ module.exports = {
     dailyGlobalsAndUserSyncJob,
     paceAlertJob,
     updateSnapshotsAndStreaks,
+    botDateStr,
     utcDateStr,
 };
