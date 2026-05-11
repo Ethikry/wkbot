@@ -321,6 +321,26 @@ async function handleLtInitModal(interaction) {
         }
         const fastest = await computeFastestPaceDays(account, currentLevel, targetLevel).catch(() => null);
         const srsDaysPerLevel = fastest?.avgDaysPerLevel;
+
+        // Gate: refuse impossible goals up-front. underWaniKaniMinimum depends
+        // only on (deadline, level range, hit rate, SRS floor) — not on the
+        // chosen daily-lesson rate — so no preset can rescue it. Block the
+        // deadline here rather than letting the user pick a preset that will
+        // be flagged in the confirm step anyway.
+        const feasibilityProbe = projectPace({
+            targetLevel, currentLevel, deadline, hitRate,
+            itemCounts, srsDaysPerLevel,
+        });
+        if (feasibilityProbe.underWaniKaniMinimum) {
+            return interaction.editReply({
+                embeds: [impossibleGoalEmbed(
+                    { targetLevel, currentLevel, deadline },
+                    feasibilityProbe,
+                )],
+                components: [ltCancelRow()],
+            });
+        }
+
         const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts, srsDaysPerLevel });
 
         wizard.set(interaction.user.id, {
@@ -412,6 +432,25 @@ async function handleLtCustomize(interaction) {
     );
 }
 
+// Builds the "deadline is impossible under SRS" error embed shown when a goal
+// requires advancing levels faster than WaniKani's SRS allows (even with
+// infinite daily lessons). projection.minimumSrsDays is hit-rate-inflated, so
+// the earliest feasible date reflects the user's actual accuracy.
+function impossibleGoalEmbed(state, projection) {
+    const today = new Date();
+    const earliest = new Date(today.getTime() + projection.minimumSrsDays * 24 * 60 * 60 * 1000);
+    const earliestStr = earliest.toISOString().slice(0, 10);
+    const lines = [
+        `Reaching **Level ${state.targetLevel}** from Level ${state.currentLevel} takes at least **${projection.minimumSrsDays} days** under WaniKani's SRS at your hit rate (${formatPercent(projection.effectiveHitRate)}).`,
+        `Your deadline (${state.deadline}) is only ${projection.daysRemaining} days away — even infinite lessons/day can't beat the SRS timing.`,
+        '',
+        `Earliest feasible deadline: **${earliestStr}**.`,
+        '',
+        'Pick a later deadline or a lower target level.',
+    ];
+    return error('Goal Not Attainable', lines.join('\n'));
+}
+
 async function handleLtCustomModal(interaction) {
     const lessons = parseInt(interaction.fields.getTextInputValue('lessons').trim(), 10);
     const hitRateRaw = interaction.fields.getTextInputValue('hit_rate').trim();
@@ -450,6 +489,16 @@ async function handleLtCustomModal(interaction) {
         srsDaysPerLevel: state.srsDaysPerLevel,
     });
 
+    // A lower custom hit rate inflates the SRS floor and can push the goal
+    // past attainable. Refuse rather than letting the user save something the
+    // overview will permanently flag as "behind".
+    if (projection.underWaniKaniMinimum) {
+        return respondModal(interaction, {
+            embeds: [impossibleGoalEmbed(state, projection)],
+            components: ltConfirmRows(),
+        });
+    }
+
     wizard.update(interaction.user.id, { customLessons: lessons, customHitRate });
     const updated = wizard.get(interaction.user.id);
 
@@ -472,6 +521,16 @@ async function handleLtConfirm(interaction) {
         return interaction.update({
             embeds: [error('Unknown Pace', 'That pace option is no longer available. Please start over.')],
             components: [],
+        });
+    }
+    // Final guard against saving an impossible goal — should normally be
+    // caught by handleLtInitModal / handleLtCustomModal, but reaffirm here
+    // since stale wizard state or hand-crafted button payloads could bypass
+    // those checks.
+    if (chosen.projection.underWaniKaniMinimum) {
+        return interaction.update({
+            embeds: [impossibleGoalEmbed(state, chosen.projection)],
+            components: ltConfirmRows(),
         });
     }
     const finalLessons = chosen.projection.lessonsPerDay;
