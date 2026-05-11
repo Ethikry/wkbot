@@ -28,16 +28,16 @@ const PACE_PRESETS = {
     },
     ten: {
         key: 'ten',
-        label: '📚 10/day',
+        label: '📚 Comfortable',
         emoji: '📚',
-        labelText: '10/day',
+        labelText: 'Comfortable',
         dailyLessons: 10,
     },
     five: {
         key: 'five',
-        label: '🌱 5/day',
+        label: '🌱 Relaxed',
         emoji: '🌱',
-        labelText: '5/day',
+        labelText: 'Relaxed',
         dailyLessons: 5,
     },
 };
@@ -94,6 +94,7 @@ function projectPace({
     hitRate,
     itemCounts,
     dailyLessons,
+    srsDaysPerLevel,
 }) {
     const today = new Date();
     const todayStr = isoDate(today);
@@ -104,7 +105,12 @@ function projectPace({
     const totalLessons = Math.max(0, counts.total ?? 0);
     const effectiveHitRate = normalizeHitRate(hitRate);
 
-    const minimumDaysPerLevel = MIN_DAYS_PER_LEVEL_SRS / effectiveHitRate;
+    // SRS floor is user-specific when srsDaysPerLevel is provided (derived
+    // from wk_srs_stages for this user's level range, so L1-2 users get
+    // ~3.17 d/lvl instead of the static 6.83). Fall back to the constant
+    // when the SRS cache isn't ready or the caller didn't compute it.
+    const baseSrsDaysPerLevel = srsDaysPerLevel ?? MIN_DAYS_PER_LEVEL_SRS;
+    const minimumDaysPerLevel = baseSrsDaysPerLevel / effectiveHitRate;
     const minimumSrsDays = Math.ceil(minimumDaysPerLevel * levelsRemaining);
     const requiredLessonsPerDay = totalLessons === 0 ? 0 : Math.ceil(totalLessons / daysRemaining);
     const fastestLessonsPerDay = totalLessons === 0
@@ -134,6 +140,7 @@ function projectPace({
         lessonDays,
         minimumSrsDays,
         minimumDaysPerLevel,
+        srsDaysPerLevel: baseSrsDaysPerLevel,
         effectiveHitRate,
         daysPerLevel: projectedDays / levelsRemaining,
         requiredLessonsPerDay,
