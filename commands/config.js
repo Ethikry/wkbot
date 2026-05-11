@@ -2,6 +2,7 @@ const { SlashCommandBuilder, ChannelType, MessageFlags } = require('discord.js')
 const { isModerator } = require('../helpers/permissions');
 const { success, error, base } = require('../helpers/embeds');
 const { rescheduleGuild } = require('../scheduler');
+const { DEFAULT_TIME_ZONE, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 const VALID_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -21,7 +22,10 @@ function dayName(n) {
 }
 
 async function ensureSettings(guildId) {
-    await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+    await db.run(
+        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+        [guildId, DEFAULT_TIME_ZONE]
+    );
 }
 
 module.exports = {
@@ -41,7 +45,7 @@ module.exports = {
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
         .addStringOption(o =>
-            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, UTC)'))
+            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, configured timezone)'))
         .addChannelOption(o =>
             o.setName('channel').setDescription('Output channel or thread for bot posts')
                 .addChannelTypes(...OUTPUT_CHANNEL_TYPES))
@@ -106,7 +110,7 @@ module.exports = {
         if (time !== null) {
             fields.push('daily_summary_time = ?', 'weekly_leaderboard_time = ?');
             params.push(time, time);
-            summary.push(`Scheduled message time: **${time} UTC**`);
+            summary.push(`Scheduled message time: **${time}**`);
             scheduleChanged = true;
         }
         if (weekly !== null) {
@@ -161,7 +165,8 @@ async function showSettings(interaction, guildId) {
     const embed = base('⚙️ Server Settings')
         .addFields(
             { name: 'Output channel', value: channelStr, inline: false },
-            { name: 'Scheduled time (UTC)', value: `**${s.daily_summary_time}**`, inline: true },
+            { name: 'Timezone', value: `**${resolveTimeZone(s.timezone)}**`, inline: true },
+            { name: 'Scheduled time', value: `**${s.daily_summary_time}**`, inline: true },
             {
                 name: 'Daily summary',
                 value: s.daily_summary_enabled ? 'on' : 'off',

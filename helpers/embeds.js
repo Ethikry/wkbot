@@ -1,4 +1,5 @@
 const { EmbedBuilder } = require('discord.js');
+const { getBotTimeZone, recentDateKeys } = require('./botTime');
 
 const COLOR_PRIMARY = 0xFF9900;
 const COLOR_SUCCESS = 0x2ECC71;
@@ -50,16 +51,10 @@ function bucketEmoji(reviews) {
     return '🟥';
 }
 
-function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6) {
-    const today = new Date();
-    const cells = [];
-    for (let i = days - 1; i >= 0; i--) {
-        const d = new Date(today);
-        d.setUTCDate(d.getUTCDate() - i);
-        const dateStr = d.toISOString().slice(0, 10);
-        const reviews = snapshotsByDate.get(dateStr) ?? 0;
-        cells.push(bucketEmoji(reviews));
-    }
+function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone = getBotTimeZone()) {
+    const cells = recentDateKeys(days, timeZone).map(dateStr =>
+        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0)
+    );
     const rows = [];
     for (let i = 0; i < cells.length; i += columns) {
         rows.push(cells.slice(i, i + columns).join(''));

@@ -19,7 +19,7 @@ const SCHEMA_V1 = [
         announcement_channel_id TEXT,
         reminder_channel_id TEXT,
         leaderboard_channel_id TEXT,
-        timezone TEXT NOT NULL DEFAULT 'UTC',
+        timezone TEXT NOT NULL DEFAULT 'Asia/Tokyo',
         daily_summary_enabled INTEGER NOT NULL DEFAULT 1,
         daily_summary_time TEXT NOT NULL DEFAULT '15:00',
         morning_ping_enabled INTEGER NOT NULL DEFAULT 0,
