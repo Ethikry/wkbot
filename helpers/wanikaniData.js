@@ -178,7 +178,14 @@ const STALE = {
 
 function isStale(lastSyncedAt, maxAgeMs) {
     if (!lastSyncedAt) return true;
-    return Date.now() - new Date(lastSyncedAt).getTime() >= maxAgeMs;
+    // SQLite CURRENT_TIMESTAMP writes "YYYY-MM-DD HH:MM:SS" in UTC with no
+    // timezone marker; V8 would parse that as the host's local wall-clock,
+    // skewing the diff by the system's UTC offset (silently disabling the
+    // cache on a non-UTC host, silently serving stale data on a UTC host).
+    const iso = /[TZ]/.test(lastSyncedAt)
+        ? lastSyncedAt
+        : lastSyncedAt.replace(' ', 'T') + 'Z';
+    return Date.now() - new Date(iso).getTime() >= maxAgeMs;
 }
 
 async function ensureUserSynced(account, maxAgeMs = STALE.user) {
