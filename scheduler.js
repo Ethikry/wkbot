@@ -8,7 +8,10 @@ const {
     getBurnedCount,
     getResetsSince,
     clearCacheForApiKey,
+    getRemainingLessonsForGoal,
+    computeFastestPaceDays,
 } = require('./helpers/wanikaniData');
+const { projectPace } = require('./helpers/longgoal');
 const wkSync = require('./helpers/wkSync');
 const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, COLOR_SUCCESS, FOOTER } = require('./helpers/embeds');
 const { recordPoll } = require('./helpers/zerostate');
@@ -821,46 +824,108 @@ async function paceAlertJob(client) {
                 if (ageMs >= 0 && ageMs < TWENTY_HOURS_MS) continue;
             }
 
-            const memberRows = await db.all(
-                `SELECT guild_id FROM guild_members WHERE discord_user_id = ?`,
-                [goal.discord_user_id]
+            // Load fresh account state — current level drives the projection,
+            // and we need the api token for the SRS-derived floor.
+            const account = await db.get(
+                `SELECT wanikani_user_id, level, api_token_encrypted
+                 FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+                [goal.wanikani_user_id]
             );
-            if (memberRows.length === 0) continue;
 
-            let lessonsToday = 0;
-            for (const m of memberRows) {
-                const settings = await getOrCreateSettings(m.guild_id);
-                const todayForGuild = botDateStr(0, settings.timezone);
-                const snap = await db.get(
-                    `SELECT lessons_completed FROM daily_snapshots
-                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
-                    [m.guild_id, goal.discord_user_id, todayForGuild]
-                );
-                if (snap?.lessons_completed > lessonsToday) {
-                    lessonsToday = snap.lessons_completed;
+            // Severity ladder: attainability → cumulative pace → today's
+            // ratio. Higher tiers subsume lower ones so we only send the most
+            // serious applicable alert (and the 20-hour gate above keeps us
+            // from re-paging every cron tick).
+            let embed = null;
+            if (account && goal.deadline && goal.target_level > account.level) {
+                const [itemCounts, fastest] = await Promise.all([
+                    getRemainingLessonsForGoal(account, goal.target_level, account.level).catch(() => null),
+                    computeFastestPaceDays(account, account.level, goal.target_level).catch(() => null),
+                ]);
+                const proj = projectPace({
+                    targetLevel: goal.target_level,
+                    currentLevel: account.level,
+                    deadline: goal.deadline,
+                    hitRate: goal.hit_rate,
+                    dailyLessons: goal.daily_lessons,
+                    itemCounts,
+                    srsDaysPerLevel: fastest?.avgDaysPerLevel,
+                });
+
+                if (proj.underWaniKaniMinimum) {
+                    const levelsRemaining = proj.levelsRemaining;
+                    embed = new EmbedBuilder()
+                        .setColor(COLOR_ERROR)
+                        .setTitle('⛔ Goal no longer attainable')
+                        .setDescription([
+                            `Your deadline is **${goal.deadline}** (${proj.daysRemaining} day${proj.daysRemaining === 1 ? '' : 's'} away), but reaching **Level ${goal.target_level}** from Level ${account.level} now needs at least **${proj.minimumSrsDays} days** under WaniKani's SRS at your hit rate (${(proj.effectiveHitRate * 100).toFixed(0)}%).`,
+                            `That's ${levelsRemaining} level${levelsRemaining === 1 ? '' : 's'} to clear and the SRS timing simply doesn't fit anymore.`,
+                            '',
+                            'Run `/goals` to extend the deadline, lower the target, or clear the goal.',
+                            '',
+                            'Disable with `/goals` → Configure alerts.',
+                        ].join('\n'))
+                        .setTimestamp()
+                        .setFooter(FOOTER);
+                } else if (!proj.feasibleAtPace) {
+                    const overshoot = proj.projectedDays - proj.daysRemaining;
+                    embed = new EmbedBuilder()
+                        .setColor(COLOR_WARN)
+                        .setTitle('⚠️ Falling behind your goal')
+                        .setDescription([
+                            `At **${proj.lessonsPerDay} lessons/day** you'd finish around **${proj.projectedFinish}** — about **${overshoot} day${overshoot === 1 ? '' : 's'}** past your deadline (${goal.deadline}).`,
+                            `${proj.totalLessons} lesson${proj.totalLessons === 1 ? '' : 's'} remain across ${proj.levelsRemaining} level${proj.levelsRemaining === 1 ? '' : 's'}.`,
+                            'Bumping your daily lessons up will close the gap; run `/goals` to adjust.',
+                            '',
+                            'Disable with `/goals` → Configure alerts.',
+                        ].join('\n'))
+                        .setTimestamp()
+                        .setFooter(FOOTER);
                 }
             }
 
-            const target = goal.daily_lessons || 0;
-            if (target === 0) continue;
-            const ratio = lessonsToday / target;
-            if (ratio >= 0.5) continue;
+            // Tier 3 — daily lesson ratio, only when nothing more serious
+            // is firing. Reads the user's same-day snapshot across all guilds
+            // they're in and takes the max (one server's count is enough).
+            if (!embed) {
+                const target = goal.daily_lessons || 0;
+                if (target === 0) continue;
+                const memberRows = await db.all(
+                    `SELECT guild_id FROM guild_members WHERE discord_user_id = ?`,
+                    [goal.discord_user_id]
+                );
+                if (memberRows.length === 0) continue;
+                let lessonsToday = 0;
+                for (const m of memberRows) {
+                    const settings = await getOrCreateSettings(m.guild_id);
+                    const todayForGuild = botDateStr(0, settings.timezone);
+                    const snap = await db.get(
+                        `SELECT lessons_completed FROM daily_snapshots
+                         WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
+                        [m.guild_id, goal.discord_user_id, todayForGuild]
+                    );
+                    if (snap?.lessons_completed > lessonsToday) {
+                        lessonsToday = snap.lessons_completed;
+                    }
+                }
+                if (lessonsToday / target >= 0.5) continue;
+
+                embed = new EmbedBuilder()
+                    .setColor(COLOR_WARN)
+                    .setTitle('⏳ Behind pace today')
+                    .setDescription([
+                        `You've done **${lessonsToday}/${target}** lessons today.`,
+                        `Goal: level **${goal.target_level}**${goal.deadline ? ` by **${goal.deadline}**` : ''}.`,
+                        'Try to log a session today to stay on track.',
+                        '',
+                        'Disable with `/goals` → Configure alerts.',
+                    ].join('\n'))
+                    .setTimestamp()
+                    .setFooter(FOOTER);
+            }
 
             const user = await client.users.fetch(goal.discord_user_id).catch(() => null);
             if (!user) continue;
-
-            const embed = new EmbedBuilder()
-                .setColor(COLOR_WARN)
-                .setTitle('⏳ Behind pace today')
-                .setDescription([
-                    `You've done **${lessonsToday}/${target}** lessons today.`,
-                    `Goal: level **${goal.target_level}**${goal.deadline ? ` by **${goal.deadline}**` : ''} (~${(goal.days_per_level ?? 0).toFixed(1)} days/level).`,
-                    'Try to log a session today to stay on track.',
-                    '',
-                    'Disable with `/goals` → Configure alerts.',
-                ].join('\n'))
-                .setTimestamp()
-                .setFooter(FOOTER);
 
             try {
                 await user.send({ embeds: [embed] });

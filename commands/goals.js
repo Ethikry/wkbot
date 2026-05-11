@@ -322,24 +322,30 @@ async function handleLtInitModal(interaction) {
         const fastest = await computeFastestPaceDays(account, currentLevel, targetLevel).catch(() => null);
         const srsDaysPerLevel = fastest?.avgDaysPerLevel;
 
-        // Gate: refuse impossible goals up-front. underWaniKaniMinimum depends
-        // only on (deadline, level range, hit rate, SRS floor) — not on the
-        // chosen daily-lesson rate — so no preset can rescue it. Block the
-        // deadline here rather than letting the user pick a preset that will
-        // be flagged in the confirm step anyway.
-        const feasibilityProbe = projectPace({
-            targetLevel, currentLevel, deadline, hitRate,
+        // Two-tier gate. Run a probe at 100% hit rate to detect physical SRS
+        // impossibility (deadline shorter than the raw SRS floor × levels) —
+        // that's a hard block. Then probe at the user's real hit rate; if
+        // only that probe is infeasible, the deadline is theoretically
+        // reachable with better accuracy, so let them through with a warning
+        // banner rather than blocking.
+        const hardProbe = projectPace({
+            targetLevel, currentLevel, deadline, hitRate: 1.0,
             itemCounts, srsDaysPerLevel,
         });
-        if (feasibilityProbe.underWaniKaniMinimum) {
+        if (hardProbe.underWaniKaniMinimum) {
             return interaction.editReply({
                 embeds: [impossibleGoalEmbed(
                     { targetLevel, currentLevel, deadline },
-                    feasibilityProbe,
+                    hardProbe,
                 )],
                 components: [ltCancelRow()],
             });
         }
+        const realProbe = projectPace({
+            targetLevel, currentLevel, deadline, hitRate,
+            itemCounts, srsDaysPerLevel,
+        });
+        const hitRateWarning = realProbe.underWaniKaniMinimum ? realProbe : null;
 
         const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts, srsDaysPerLevel });
 
@@ -350,7 +356,7 @@ async function handleLtInitModal(interaction) {
         });
 
         return interaction.editReply({
-            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options })],
+            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options, hitRateWarning })],
             components: ltPaceRows(options),
         });
     } catch (e) {
@@ -489,16 +495,9 @@ async function handleLtCustomModal(interaction) {
         srsDaysPerLevel: state.srsDaysPerLevel,
     });
 
-    // A lower custom hit rate inflates the SRS floor and can push the goal
-    // past attainable. Refuse rather than letting the user save something the
-    // overview will permanently flag as "behind".
-    if (projection.underWaniKaniMinimum) {
-        return respondModal(interaction, {
-            embeds: [impossibleGoalEmbed(state, projection)],
-            components: ltConfirmRows(),
-        });
-    }
-
+    // A lower custom hit rate can push the goal past the SRS minimum; we
+    // surface that via the ⛔ line in the confirm embed but no longer block
+    // saving — improving accuracy can recover the goal.
     wizard.update(interaction.user.id, { customLessons: lessons, customHitRate });
     const updated = wizard.get(interaction.user.id);
 
@@ -521,16 +520,6 @@ async function handleLtConfirm(interaction) {
         return interaction.update({
             embeds: [error('Unknown Pace', 'That pace option is no longer available. Please start over.')],
             components: [],
-        });
-    }
-    // Final guard against saving an impossible goal — should normally be
-    // caught by handleLtInitModal / handleLtCustomModal, but reaffirm here
-    // since stale wizard state or hand-crafted button payloads could bypass
-    // those checks.
-    if (chosen.projection.underWaniKaniMinimum) {
-        return interaction.update({
-            embeds: [impossibleGoalEmbed(state, chosen.projection)],
-            components: ltConfirmRows(),
         });
     }
     const finalLessons = chosen.projection.lessonsPerDay;
@@ -811,7 +800,7 @@ async function execClear(interaction) {
 // Shared render helpers
 // ---------------------------------------------------------------------------
 
-function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options }) {
+function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options, hitRateWarning }) {
     const levelsRemaining = Math.max(1, targetLevel - currentLevel);
     const counts = itemCounts && Number.isFinite(itemCounts.total) ? itemCounts : null;
     const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
@@ -825,7 +814,15 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
     const srsLine = srsDaysPerLevel
         ? `Projections assume you clear reviews each day; the SRS floor for **L${currentLevel + 1}–L${targetLevel}** is **${srsFloor.toFixed(2)} days/level** (radicals→Guru, then kanji→Guru) before hit-rate adjustment.`
         : `Projections assume you clear reviews each day; the SRS floor is ~${srsFloor.toFixed(2)} days/level before hit-rate adjustment.`;
-    const embed = base('🎯 Choose Your Pace').setDescription([
+    const lines = [];
+    if (hitRateWarning) {
+        lines.push(
+            `⚠️ **Heads-up:** at your current hit rate (${formatPercent(hitRate)}), the SRS floor inflates to **${hitRateWarning.minimumSrsDays} days** for ${levelsRemaining} level${levelsRemaining === 1 ? '' : 's'} — past your deadline (${hitRateWarning.daysRemaining} days away).`,
+            'Improving accuracy or extending the deadline will make this attainable. You can still save the goal; overview will keep you informed.',
+            '',
+        );
+    }
+    lines.push(
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
         itemsLine,
@@ -833,7 +830,8 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
         '',
         'Plans cover **every item you have not started yet** through the target level.',
         srsLine,
-    ].join('\n'));
+    );
+    const embed = base('🎯 Choose Your Pace').setDescription(lines.join('\n'));
     for (const opt of options) {
         const p = opt.projection;
         embed.addFields({
