@@ -10,7 +10,7 @@ const {
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
-const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal } = require('../helpers/wanikaniData');
+const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal, computeFastestPaceDays } = require('../helpers/wanikaniData');
 const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const {
     paceOptionsFor,
@@ -92,7 +92,10 @@ async function buildOverviewPayload(userId, guildId) {
                 const wk = await getWaniKaniData(account);
                 currentLevel = wk.userData.level;
                 if (longGoal.deadline) {
-                    const itemCounts = await getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null);
+                    const [itemCounts, fastest] = await Promise.all([
+                        getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null),
+                        computeFastestPaceDays(account, currentLevel, longGoal.target_level).catch(() => null),
+                    ]);
                     proj = projectPace({
                         targetLevel: longGoal.target_level,
                         currentLevel,
@@ -100,6 +103,7 @@ async function buildOverviewPayload(userId, guildId) {
                         hitRate: longGoal.hit_rate,
                         dailyLessons: longGoal.daily_lessons,
                         itemCounts,
+                        srsDaysPerLevel: fastest?.avgDaysPerLevel,
                     });
                 }
             }
@@ -315,16 +319,44 @@ async function handleLtInitModal(interaction) {
             }
             throw apiErr;
         }
-        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts });
+        const fastest = await computeFastestPaceDays(account, currentLevel, targetLevel).catch(() => null);
+        const srsDaysPerLevel = fastest?.avgDaysPerLevel;
+
+        // Two-tier gate. Run a probe at 100% hit rate to detect physical SRS
+        // impossibility (deadline shorter than the raw SRS floor × levels) —
+        // that's a hard block. Then probe at the user's real hit rate; if
+        // only that probe is infeasible, the deadline is theoretically
+        // reachable with better accuracy, so let them through with a warning
+        // banner rather than blocking.
+        const hardProbe = projectPace({
+            targetLevel, currentLevel, deadline, hitRate: 1.0,
+            itemCounts, srsDaysPerLevel,
+        });
+        if (hardProbe.underWaniKaniMinimum) {
+            return interaction.editReply({
+                embeds: [impossibleGoalEmbed(
+                    { targetLevel, currentLevel, deadline },
+                    hardProbe,
+                )],
+                components: [ltCancelRow()],
+            });
+        }
+        const realProbe = projectPace({
+            targetLevel, currentLevel, deadline, hitRate,
+            itemCounts, srsDaysPerLevel,
+        });
+        const hitRateWarning = realProbe.underWaniKaniMinimum ? realProbe : null;
+
+        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, itemCounts, srsDaysPerLevel });
 
         wizard.set(interaction.user.id, {
             targetLevel, currentLevel, deadline,
-            hitRate, hitRateSampleSize, itemCounts,
+            hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel,
             chosenPaceKey: null, customLessons: null, customHitRate: null,
         });
 
         return interaction.editReply({
-            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options })],
+            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options, hitRateWarning })],
             components: ltPaceRows(options),
         });
     } catch (e) {
@@ -406,6 +438,25 @@ async function handleLtCustomize(interaction) {
     );
 }
 
+// Builds the "deadline is impossible under SRS" error embed shown when a goal
+// requires advancing levels faster than WaniKani's SRS allows (even with
+// infinite daily lessons). projection.minimumSrsDays is hit-rate-inflated, so
+// the earliest feasible date reflects the user's actual accuracy.
+function impossibleGoalEmbed(state, projection) {
+    const today = new Date();
+    const earliest = new Date(today.getTime() + projection.minimumSrsDays * 24 * 60 * 60 * 1000);
+    const earliestStr = earliest.toISOString().slice(0, 10);
+    const lines = [
+        `Reaching **Level ${state.targetLevel}** from Level ${state.currentLevel} takes at least **${projection.minimumSrsDays} days** under WaniKani's SRS at your hit rate (${formatPercent(projection.effectiveHitRate)}).`,
+        `Your deadline (${state.deadline}) is only ${projection.daysRemaining} days away — even infinite lessons/day can't beat the SRS timing.`,
+        '',
+        `Earliest feasible deadline: **${earliestStr}**.`,
+        '',
+        'Pick a later deadline or a lower target level.',
+    ];
+    return error('Goal Not Attainable', lines.join('\n'));
+}
+
 async function handleLtCustomModal(interaction) {
     const lessons = parseInt(interaction.fields.getTextInputValue('lessons').trim(), 10);
     const hitRateRaw = interaction.fields.getTextInputValue('hit_rate').trim();
@@ -441,8 +492,12 @@ async function handleLtCustomModal(interaction) {
         hitRate: finalHitRate,
         dailyLessons: lessons,
         itemCounts: state.itemCounts,
+        srsDaysPerLevel: state.srsDaysPerLevel,
     });
 
+    // A lower custom hit rate can push the goal past the SRS minimum; we
+    // surface that via the ⛔ line in the confirm embed but no longer block
+    // saving — improving accuracy can recover the goal.
     wizard.update(interaction.user.id, { customLessons: lessons, customHitRate });
     const updated = wizard.get(interaction.user.id);
 
@@ -745,22 +800,38 @@ async function execClear(interaction) {
 // Shared render helpers
 // ---------------------------------------------------------------------------
 
-function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options }) {
+function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel, options, hitRateWarning }) {
     const levelsRemaining = Math.max(1, targetLevel - currentLevel);
     const counts = itemCounts && Number.isFinite(itemCounts.total) ? itemCounts : null;
     const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
     const itemsLine = counts
         ? `**Lessons remaining to reach L${targetLevel}:** ${counts.total} (${counts.radicals} radicals · ${counts.kanji} kanji · ${vocabTotal} vocab)${counts.source === 'fallback' ? ' — estimated' : ''}`
         : `**Lessons remaining to reach L${targetLevel}:** ~${levelsRemaining * 140} estimated`;
-    const embed = base('🎯 Choose Your Pace').setDescription([
+    // Prefer the user-specific SRS floor (computed from wk_srs_stages for the
+    // remaining level range — picks up L1-2 acceleration). Fall back to the
+    // static constant when the SRS cache wasn't ready.
+    const srsFloor = srsDaysPerLevel ?? MIN_DAYS_PER_LEVEL_SRS;
+    const srsLine = srsDaysPerLevel
+        ? `Projections assume you clear reviews each day; the SRS floor for **L${currentLevel + 1}–L${targetLevel}** is **${srsFloor.toFixed(2)} days/level** (radicals→Guru, then kanji→Guru) before hit-rate adjustment.`
+        : `Projections assume you clear reviews each day; the SRS floor is ~${srsFloor.toFixed(2)} days/level before hit-rate adjustment.`;
+    const lines = [];
+    if (hitRateWarning) {
+        lines.push(
+            `⚠️ **Heads-up:** at your current hit rate (${formatPercent(hitRate)}), the SRS floor inflates to **${hitRateWarning.minimumSrsDays} days** for ${levelsRemaining} level${levelsRemaining === 1 ? '' : 's'} — past your deadline (${hitRateWarning.daysRemaining} days away).`,
+            'Improving accuracy or extending the deadline will make this attainable. You can still save the goal; overview will keep you informed.',
+            '',
+        );
+    }
+    lines.push(
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
         itemsLine,
         `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleSize ? ` (${hitRateSampleSize} reviewed items)` : ' — defaulted'}`,
         '',
         'Plans cover **every item you have not started yet** through the target level.',
-        `Projections assume you clear reviews each day; the SRS floor is ~${MIN_DAYS_PER_LEVEL_SRS.toFixed(2)} days/level before hit-rate adjustment.`,
-    ].join('\n'));
+        srsLine,
+    );
+    const embed = base('🎯 Choose Your Pace').setDescription(lines.join('\n'));
     for (const opt of options) {
         const p = opt.projection;
         embed.addFields({
@@ -846,6 +917,7 @@ function buildPresetMap(state) {
             deadline: state.deadline,
             hitRate: state.hitRate,
             itemCounts: state.itemCounts,
+            srsDaysPerLevel: state.srsDaysPerLevel,
         }).map(o => [o.key, o])
     );
 }
@@ -868,6 +940,7 @@ function buildCustomOption(state, projection = null) {
         hitRate,
         dailyLessons: lessonsPerDay,
         itemCounts: state.itemCounts,
+        srsDaysPerLevel: state.srsDaysPerLevel,
     });
     return {
         key: 'custom',
@@ -899,8 +972,8 @@ function fmtPace(mode) {
     switch (mode) {
         case 'goal':        return '🎯 Goal Rate';
         case 'fastest':     return '🚀 Fastest SRS';
-        case 'ten':         return '📚 10/day';
-        case 'five':        return '🌱 5/day';
+        case 'ten':         return '📚 Comfortable';
+        case 'five':        return '🌱 Relaxed';
         case 'custom':      return '🛠️ Custom';
         default:            return mode || 'custom';
     }
