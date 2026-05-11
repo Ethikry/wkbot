@@ -11,6 +11,7 @@ const {
 const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
 const { getWaniKaniData, getHitRate, getPersonalPace } = require('../helpers/wanikaniData');
+const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const {
     paceOptionsFor,
     projectPace,
@@ -595,7 +596,10 @@ async function handleDailyModal(interaction) {
     }
 
     const { user: { id: userId }, guildId } = interaction;
-    await db.run(`INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`, [guildId]);
+    await db.run(
+        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+        [guildId, DEFAULT_TIME_ZONE]
+    );
     await db.run(
         `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
         [guildId, userId]

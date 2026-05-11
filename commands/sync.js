@@ -1,7 +1,8 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
-const { updateSnapshotsAndStreaks, utcDateStr } = require('../scheduler');
+const { botDateStr, updateSnapshotsAndStreaks } = require('../scheduler');
+const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const db = require('../db');
 
 module.exports = {
@@ -25,8 +26,8 @@ module.exports = {
         // /sync requires the user to be a registered member of this guild so the
         // FK on daily_snapshots / streaks / queue_history holds.
         await db.run(
-            `INSERT OR IGNORE INTO guild_settings (guild_id) VALUES (?)`,
-            [guildId]
+            `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
+            [guildId, DEFAULT_TIME_ZONE]
         );
         await db.run(
             `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
@@ -42,7 +43,8 @@ module.exports = {
                 api_token_encrypted: account.api_token_encrypted,
             }]);
 
-            const today = utcDateStr();
+            const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
+            const today = botDateStr(0, settings?.timezone);
             const snap = await db.get(
                 `SELECT reviews_completed, lessons_completed FROM daily_snapshots
                  WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
@@ -55,7 +57,7 @@ module.exports = {
             return interaction.editReply({
                 embeds: [success(
                     'Stats Synced',
-                    `Past 24 hours: **${reviews}** reviews · **${lessons}** lessons\nLeaderboard, heatmap, and streak are now up to date.`
+                    `Today: **${reviews}** reviews · **${lessons}** lessons\nLeaderboard, heatmap, and streak are now up to date.`
                 )],
             });
         } catch (err) {
