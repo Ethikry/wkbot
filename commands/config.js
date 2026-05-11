@@ -2,7 +2,7 @@ const { SlashCommandBuilder, ChannelType, MessageFlags } = require('discord.js')
 const { isModerator } = require('../helpers/permissions');
 const { success, error, base } = require('../helpers/embeds');
 const { rescheduleGuild } = require('../scheduler');
-const { DEFAULT_TIME_ZONE, resolveTimeZone } = require('../helpers/botTime');
+const { DEFAULT_TIME_ZONE, isValidTimeZone, normalizeTimeZone, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 const VALID_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
@@ -45,7 +45,9 @@ module.exports = {
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
         .addStringOption(o =>
-            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, in server timezone — see /timezone)'))
+            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, in server timezone)'))
+        .addStringOption(o =>
+            o.setName('timezone').setDescription('IANA timezone (Asia/Tokyo) or abbreviation (JST, PST, MDT)'))
         .addChannelOption(o =>
             o.setName('channel').setDescription('Output channel or thread for bot posts')
                 .addChannelTypes(...OUTPUT_CHANNEL_TYPES))
@@ -69,10 +71,11 @@ module.exports = {
         const weekly = interaction.options.getBoolean('weekly');
         const weeklyDay = interaction.options.getString('weekly_day');
         const time = interaction.options.getString('time');
+        const timezone = interaction.options.getString('timezone');
         const channel = interaction.options.getChannel('channel');
         const modrole = interaction.options.getRole('modrole');
 
-        const noneSet = [burn, levelup, daily, weekly, weeklyDay, time, channel, modrole]
+        const noneSet = [burn, levelup, daily, weekly, weeklyDay, time, timezone, channel, modrole]
             .every(v => v === null);
 
         if (noneSet) {
@@ -82,6 +85,14 @@ module.exports = {
         if (time !== null && !VALID_TIME.test(time)) {
             return interaction.reply({
                 embeds: [error('Invalid time', 'Use 24-hour `HH:MM` in the server timezone, e.g. `00:00`.')],
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+
+        const normalizedTimezone = timezone !== null ? normalizeTimeZone(timezone) : null;
+        if (timezone !== null && !isValidTimeZone(normalizedTimezone)) {
+            return interaction.reply({
+                embeds: [error('Invalid timezone', 'Use an IANA timezone like `Asia/Tokyo`, `America/Denver`, or `Europe/London` — or an abbreviation like `JST`, `PST`, or `MDT`.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
@@ -123,6 +134,12 @@ module.exports = {
             fields.push('weekly_leaderboard_day = ?');
             params.push(DAY_NAME_TO_INT[weeklyDay]);
             summary.push(`Weekly leaderboard day: **${weeklyDay[0].toUpperCase() + weeklyDay.slice(1)}**`);
+            scheduleChanged = true;
+        }
+        if (timezone !== null) {
+            fields.push('timezone = ?');
+            params.push(normalizedTimezone);
+            summary.push(`Timezone: **${normalizedTimezone}**`);
             scheduleChanged = true;
         }
         if (channel !== null) {

@@ -4,10 +4,50 @@ function getBotTimeZone() {
     return process.env.BOT_TIMEZONE || DEFAULT_TIME_ZONE;
 }
 
+// Common timezone abbreviations users type instead of IANA names. Each maps to
+// an IANA zone that handles DST correctly (e.g. PST and PDT both → Los Angeles).
+const TIME_ZONE_ABBREVIATIONS = {
+    UTC: 'UTC',
+    GMT: 'Etc/GMT',
+    // North America
+    PST: 'America/Los_Angeles', PDT: 'America/Los_Angeles', PT: 'America/Los_Angeles',
+    MST: 'America/Denver',      MDT: 'America/Denver',      MT: 'America/Denver',
+    CST: 'America/Chicago',     CDT: 'America/Chicago',     CT: 'America/Chicago',
+    EST: 'America/New_York',    EDT: 'America/New_York',    ET: 'America/New_York',
+    AKST: 'America/Anchorage',  AKDT: 'America/Anchorage',
+    HST: 'Pacific/Honolulu',
+    AST: 'America/Halifax',     ADT: 'America/Halifax',
+    NST: 'America/St_Johns',    NDT: 'America/St_Johns',
+    // Europe
+    BST: 'Europe/London',
+    WET: 'Europe/Lisbon',       WEST: 'Europe/Lisbon',
+    CET: 'Europe/Paris',        CEST: 'Europe/Paris',
+    EET: 'Europe/Helsinki',     EEST: 'Europe/Helsinki',
+    MSK: 'Europe/Moscow',
+    // Asia / Pacific
+    JST: 'Asia/Tokyo',
+    KST: 'Asia/Seoul',
+    HKT: 'Asia/Hong_Kong',
+    SGT: 'Asia/Singapore',
+    IST: 'Asia/Kolkata',
+    PHT: 'Asia/Manila',
+    ICT: 'Asia/Bangkok',
+    AEST: 'Australia/Sydney',   AEDT: 'Australia/Sydney',
+    ACST: 'Australia/Adelaide', ACDT: 'Australia/Adelaide',
+    AWST: 'Australia/Perth',
+    NZST: 'Pacific/Auckland',   NZDT: 'Pacific/Auckland',
+};
+
+function normalizeTimeZone(timeZone) {
+    if (!timeZone) return timeZone;
+    const upper = timeZone.toUpperCase();
+    return TIME_ZONE_ABBREVIATIONS[upper] ?? timeZone;
+}
+
 function isValidTimeZone(timeZone) {
     if (!timeZone) return false;
     try {
-        new Intl.DateTimeFormat('en-US', { timeZone });
+        new Intl.DateTimeFormat('en-US', { timeZone: normalizeTimeZone(timeZone) });
         return true;
     } catch {
         return false;
@@ -15,7 +55,8 @@ function isValidTimeZone(timeZone) {
 }
 
 function resolveTimeZone(timeZone) {
-    return isValidTimeZone(timeZone) ? timeZone : getBotTimeZone();
+    const normalized = normalizeTimeZone(timeZone);
+    return isValidTimeZone(normalized) ? normalized : getBotTimeZone();
 }
 
 function datePartsInTimeZone(date = new Date(), timeZone = getBotTimeZone()) {
@@ -85,6 +126,7 @@ function startOfBotDayUtcIso(dateKey = botDateKey(), timeZone = getBotTimeZone()
 module.exports = {
     DEFAULT_TIME_ZONE,
     getBotTimeZone,
+    normalizeTimeZone,
     isValidTimeZone,
     resolveTimeZone,
     botDateKey,

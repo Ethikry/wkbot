@@ -1,6 +1,7 @@
 const { SlashCommandBuilder } = require('discord.js');
 const { base, error } = require('../helpers/embeds');
 const { addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { buildWeeklyExtras } = require('../helpers/weeklyExtras');
 const db = require('../db');
 
 module.exports = {
@@ -43,9 +44,32 @@ module.exports = {
             return `${medal} **${name}** — ${r.reviews} reviews · ${r.lessons} lessons`;
         }));
 
+        const streakRows = await db.all(
+            `SELECT discord_user_id, current_streak, longest_streak
+             FROM streaks
+             WHERE guild_id = ? AND longest_streak > 0
+             ORDER BY longest_streak DESC, current_streak DESC, discord_user_id ASC
+             LIMIT 3`,
+            [guildId]
+        );
+        const streakLines = await Promise.all(streakRows.map(async (r, i) => {
+            const member = await interaction.guild.members.fetch(r.discord_user_id).catch(() => null);
+            const name = member ? member.displayName : 'Unknown';
+            const medal = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
+            const days = n => `${n} day${n === 1 ? '' : 's'}`;
+            return `${medal} **${name}** — ${days(r.longest_streak)} (current: ${r.current_streak})`;
+        }));
+
+        const extras = await buildWeeklyExtras(guildId, interaction.guild, timeZone);
+
         const embed = base('🏆 Weekly Leaderboard')
             .setDescription(lines.join('\n'))
             .setFooter({ text: 'Past 7 days · WaniKani Bot' });
+
+        if (extras.fields.length) embed.addFields(...extras.fields);
+        if (streakLines.length) {
+            embed.addFields({ name: '🔥 Longest Streaks', value: streakLines.join('\n'), inline: false });
+        }
 
         return interaction.editReply({ embeds: [embed] });
     },
