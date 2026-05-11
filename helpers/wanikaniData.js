@@ -211,6 +211,11 @@ async function ensureSubjectsSynced(apiKey, maxAgeMs = STALE.subjects) {
     const state = await loadGlobalSyncState('subjects');
     if (isStale(state?.lastSyncedAt, maxAgeMs)) await syncSubjects(apiKey);
 }
+async function ensureSrsSystemsSynced(apiKey, maxAgeMs = STALE.spacedRepetitionSystems) {
+    const { loadGlobalSyncState, syncSpacedRepetitionSystems } = require('./wkSync');
+    const state = await loadGlobalSyncState('spaced_repetition_systems');
+    if (isStale(state?.lastSyncedAt, maxAgeMs)) await syncSpacedRepetitionSystems(apiKey);
+}
 
 async function getWaniKaniData(account) {
     await Promise.all([ensureUserSynced(account), ensureSummarySynced(account)]);
@@ -556,6 +561,74 @@ async function cumulativeHoursToGuru(srsId, fromStage) {
     return h;
 }
 
+// Sum of apprentice stage intervals (positions 1..4) in hours for one SRS.
+// Time from "lesson done" (entering Apprentice 1) to Guru 1, at 100% accuracy.
+// Returns null if the cached SRS table doesn't have this system yet.
+async function apprenticeHoursToGuru(srsId) {
+    const stages = await db.all(
+        `SELECT interval, interval_unit FROM wk_srs_stages
+         WHERE srs_id = ? AND position >= 1 AND position <= 4
+         ORDER BY position`,
+        [srsId]
+    );
+    if (stages.length === 0) return null;
+    let h = 0;
+    for (const s of stages) h += intervalToHours(s.interval, s.interval_unit);
+    return h;
+}
+
+// Average fastest possible days/level across [currentLevel+1 .. targetLevel],
+// derived from the real wk_srs_stages interval data. Each level cycle is:
+// radicals->Guru (unlocks kanji), then kanji->Guru (90%-threshold -> level up),
+// so hours/level = apprenticeHoursToGuru(radicalSrs) + apprenticeHoursToGuru(kanjiSrs).
+// Levels 1-2 use an accelerated SRS, so the average naturally drops when the
+// range includes them. Returns null if no levels in the range have data.
+async function computeFastestPaceDays(account, currentLevel, targetLevel) {
+    if (targetLevel <= currentLevel) return null;
+    const apiKey = decryptForAccount(account);
+    await Promise.all([
+        ensureSubjectsSynced(apiKey),
+        ensureSrsSystemsSynced(apiKey),
+    ]);
+
+    const cache = new Map();
+    const lookup = async (srsId) => {
+        if (cache.has(srsId)) return cache.get(srsId);
+        const h = await apprenticeHoursToGuru(srsId);
+        cache.set(srsId, h);
+        return h;
+    };
+
+    let totalHours = 0;
+    let levelsCounted = 0;
+    for (let lvl = currentLevel + 1; lvl <= targetLevel; lvl++) {
+        const rad = await db.get(
+            `SELECT spaced_repetition_system_id AS srs_id FROM wk_subjects
+             WHERE level = ? AND subject_type = 'radical' AND hidden_at IS NULL
+             LIMIT 1`,
+            [lvl]
+        );
+        const kan = await db.get(
+            `SELECT spaced_repetition_system_id AS srs_id FROM wk_subjects
+             WHERE level = ? AND subject_type = 'kanji' AND hidden_at IS NULL
+             LIMIT 1`,
+            [lvl]
+        );
+        if (!rad?.srs_id || !kan?.srs_id) continue;
+        const rh = await lookup(rad.srs_id);
+        const kh = await lookup(kan.srs_id);
+        if (rh == null || kh == null) continue;
+        totalHours += rh + kh;
+        levelsCounted++;
+    }
+    if (levelsCounted === 0) return null;
+    return {
+        avgDaysPerLevel: (totalHours / levelsCounted) / 24,
+        totalDays: totalHours / 24,
+        levelsCounted,
+    };
+}
+
 async function getLevelUpETA(account, level) {
     await ensureAssignmentsSynced(account);
     const kanji = await db.all(
@@ -649,6 +722,7 @@ module.exports = {
     getLevelUpETA,
     getSubjectsPerLevel,
     getRemainingLessonsForGoal,
+    computeFastestPaceDays,
     // sync-on-stale primitives (exposed so the scheduler can pre-warm)
     ensureUserSynced,
     ensureSummarySynced,
