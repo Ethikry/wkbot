@@ -460,7 +460,7 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
         const nextBucket = await db.get(
             `SELECT available_at, subject_count FROM wk_summary_buckets
              WHERE wanikani_user_id = ? AND bucket_type = 'review'
-               AND available_at > datetime('now')
+               AND datetime(available_at) > datetime('now')
              ORDER BY available_at ASC LIMIT 1`,
             [row.wanikani_user_id]
         );
@@ -523,7 +523,7 @@ async function scheduleNextReviewTimer(client, account) {
         `SELECT available_at FROM wk_summary_buckets
          WHERE wanikani_user_id = ?
            AND bucket_type = 'review'
-           AND available_at > datetime('now')
+           AND datetime(available_at) > datetime('now')
          ORDER BY available_at ASC LIMIT 1`,
         [wkId]
     );
@@ -599,7 +599,7 @@ async function reviewTimerFired(client, account) {
     const nextBucket = await db.get(
         `SELECT available_at, subject_count FROM wk_summary_buckets
          WHERE wanikani_user_id = ? AND bucket_type = 'review'
-           AND available_at > datetime('now')
+           AND datetime(available_at) > datetime('now')
          ORDER BY available_at ASC LIMIT 1`,
         [account.wanikani_user_id]
     );
