@@ -16,6 +16,7 @@ const { pickShameLine } = require('./helpers/shame');
 const { generateShameLine } = require('./helpers/anthropic');
 const { logReminderEvent } = require('./helpers/reminderEvents');
 const { evaluateAchievements } = require('./helpers/achievements');
+const { buildWeeklyExtras } = require('./helpers/weeklyExtras');
 const {
     DEFAULT_TIME_ZONE,
     addDaysToDateKey,
@@ -143,9 +144,9 @@ function summaryEmbed(title, description, summaries) {
     const embed = new EmbedBuilder()
         .setColor(COLOR_PRIMARY)
         .setTitle(title)
-        .setDescription(description)
         .setTimestamp()
         .setFooter(FOOTER);
+    if (description) embed.setDescription(description);
 
     for (const s of summaries) {
         if (s.error) {
@@ -177,7 +178,7 @@ async function dailyJob(client, guildId) {
         const channel = await resolveOutputChannel(guild, settings);
         if (channel) {
             const summaries = await fetchUserSummaries(guild, rows);
-            const embed = summaryEmbed('📅 Daily WaniKani Summary', "Today's status:", summaries);
+            const embed = summaryEmbed('📅 Daily WaniKani Summary', null, summaries);
 
             const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
             const sent = await channel.send({
@@ -278,6 +279,21 @@ async function leaderboardJob(client, guildId) {
         lines[0] += ' 👑';
     }
 
+    const streakRows = await db.all(
+        `SELECT discord_user_id, current_streak, longest_streak
+         FROM streaks
+         WHERE guild_id = ? AND longest_streak > 0
+         ORDER BY longest_streak DESC, current_streak DESC, discord_user_id ASC
+         LIMIT 3`,
+        [guildId]
+    );
+    const streakLines = await Promise.all(streakRows.map(async (r, i) => {
+        const member = await guild.members.fetch(r.discord_user_id).catch(() => null);
+        const name = member ? member.displayName : 'Unknown';
+        const medal = ['🥇', '🥈', '🥉'][i] || `${i + 1}.`;
+        return `${medal} **${name}** — ${r.longest_streak} day${r.longest_streak === 1 ? '' : 's'} (current: ${r.current_streak})`;
+    }));
+
     const shameTargets = enriched.filter(e => e.shameEnabled && e.reviews === 0);
     const shameLines = await Promise.all(shameTargets.map(async e => {
         const user = `<@${e.userId}>`;
@@ -294,12 +310,19 @@ async function leaderboardJob(client, guildId) {
     }));
     const shameBlock = shameLines.length ? '\n\n' + shameLines.join('\n\n') : '';
 
+    const extras = await buildWeeklyExtras(guildId, guild, timeZone);
+
     const embed = new EmbedBuilder()
         .setColor(COLOR_PRIMARY)
         .setTitle('🏆 Weekly Leaderboard')
         .setDescription(clipDescription(lines.join('\n') + shameBlock))
         .setTimestamp()
         .setFooter({ text: 'Past 7 days · WaniKani Bot' });
+
+    if (extras.fields.length) embed.addFields(...extras.fields);
+    if (streakLines.length) {
+        embed.addFields({ name: '🔥 Longest Streaks', value: streakLines.join('\n'), inline: false });
+    }
 
     await channel.send({ embeds: [embed] });
 }
