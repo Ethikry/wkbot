@@ -108,7 +108,12 @@ async function syncSubjects(apiKey) {
         for (const item of res.items) await upsertSubject(item);
         await saveGlobalSyncState('subjects', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            // Pass null (not "now") when the API confirmed no new data — the
+            // UPSERT's COALESCE preserves the previous watermark. Falling
+            // back to local now would silently advance the watermark past
+            // data we never actually fetched, making an empty cache
+            // unrecoverable via incremental sync.
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
@@ -165,7 +170,7 @@ async function syncSpacedRepetitionSystems(apiKey) {
         for (const item of res.items) await upsertSrsSystem(item);
         await saveGlobalSyncState('spaced_repetition_systems', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
@@ -219,7 +224,7 @@ async function syncAssignments(account) {
         for (const item of res.items) await upsertAssignment(wkId, item);
         await saveUserSyncState(wkId, 'assignments', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
@@ -281,7 +286,7 @@ async function syncReviewStatistics(account) {
         for (const item of res.items) await upsertReviewStatistic(wkId, item);
         await saveUserSyncState(wkId, 'review_statistics', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
@@ -333,7 +338,7 @@ async function syncLevelProgressions(account) {
         for (const item of res.items) await upsertLevelProgression(wkId, item);
         await saveUserSyncState(wkId, 'level_progressions', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
@@ -385,7 +390,7 @@ async function syncStudyMaterials(account) {
         for (const item of res.items) await upsertStudyMaterial(wkId, item);
         await saveUserSyncState(wkId, 'study_materials', {
             etag: res.etag, lastModified: res.lastModified,
-            dataUpdatedAt: res.dataUpdatedAt ?? new Date().toISOString(),
+            dataUpdatedAt: res.dataUpdatedAt,
             status: res.notModified ? 304 : 200,
         });
         return { synced: res.items.length, notModified: res.notModified };
