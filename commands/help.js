@@ -47,8 +47,8 @@ module.exports = {
                         '`daily` — daily summary on/off',
                         '`weekly` `weekly_day` — leaderboard on/off + day of week',
                         '`time` — time for all scheduled messages (HH:MM, server timezone)',
+                        '`timezone` — IANA timezone (e.g. `Asia/Tokyo`, `America/Denver`)',
                         '`channel` `modrole` — output channel/thread, mod role',
-                        '`/timezone` — view or set the server timezone',
                     ].join('\n'),
                 },
             );

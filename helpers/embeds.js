@@ -53,7 +53,7 @@ function bucketEmoji(reviews) {
 
 function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone = getBotTimeZone()) {
     const cells = recentDateKeys(days, timeZone).map(dateStr =>
-        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0)
+        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0).repeat(3)
     );
     const rows = [];
     for (let i = 0; i < cells.length; i += columns) {
