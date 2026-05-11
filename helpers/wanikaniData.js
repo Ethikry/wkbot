@@ -348,18 +348,32 @@ async function getSubjectsPerLevel(apiKey, level) {
     return row?.n ?? 0;
 }
 
+// wk_assignments.level is always NULL — the WK /assignments API payload doesn't
+// include the subject's level. Join wk_subjects to filter by level; use the
+// subjects table for the total so the kanji 90% rule denominates against the
+// full level, not just the items unlocked so far.
 async function getLevelProgress(account, level) {
-    await ensureAssignmentsSynced(account);
+    await Promise.all([
+        ensureAssignmentsSynced(account),
+        ensureSubjectsSynced(decryptForAccount(account)),
+    ]);
     const tally = async (subjectType) => {
-        const row = await db.get(
-            `SELECT COUNT(*) AS total,
-                    SUM(CASE WHEN passed_at IS NOT NULL THEN 1 ELSE 0 END) AS passed
-             FROM wk_assignments
-             WHERE wanikani_user_id = ? AND level = ? AND subject_type = ? AND hidden = 0`,
+        const totalRow = await db.get(
+            `SELECT COUNT(*) AS n FROM wk_subjects
+             WHERE level = ? AND subject_type = ? AND hidden_at IS NULL`,
+            [level, subjectType]
+        );
+        const total = totalRow?.n ?? 0;
+        const passRow = await db.get(
+            `SELECT SUM(CASE WHEN a.passed_at IS NOT NULL THEN 1 ELSE 0 END) AS passed
+             FROM wk_assignments a
+             JOIN wk_subjects s ON s.subject_id = a.subject_id
+             WHERE a.wanikani_user_id = ?
+               AND s.level = ? AND s.subject_type = ?
+               AND a.hidden = 0 AND s.hidden_at IS NULL`,
             [account.wanikani_user_id, level, subjectType]
         );
-        const total = row?.total ?? 0;
-        const passed = row?.passed ?? 0;
+        const passed = passRow?.passed ?? 0;
         const threshold = subjectType === 'kanji' ? Math.ceil(total * 0.9) : total;
         const denominator = Math.max(1, threshold);
         return {
@@ -448,8 +462,8 @@ async function getLevelUpETA(account, level) {
     const kanji = await db.all(
         `SELECT a.srs_stage, a.available_at, s.spaced_repetition_system_id AS srs_id
          FROM wk_assignments a
-         LEFT JOIN wk_subjects s ON s.subject_id = a.subject_id
-         WHERE a.wanikani_user_id = ? AND a.level = ? AND a.subject_type = 'kanji' AND a.hidden = 0`,
+         JOIN wk_subjects s ON s.subject_id = a.subject_id
+         WHERE a.wanikani_user_id = ? AND s.level = ? AND s.subject_type = 'kanji' AND a.hidden = 0`,
         [account.wanikani_user_id, level]
     );
     const total = kanji.length;
