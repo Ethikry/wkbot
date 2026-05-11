@@ -233,6 +233,7 @@ async function syncAssignments(account) {
 
 async function upsertReviewStatistic(wanikaniUserId, item) {
     const d = item.data ?? {};
+    const recordedAt = item.data_updated_at ?? new Date().toISOString();
     await db.run(
         `INSERT INTO wk_review_statistics (
             review_statistic_id, wanikani_user_id, object, url, data_updated_at,
@@ -265,6 +266,25 @@ async function upsertReviewStatistic(wanikaniUserId, item) {
             d.reading_max_streak ?? 0, d.reading_current_streak ?? 0,
             d.percentage_correct ?? 0, d.hidden ? 1 : 0,
             JSON.stringify(item), d.created_at ?? null,
+        ]
+    );
+    await db.run(
+        `INSERT INTO wk_review_stat_history (
+            wanikani_user_id, review_statistic_id, subject_id, recorded_at,
+            meaning_correct, meaning_incorrect, reading_correct, reading_incorrect, hidden
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(wanikani_user_id, subject_id, recorded_at) DO UPDATE SET
+            review_statistic_id = excluded.review_statistic_id,
+            meaning_correct = excluded.meaning_correct,
+            meaning_incorrect = excluded.meaning_incorrect,
+            reading_correct = excluded.reading_correct,
+            reading_incorrect = excluded.reading_incorrect,
+            hidden = excluded.hidden`,
+        [
+            wanikaniUserId, item.id, d.subject_id, recordedAt,
+            d.meaning_correct ?? 0, d.meaning_incorrect ?? 0,
+            d.reading_correct ?? 0, d.reading_incorrect ?? 0,
+            d.hidden ? 1 : 0,
         ]
     );
 }
