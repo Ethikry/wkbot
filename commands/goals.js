@@ -10,14 +10,13 @@ const {
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
-const { getWaniKaniData, getHitRate, getPersonalPace } = require('../helpers/wanikaniData');
+const { getWaniKaniData, getHitRate, getPersonalPace, getRemainingLessonsForGoal } = require('../helpers/wanikaniData');
 const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
 const {
     paceOptionsFor,
     projectPace,
     isValidDeadline,
     isValidLevel,
-    ITEMS_PER_LEVEL,
     DEFAULT_HIT_RATE,
 } = require('../helpers/longgoal');
 const wizard = require('../helpers/wizardState');
@@ -91,12 +90,14 @@ async function buildOverviewPayload(userId, guildId) {
             if (account) {
                 const wk = await getWaniKaniData(account);
                 currentLevel = wk.userData.level;
+                const itemCounts = await getRemainingLessonsForGoal(account, longGoal.target_level).catch(() => null);
                 proj = projectPace({
                     targetLevel: longGoal.target_level,
                     currentLevel,
                     deadline: longGoal.deadline,
                     hitRate: longGoal.hit_rate,
                     daysPerLevel: longGoal.days_per_level,
+                    itemCounts,
                 });
             }
         } catch (e) {
@@ -300,16 +301,17 @@ async function handleLtInitModal(interaction) {
 
         const hitRate = hitRateData?.hitRate ?? DEFAULT_HIT_RATE;
         const hitRateSampleSize = hitRateData?.sampleSize ?? 0;
-        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, personalPace });
+        const itemCounts = await getRemainingLessonsForGoal(account, targetLevel).catch(() => null);
+        const options = paceOptionsFor({ targetLevel, currentLevel, deadline, hitRate, personalPace, itemCounts });
 
         wizard.set(interaction.user.id, {
             targetLevel, currentLevel, deadline,
-            hitRate, hitRateSampleSize, personalPace,
+            hitRate, hitRateSampleSize, personalPace, itemCounts,
             chosenPaceKey: null, customLessons: null, customReviews: null,
         });
 
         return interaction.editReply({
-            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, options })],
+            embeds: [paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options })],
             components: ltPaceRows(options),
         });
     } catch (e) {
@@ -356,15 +358,17 @@ async function handleLtCustomize(interaction) {
     const currentLessons = state.customLessons ?? chosen.projection.lessonsPerDay;
 
     // Pre-calculate reviews from the current lesson count so the field shows an accurate estimate.
-    const derivedDays = ITEMS_PER_LEVEL / currentLessons;
     const previewProj = projectPace({
         targetLevel: state.targetLevel,
         currentLevel: state.currentLevel,
         deadline: state.deadline,
         hitRate: state.hitRate,
-        daysPerLevel: derivedDays,
+        daysPerLevel: chosen.daysPerLevel,
+        itemCounts: state.itemCounts,
     });
-    const prefilledReviews = state.customReviews ?? previewProj.reviewsPerDay;
+    const lessonsBasis = previewProj.lessonsPerDay;
+    const reviewsScale = lessonsBasis > 0 ? currentLessons / lessonsBasis : 1;
+    const prefilledReviews = state.customReviews ?? Math.max(currentLessons, Math.ceil(previewProj.reviewsPerDay * reviewsScale));
 
     await interaction.showModal(
         new ModalBuilder()
@@ -413,28 +417,34 @@ async function handleLtCustomModal(interaction) {
         });
     }
 
-    // Derive days/level from lessons and re-run projection so feasibility + finish date are accurate.
-    const derivedDaysPerLevel = ITEMS_PER_LEVEL / lessons;
+    // Customizing lessons changes the daily learning volume but doesn't change
+    // the level-up cadence (that's an SRS-floor question). Re-run the projection
+    // with the preset's daysPerLevel so feasibility / projected finish stay
+    // consistent; just override lessons & reviews from user input.
+    const chosenPreset = buildPresetMap(state)[state.chosenPaceKey];
     const freshProj = projectPace({
         targetLevel: state.targetLevel,
         currentLevel: state.currentLevel,
         deadline: state.deadline,
         hitRate: state.hitRate,
-        daysPerLevel: derivedDaysPerLevel,
+        daysPerLevel: chosenPreset.daysPerLevel,
+        itemCounts: state.itemCounts,
     });
 
-    // Use auto-calculated reviews unless the user explicitly changed the field.
-    const autoReviews = freshProj.reviewsPerDay;
+    // Scale the auto-calculated reviews if the user changed lesson volume; this
+    // keeps the reviews-per-lesson ratio consistent with the SRS heuristic.
+    const lessonsBasis = freshProj.lessonsPerDay;
+    const scale = lessonsBasis > 0 ? lessons / lessonsBasis : 1;
+    const autoReviews = Math.max(lessons, Math.ceil(freshProj.reviewsPerDay * scale));
     const finalReviews = (Number.isInteger(reviewsInput) && reviewsInput >= 1 && reviewsInput <= 2000 && reviewsInput !== autoReviews)
         ? reviewsInput
         : autoReviews;
 
-    wizard.update(interaction.user.id, { customLessons: lessons, customReviews: finalReviews, customDaysPerLevel: derivedDaysPerLevel });
+    wizard.update(interaction.user.id, { customLessons: lessons, customReviews: finalReviews, customDaysPerLevel: chosenPreset.daysPerLevel });
     const updated = wizard.get(interaction.user.id);
     const chosen = buildPresetMap(updated)[updated.chosenPaceKey];
     const override = {
         ...chosen,
-        daysPerLevel: derivedDaysPerLevel,
         projection: { ...freshProj, lessonsPerDay: lessons, reviewsPerDay: finalReviews },
     };
 
@@ -456,6 +466,10 @@ async function handleLtConfirm(interaction) {
     const finalLessons = state.customLessons ?? chosen.projection.lessonsPerDay;
     const finalReviews = state.customReviews ?? chosen.projection.reviewsPerDay;
     const finalDaysPerLevel = state.customDaysPerLevel ?? chosen.daysPerLevel;
+    const levelsRemaining = Math.max(1, state.targetLevel - state.currentLevel);
+    const avgItemsPerLevel = state.itemCounts?.total
+        ? Math.round(state.itemCounts.total / levelsRemaining)
+        : null;
 
     const wanikaniUserId = await getWanikaniUserId(interaction.user.id);
     if (!wanikaniUserId) {
@@ -483,7 +497,7 @@ async function handleLtConfirm(interaction) {
             updated_at = CURRENT_TIMESTAMP`,
         [
             interaction.user.id, wanikaniUserId, state.targetLevel, state.deadline, chosen.key,
-            finalDaysPerLevel, ITEMS_PER_LEVEL,
+            finalDaysPerLevel, avgItemsPerLevel,
             finalLessons, finalReviews, state.hitRate,
         ]
     );
@@ -725,23 +739,33 @@ async function execClear(interaction) {
 // Shared render helpers
 // ---------------------------------------------------------------------------
 
-function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, options }) {
+function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitRateSampleSize, itemCounts, options }) {
+    const levelsRemaining = Math.max(1, targetLevel - currentLevel);
+    const counts = itemCounts && itemCounts.total > 0 ? itemCounts : null;
+    const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
+    const itemsLine = counts
+        ? `**Lessons remaining to reach L${targetLevel}:** ${counts.total} (${counts.radicals} radicals · ${counts.kanji} kanji · ${vocabTotal} vocab)${counts.source === 'fallback' ? ' — estimated' : ''}`
+        : `**Lessons remaining to reach L${targetLevel}:** ~${levelsRemaining * 140} estimated`;
     const embed = base('🎯 Choose Your Pace').setDescription([
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
+        itemsLine,
         `**Hit rate (last 30d):** ${(hitRate * 100).toFixed(0)}%${hitRateSampleSize ? ` (${hitRateSampleSize} reviews)` : ' — defaulted'}`,
         '',
-        'Pick a pace below. Daily review estimates assume your hit rate stays stable.',
+        'Daily lessons cover **every item you haven\'t started yet** through the target level.',
+        'Level-up cadence (days/level) is capped by WaniKani\'s SRS minimum (~6.83 days, set by the 90%-kanji-at-Guru rule).',
     ].join('\n'));
     for (const opt of options) {
         const p = opt.projection;
         embed.addFields({
-            name: `${opt.label} — ${opt.daysPerLevel.toFixed(1)} days/level`,
+            name: `${opt.label} — ${p.daysPerLevel.toFixed(1)} days/level`,
             value: [
                 `**${p.lessonsPerDay}** lessons/day · **~${p.reviewsPerDay}** reviews/day`,
                 p.underWaniKaniMinimum
-                    ? '⛔ Below WaniKani SRS minimum — not achievable'
-                    : p.feasibleAtPace ? `✅ Finishes ~${p.projectedFinish}` : `⚠️ Finishes ~${p.projectedFinish} — past deadline`,
+                    ? `⛔ Deadline requires <${(6.83).toFixed(2)} days/level — below WaniKani's SRS minimum`
+                    : p.feasibleAtPace
+                        ? `✅ Finishes ~${p.projectedFinish}`
+                        : `⚠️ Finishes ~${p.projectedFinish} — past deadline at this floor`,
             ].join('\n'),
         });
     }
@@ -750,22 +774,24 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
 
 function ltConfirmEmbed(state, chosen, opts = {}) {
     const p = chosen.projection;
+    const totalItems = p.itemCounts?.total ?? state.itemCounts?.total ?? null;
     return base('Review Your Goal').setDescription([
         `🎯 **Level ${state.targetLevel} by ${state.deadline}**`,
         `**Current level:** ${state.currentLevel}`,
-        `**Pace:** ${chosen.label} — ${chosen.daysPerLevel.toFixed(1)} days/level`,
+        `**Pace:** ${chosen.label} — ${p.daysPerLevel.toFixed(1)} days/level`,
         `**Daily target:** ${p.lessonsPerDay} lessons · ~${p.reviewsPerDay} reviews`,
+        totalItems ? `**Workload:** ${totalItems} lessons remaining (across ${p.levelsRemaining} levels)` : null,
         `**Hit rate:** ${(state.hitRate * 100).toFixed(0)}%`,
-        opts.customized ? '*(targets customised)*' : '',
+        opts.customized ? '*(targets customised)*' : null,
         '',
         p.underWaniKaniMinimum
-            ? '⛔ Below WaniKani\'s SRS minimum — not physically achievable.'
+            ? '⛔ Deadline requires advancing levels faster than WaniKani\'s SRS allows — not physically achievable.'
             : p.feasibleAtPace
                 ? `✅ At this pace you'd finish around ${p.projectedFinish}, ahead of deadline.`
                 : `⚠️ Projects finishing ${p.projectedFinish}, past your deadline. Consider a faster pace.`,
         '',
         'Confirm to save, Customise to override daily targets, or Cancel.',
-    ].filter(s => s !== undefined).join('\n'));
+    ].filter(s => s !== undefined && s !== null).join('\n'));
 }
 
 function ltPaceRows(options) {
@@ -812,6 +838,7 @@ function buildPresetMap(state) {
             deadline: state.deadline,
             hitRate: state.hitRate,
             personalPace: state.personalPace,
+            itemCounts: state.itemCounts,
         }).map(o => [o.key, o])
     );
 }

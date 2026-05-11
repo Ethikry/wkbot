@@ -348,6 +348,66 @@ async function getSubjectsPerLevel(apiKey, level) {
     return row?.n ?? 0;
 }
 
+// Counts the lessons the user still has to complete to reach `targetLevel`,
+// accounting for current state: subjects at level <= targetLevel that either
+// don't have an assignment yet (not unlocked) or have an assignment with
+// started_at IS NULL (sitting in the lesson queue). Items the user has
+// already lesson'd — even if not yet at Guru — are excluded.
+//
+// Also returns `currentLevel` items remaining specifically in (currentLevel,
+// targetLevel] so callers can show breakdown.
+//
+// Falls back to a level-count × ~140-items estimate when the subjects cache
+// is empty (first-run / sync failure).
+async function getRemainingLessonsForGoal(account, targetLevel) {
+    const apiKey = decryptForAccount(account);
+    await Promise.all([
+        ensureSubjectsSynced(apiKey),
+        ensureAssignmentsSynced(account),
+    ]);
+    const wkId = account.wanikani_user_id;
+    const rows = await db.all(
+        `SELECT s.subject_type, COUNT(*) AS n
+         FROM wk_subjects s
+         LEFT JOIN wk_assignments a
+           ON a.subject_id = s.subject_id
+          AND a.wanikani_user_id = ?
+          AND a.hidden = 0
+         WHERE s.level <= ?
+           AND s.hidden_at IS NULL
+           AND (a.assignment_id IS NULL OR a.started_at IS NULL)
+         GROUP BY s.subject_type`,
+        [wkId, targetLevel]
+    );
+    const out = { radicals: 0, kanji: 0, vocabulary: 0, kanaVocabulary: 0, total: 0, source: 'cache' };
+    for (const r of rows) {
+        if (r.subject_type === 'radical') out.radicals = r.n;
+        else if (r.subject_type === 'kanji') out.kanji = r.n;
+        else if (r.subject_type === 'vocabulary') out.vocabulary = r.n;
+        else if (r.subject_type === 'kana_vocabulary') out.kanaVocabulary = r.n;
+        out.total += r.n;
+    }
+    if (out.total === 0) {
+        // Subjects cache likely empty or this account has fully cleared the
+        // queue. Fall back to a coarse per-level average so the wizard still
+        // produces a sane number.
+        const acct = await db.get(
+            `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+            [wkId]
+        );
+        const currentLevel = acct?.level ?? 1;
+        const levelsRemaining = Math.max(0, targetLevel - currentLevel);
+        if (levelsRemaining > 0) {
+            out.radicals = levelsRemaining * 25;
+            out.kanji = levelsRemaining * 30;
+            out.vocabulary = levelsRemaining * 85;
+            out.total = out.radicals + out.kanji + out.vocabulary;
+            out.source = 'fallback';
+        }
+    }
+    return out;
+}
+
 // wk_assignments.level is always NULL — the WK /assignments API payload doesn't
 // include the subject's level. Join wk_subjects to filter by level; use the
 // subjects table for the total so the kanji 90% rule denominates against the
@@ -549,6 +609,7 @@ module.exports = {
     getResetsSince,
     getLevelUpETA,
     getSubjectsPerLevel,
+    getRemainingLessonsForGoal,
     // sync-on-stale primitives (exposed so the scheduler can pre-warm)
     ensureUserSynced,
     ensureSummarySynced,
