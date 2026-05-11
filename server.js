@@ -1,4 +1,6 @@
 const express = require('express');
+const { installConsoleLogger } = require('./helpers/logger');
+installConsoleLogger();
 
 function startHealthServer({ getStatus } = {}) {
     const port = Number(process.env.HEALTH_PORT) || 3000;
@@ -23,7 +25,7 @@ function startHealthServer({ getStatus } = {}) {
     });
 
     server.on('error', (err) => {
-        console.error('[health] failed to start:', err.message);
+        console.error('[health] failed to start:', err);
     });
 
     return server;
