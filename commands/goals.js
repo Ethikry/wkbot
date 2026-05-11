@@ -752,6 +752,9 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
     const levelsRemaining = Math.max(1, targetLevel - currentLevel);
     const counts = itemCounts && Number.isFinite(itemCounts.total) ? itemCounts : null;
     const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
+    const hitRateSampleLabel = hitRateSampleSize
+        ? ` (${hitRateSampleSize} answer attempt${hitRateSampleSize === 1 ? '' : 's'})`
+        : ' — defaulted';
     const itemsLine = counts
         ? `**Lessons remaining to reach L${targetLevel}:** ${counts.total} (${counts.radicals} radicals · ${counts.kanji} kanji · ${vocabTotal} vocab)${counts.source === 'fallback' ? ' — estimated' : ''}`
         : `**Lessons remaining to reach L${targetLevel}:** ~${levelsRemaining * 140} estimated`;
@@ -759,7 +762,7 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
         itemsLine,
-        `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleSize ? ` (${hitRateSampleSize} reviewed items)` : ' — defaulted'}`,
+        `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleLabel}`,
         '',
         'Plans cover **every item you have not started yet** through the target level.',
         `Projections assume you clear reviews each day; the SRS floor is ~${MIN_DAYS_PER_LEVEL_SRS.toFixed(2)} days/level before hit-rate adjustment.`,
