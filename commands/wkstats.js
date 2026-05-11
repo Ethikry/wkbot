@@ -49,7 +49,7 @@ module.exports = {
             const next24Excl = Math.max(0, dueNext24Hours - dueRightNow);
 
             await recordPoll(userId, guildId, dueRightNow, account.wanikani_user_id).catch(err =>
-                console.error('[wkstats recordPoll]', err.message)
+                console.error('[wkstats recordPoll]', err)
             );
 
             const [srs, levelProgress, snapshots] = await Promise.all([

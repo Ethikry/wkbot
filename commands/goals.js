@@ -92,7 +92,10 @@ async function buildOverviewPayload(userId, guildId) {
                 const wk = await getWaniKaniData(account);
                 currentLevel = wk.userData.level;
                 if (longGoal.deadline) {
-                    const itemCounts = await getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null);
+                    const itemCounts = await getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(err => {
+                        console.warn('[goals overview] lesson count projection:', err);
+                        return null;
+                    });
                     proj = projectPace({
                         targetLevel: longGoal.target_level,
                         currentLevel,
@@ -104,7 +107,7 @@ async function buildOverviewPayload(userId, guildId) {
                 }
             }
         } catch (e) {
-            console.error('[goals overview] WK fetch:', e.message);
+            console.error('[goals overview] WK fetch:', e);
         }
 
         lines.push('**Long-term Goal**');
@@ -214,7 +217,7 @@ async function startLtWizardDM(interaction, client) {
             components: [],
         });
     } catch (e) {
-        console.error('[goals] DM send failed:', e.message);
+        console.error('[goals] DM send failed:', e);
         return interaction.editReply({
             embeds: [error('Could Not Send DM', 'Unable to DM you. Check that your privacy settings allow DMs from server members.')],
             components: [backRow()],

@@ -114,7 +114,7 @@ async function fetchUserSummaries(guild, rows) {
         try {
             const data = await getWaniKaniData(row);
             await recordPoll(row.discord_user_id, guild.id, data.dueRightNow, row.wanikani_user_id).catch(err =>
-                console.error(`[recordPoll] ${row.discord_user_id}@${guild.id}:`, err.message)
+                console.error(`[recordPoll] ${row.discord_user_id}@${guild.id}:`, err)
             );
             return {
                 userId: row.discord_user_id,
@@ -128,7 +128,7 @@ async function fetchUserSummaries(guild, rows) {
                 dueNext24Hours: data.dueNext24Hours,
             };
         } catch (err) {
-            console.error(`[scheduler] WK fetch failed for ${row.discord_user_id}:`, err.message);
+            console.error(`[scheduler] WK fetch failed for ${row.discord_user_id}:`, err);
             return {
                 userId: row.discord_user_id,
                 username,
@@ -196,7 +196,7 @@ async function dailyJob(client, guildId) {
                     channelId: channel.id,
                     messageId: sent?.id ?? null,
                     status: 'sent',
-                }).catch(e => console.error('[logReminderEvent/daily]', e.message));
+                }).catch(e => console.error('[logReminderEvent/daily]', e));
             }
         }
     }
@@ -364,7 +364,7 @@ async function checkUserResets(apiKey, discordUserId, guildId, wanikaniUserId, l
             clearCacheForApiKey(apiKey);
         }
     } catch (err) {
-        console.error(`[reset check] ${discordUserId}@${guildId}:`, err.message);
+        console.error(`[reset check] ${discordUserId}@${guildId}:`, err);
     }
 
     await db.run(
@@ -400,10 +400,10 @@ async function summaryRefreshJob(client) {
             await scheduleNextReviewTimer(client, account);
             await maybeResetGoalAlertBaseline(account);
             await updateSnapshotsAndStreaksForAccount(account).catch(err =>
-                console.error(`[summaryRefresh/snapshots] ${account.wanikani_user_id}:`, err.message)
+                console.error(`[summaryRefresh/snapshots] ${account.wanikani_user_id}:`, err)
             );
         } catch (err) {
-            console.error(`[summaryRefresh] ${account.wanikani_user_id}:`, err.message);
+            console.error(`[summaryRefresh] ${account.wanikani_user_id}:`, err);
         }
     }
 
@@ -416,7 +416,7 @@ async function summaryRefreshJob(client) {
                 try {
                     await maybeAnnounceClearedQueue(client, guild, channel, settings, row);
                 } catch (err) {
-                    console.error(`[summaryRefresh/guild] ${row.discord_user_id}@${guild.id}:`, err.message);
+                    console.error(`[summaryRefresh/guild] ${row.discord_user_id}@${guild.id}:`, err);
                 }
             }
         } catch (err) {
@@ -479,7 +479,10 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
     if (!cleared) return;
     try {
         const reviewsToday = await getReviewsCompletedSince(row, START_OF_BOT_DAY(settings.timezone))
-            .catch(() => null);
+            .catch(err => {
+                console.warn(`[cleared/reviewsToday] ${row.discord_user_id}@${guild.id}:`, err);
+                return null;
+            });
         const nextBucket = await db.get(
             `SELECT available_at, subject_count FROM wk_summary_buckets
              WHERE wanikani_user_id = ? AND bucket_type = 'review'
@@ -518,9 +521,9 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
             messageId: sent?.id ?? null,
             reviewCount: reviewsToday,
             status: 'sent',
-        }).catch(e => console.error('[logReminderEvent]', e.message));
+        }).catch(e => console.error('[logReminderEvent]', e));
     } catch (err) {
-        console.error(`[cleared] ${row.discord_user_id}@${guild.id}:`, err.message);
+        console.error(`[cleared] ${row.discord_user_id}@${guild.id}:`, err);
         await logReminderEvent({
             guildId: guild.id,
             discordUserId: row.discord_user_id,
@@ -530,7 +533,7 @@ async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) 
             channelId: channel?.id ?? null,
             status: 'failed',
             error: err.message,
-        }).catch(() => {});
+        }).catch(e => console.error('[logReminderEvent/failed cleared]', e));
     }
 }
 
@@ -561,7 +564,7 @@ async function scheduleNextReviewTimer(client, account) {
     const timer = setTimeout(() => {
         reviewTimers.delete(wkId);
         reviewTimerFired(client, account).catch(err =>
-            console.error(`[reviewTimer] ${wkId}:`, err.message)
+            console.error(`[reviewTimer] ${wkId}:`, err)
         );
     }, ms);
     reviewTimers.set(wkId, timer);
@@ -569,7 +572,11 @@ async function scheduleNextReviewTimer(client, account) {
 
 async function reviewTimerFired(client, account) {
     // Refresh /summary so review_count_now reflects the unlock we're firing for.
-    try { await wkSync.syncSummary(account); } catch (e) { /* keep going */ }
+    try {
+        await wkSync.syncSummary(account);
+    } catch (err) {
+        console.warn(`[reviewTimer/syncSummary] ${account.wanikani_user_id}:`, err);
+    }
 
     const goal = await db.get(
         `SELECT notify_enabled, last_alerted_at, last_alerted_review_count, target_level, deadline
@@ -663,9 +670,9 @@ async function reviewTimerFired(client, account) {
                 reviewCount: dueRightNow,
                 messageId: sent?.id ?? null,
                 status: 'sent',
-            }).catch(e => console.error('[logReminderEvent]', e.message));
+            }).catch(e => console.error('[logReminderEvent]', e));
         } catch (err) {
-            console.warn(`[reviewDM] ${account.discord_user_id}: ${err.message}`);
+            console.warn(`[reviewDM] ${account.discord_user_id}:`, err);
             await logReminderEvent({
                 discordUserId: account.discord_user_id,
                 wanikaniUserId: account.wanikani_user_id,
@@ -674,7 +681,7 @@ async function reviewTimerFired(client, account) {
                 reviewCount: dueRightNow,
                 status: 'failed',
                 error: err.message,
-            }).catch(() => {});
+            }).catch(e => console.error('[logReminderEvent/failed reviewDM]', e));
         }
     }
 
@@ -758,9 +765,9 @@ async function slowDetectionJob(client) {
                     await evaluateAchievements({
                         discordUserId: row.discord_user_id,
                         wanikaniUserId: row.wanikani_user_id,
-                    }).catch(e => console.error('[achievements]', e.message));
+                    }).catch(e => console.error('[achievements]', e));
                 } catch (err) {
-                    console.error(`[slowDetection] ${row.discord_user_id}@${guild.id}:`, err.message);
+                    console.error(`[slowDetection] ${row.discord_user_id}@${guild.id}:`, err);
                 }
             }
         } catch (err) {
@@ -782,11 +789,11 @@ async function dailyGlobalsAndUserSyncJob() {
             const { decrypt } = require('./helpers/crypto');
             const apiKey = decrypt(someAccount.api_token_encrypted);
             await wkSync.syncSpacedRepetitionSystems(apiKey).catch(e =>
-                console.error('[dailyGlobals] srs:', e.message));
+                console.error('[dailyGlobals] srs:', e));
             await wkSync.syncSubjects(apiKey).catch(e =>
-                console.error('[dailyGlobals] subjects:', e.message));
+                console.error('[dailyGlobals] subjects:', e));
         } catch (err) {
-            console.error('[dailyGlobals]', err.message);
+            console.error('[dailyGlobals]', err);
         }
     }
 
@@ -799,7 +806,7 @@ async function dailyGlobalsAndUserSyncJob() {
             await wkSync.syncReviewStatistics(account);
             await wkSync.syncStudyMaterials(account);
         } catch (err) {
-            console.error(`[dailyUserSync] ${account.wanikani_user_id}:`, err.message);
+            console.error(`[dailyUserSync] ${account.wanikani_user_id}:`, err);
         }
     }
 }
@@ -868,10 +875,10 @@ async function paceAlertJob(client) {
                     [new Date().toISOString(), goal.discord_user_id]
                 );
             } catch (err) {
-                console.warn(`[paceDM] ${goal.discord_user_id}: ${err.message}`);
+                console.warn(`[paceDM] ${goal.discord_user_id}:`, err);
             }
         } catch (err) {
-            console.error(`[paceAlert] ${goal.discord_user_id}:`, err.message);
+            console.error(`[paceAlert] ${goal.discord_user_id}:`, err);
         }
     }
 }
@@ -1073,7 +1080,7 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
                 [row.wanikani_user_id, botDateStr(-14, timeZone)]
             );
         } catch (err) {
-            console.error(`[snapshot] ${row.discord_user_id}@${guildId}:`, err.message);
+            console.error(`[snapshot] ${row.discord_user_id}@${guildId}:`, err);
         }
     }
 }
