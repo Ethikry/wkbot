@@ -120,11 +120,13 @@ function formatLevelProgress(level, progress) {
             (ready ? ' — ready to level up! 🎉' : ` — ${k.remaining} to go`)
         );
     } else {
-        lines.push('Kanji passed: *(none unlocked yet at this level)*');
+        lines.push('Kanji at Guru+: *(none unlocked yet at this level)*');
     }
 
+    // Radicals don't gate level-up directly (only kanji 90% does), but they're
+    // a useful signal of how far through the level the user is.
     if (r.total > 0) {
-        lines.push(`Radicals passed: **${r.passed}/${r.total}** (${r.percent}%)`);
+        lines.push(`Radicals at Guru+: **${r.passed}/${r.total}** (${r.percent}%)`);
     }
 
     return lines.join('\n');
