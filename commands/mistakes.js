@@ -3,6 +3,7 @@ const { fetchAllPages, getSubjectsByIds } = require('../helpers/wanikaniData');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { decrypt } = require('../helpers/crypto');
 const { base, error } = require('../helpers/embeds');
+const { botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
 const MISTAKE_WINDOW_DAYS = 7;
@@ -15,6 +16,7 @@ module.exports = {
 
     async execute(interaction) {
         const userId = interaction.user.id;
+        const guildId = interaction.guild.id;
 
         const account = await getAccountForDiscordUser(userId);
         if (!account?.api_token_encrypted) {
@@ -46,27 +48,37 @@ module.exports = {
                 });
             }
 
-            const subjectIds = [...new Set(currentStats.map(s => s.data.subject_id))];
+            const subjectIds = [
+                ...new Set(currentStats.map(s => s.data?.subject_id).filter(id => id !== undefined && id !== null)),
+            ];
+            if (subjectIds.length === 0) {
+                return interaction.editReply({
+                    embeds: [base('📭 No Data Yet')
+                        .setDescription('No review-stat subjects were found in the past 7 days.')],
+                });
+            }
 
-            // Latest stored snapshot at or before the window start. This is the
-            // pre-window cumulative incorrect count for each subject.
+            // Latest stored daily snapshot at or before the window start. This
+            // is the pre-window cumulative incorrect count for each subject.
+            const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
+            const cutoffDateKey = botDateKey(cutoff, resolveTimeZone(settings?.timezone));
             const placeholders = subjectIds.map(() => '?').join(',');
             const snapRows = await db.all(
                 `WITH latest AS (
-                    SELECT subject_id, MAX(created_at) AS created_at
+                    SELECT subject_id, MAX(snapshot_date) AS snapshot_date
                     FROM review_stat_snapshots
                     WHERE wanikani_user_id = ?
                       AND subject_id IN (${placeholders})
-                      AND datetime(created_at) <= datetime(?)
+                      AND snapshot_date <= ?
                     GROUP BY subject_id
                  )
                  SELECT s.subject_id, s.meaning_incorrect, s.reading_incorrect
                  FROM review_stat_snapshots s
                  JOIN latest l
                    ON l.subject_id = s.subject_id
-                  AND l.created_at = s.created_at
+                  AND l.snapshot_date = s.snapshot_date
                  WHERE s.wanikani_user_id = ?`,
-                [wanikaniUserId, ...subjectIds, sinceISO, wanikaniUserId]
+                [wanikaniUserId, ...subjectIds, cutoffDateKey, wanikaniUserId]
             );
             const baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
 

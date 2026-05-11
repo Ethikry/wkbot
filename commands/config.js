@@ -45,7 +45,7 @@ module.exports = {
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
         .addStringOption(o =>
-            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, configured timezone)'))
+            o.setName('time').setDescription('Time for all scheduled messages (HH:MM, in server timezone — see /timezone)'))
         .addChannelOption(o =>
             o.setName('channel').setDescription('Output channel or thread for bot posts')
                 .addChannelTypes(...OUTPUT_CHANNEL_TYPES))
@@ -81,7 +81,7 @@ module.exports = {
 
         if (time !== null && !VALID_TIME.test(time)) {
             return interaction.reply({
-                embeds: [error('Invalid time', 'Use 24-hour `HH:MM` UTC, e.g. `15:00`.')],
+                embeds: [error('Invalid time', 'Use 24-hour `HH:MM` in the server timezone, e.g. `00:00`.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
@@ -110,7 +110,7 @@ module.exports = {
         if (time !== null) {
             fields.push('daily_summary_time = ?', 'weekly_leaderboard_time = ?');
             params.push(time, time);
-            summary.push(`Scheduled message time: **${time}**`);
+            summary.push(`Scheduled message time: **${time}** (server timezone)`);
             scheduleChanged = true;
         }
         if (weekly !== null) {
@@ -166,7 +166,7 @@ async function showSettings(interaction, guildId) {
         .addFields(
             { name: 'Output channel', value: channelStr, inline: false },
             { name: 'Timezone', value: `**${resolveTimeZone(s.timezone)}**`, inline: true },
-            { name: 'Scheduled time', value: `**${s.daily_summary_time}**`, inline: true },
+            { name: 'Scheduled time', value: `**${s.daily_summary_time}** ${resolveTimeZone(s.timezone)}`, inline: true },
             {
                 name: 'Daily summary',
                 value: s.daily_summary_enabled ? 'on' : 'off',

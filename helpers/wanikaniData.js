@@ -300,6 +300,23 @@ async function getLessonsCompletedSince(account, isoDate) {
     return (await getCompletedSince(account, isoDate)).lessonsCompleted;
 }
 
+// Cache-backed variant that returns the activity rows so callers can bucket
+// them (e.g. into per-day snapshots). Triggers a sync if the cache is older
+// than maxStaleMs (default 4 min — short enough to feel live in the 5-min
+// summary loop, but rate-limited so back-to-back calls don't hammer the API).
+async function getCompletedItemsSince(account, isoDate, maxStaleMs = 4 * 60 * 1000) {
+    await ensureAssignmentsSynced(account, maxStaleMs);
+    return db.all(
+        `SELECT subject_id, started_at, data_updated_at
+         FROM wk_assignments
+         WHERE wanikani_user_id = ?
+           AND started_at IS NOT NULL
+           AND data_updated_at >= ?
+           AND hidden = 0`,
+        [account.wanikani_user_id, isoDate]
+    );
+}
+
 async function getRandomKanjiAtLevel(apiKey, level) {
     await ensureSubjectsSynced(apiKey);
     const rows = await db.all(
@@ -505,6 +522,7 @@ module.exports = {
     getWaniKaniData,
     getSrsBreakdown,
     getCompletedSince,
+    getCompletedItemsSince,
     getReviewsCompletedSince,
     getLessonsCompletedSince,
     getBurnedCount,
