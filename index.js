@@ -1,4 +1,18 @@
 require('dotenv').config();
+const { installConsoleLogger } = require('./helpers/logger');
+installConsoleLogger();
+
+process.on('warning', warning => {
+    console.warn('[process warning]', warning);
+});
+process.on('unhandledRejection', reason => {
+    console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', err => {
+    console.error('[uncaughtException]', err);
+    process.exit(1);
+});
+
 const fs = require('fs');
 const path = require('path');
 const { Client, GatewayIntentBits, Collection, Events, MessageFlags } = require('discord.js');
@@ -27,6 +41,9 @@ async function main() {
     const client = new Client({
         intents: [GatewayIntentBits.Guilds],
     });
+    client.on('error', err => console.error('[discord/client error]', err));
+    client.on('warn', warning => console.warn('[discord/client warn]', warning));
+    client.on('shardError', err => console.error('[discord/shard error]', err));
 
     client.commands = new Collection();
     const commandsDir = path.join(__dirname, 'commands');
@@ -98,7 +115,7 @@ async function main() {
                     await interaction.reply(payload);
                 }
             } catch (replyErr) {
-                console.error('[interaction] failed to send error reply:', replyErr.message);
+                console.error('[interaction] failed to send error reply:', replyErr);
             }
         }
     };
@@ -125,9 +142,6 @@ async function main() {
     };
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('unhandledRejection', (reason) => {
-        console.error('[unhandledRejection]', reason);
-    });
 }
 
 main().catch(err => {

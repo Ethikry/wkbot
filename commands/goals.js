@@ -93,8 +93,14 @@ async function buildOverviewPayload(userId, guildId) {
                 currentLevel = wk.userData.level;
                 if (longGoal.deadline) {
                     const [itemCounts, fastest] = await Promise.all([
-                        getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(() => null),
-                        computeFastestPaceDays(account, currentLevel, longGoal.target_level).catch(() => null),
+                        getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(err => {
+                            console.warn('[goals overview] lesson count projection:', err);
+                            return null;
+                        }),
+                        computeFastestPaceDays(account, currentLevel, longGoal.target_level).catch(err => {
+                            console.warn('[goals overview] fastest pace projection:', err);
+                            return null;
+                        }),
                     ]);
                     proj = projectPace({
                         targetLevel: longGoal.target_level,
@@ -108,7 +114,7 @@ async function buildOverviewPayload(userId, guildId) {
                 }
             }
         } catch (e) {
-            console.error('[goals overview] WK fetch:', e.message);
+            console.error('[goals overview] WK fetch:', e);
         }
 
         lines.push('**Long-term Goal**');
@@ -218,7 +224,7 @@ async function startLtWizardDM(interaction, client) {
             components: [],
         });
     } catch (e) {
-        console.error('[goals] DM send failed:', e.message);
+        console.error('[goals] DM send failed:', e);
         return interaction.editReply({
             embeds: [error('Could Not Send DM', 'Unable to DM you. Check that your privacy settings allow DMs from server members.')],
             components: [backRow()],
@@ -804,6 +810,9 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
     const levelsRemaining = Math.max(1, targetLevel - currentLevel);
     const counts = itemCounts && Number.isFinite(itemCounts.total) ? itemCounts : null;
     const vocabTotal = counts ? counts.vocabulary + (counts.kanaVocabulary || 0) : 0;
+    const hitRateSampleLabel = hitRateSampleSize
+        ? ` (${hitRateSampleSize} answer attempt${hitRateSampleSize === 1 ? '' : 's'})`
+        : ' — defaulted';
     const itemsLine = counts
         ? `**Lessons remaining to reach L${targetLevel}:** ${counts.total} (${counts.radicals} radicals · ${counts.kanji} kanji · ${vocabTotal} vocab)${counts.source === 'fallback' ? ' — estimated' : ''}`
         : `**Lessons remaining to reach L${targetLevel}:** ~${levelsRemaining * 140} estimated`;
@@ -826,7 +835,7 @@ function paceSelectionEmbed({ targetLevel, currentLevel, deadline, hitRate, hitR
         `**Target:** Level ${targetLevel} by **${deadline}**`,
         `**Current level:** ${currentLevel}`,
         itemsLine,
-        `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleSize ? ` (${hitRateSampleSize} reviewed items)` : ' — defaulted'}`,
+        `**Hit rate (last 30d):** ${formatPercent(hitRate)}${hitRateSampleLabel}`,
         '',
         'Plans cover **every item you have not started yet** through the target level.',
         srsLine,

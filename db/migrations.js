@@ -475,11 +475,48 @@ const SCHEMA_V4 = [
       WHERE timezone = 'UTC' AND daily_summary_time = '15:00'`,
 ];
 
+const SCHEMA_V5 = [
+    `ALTER TABLE review_stat_snapshots ADD COLUMN meaning_correct INTEGER`,
+    `ALTER TABLE review_stat_snapshots ADD COLUMN reading_correct INTEGER`,
+    `CREATE INDEX IF NOT EXISTS idx_review_stat_snapshots_user_date
+        ON review_stat_snapshots(wanikani_user_id, snapshot_date)`,
+];
+
+const SCHEMA_V6 = [
+    `CREATE TABLE IF NOT EXISTS wk_review_stat_history (
+        wanikani_user_id TEXT NOT NULL,
+        review_statistic_id INTEGER NOT NULL,
+        subject_id INTEGER NOT NULL,
+        recorded_at TEXT NOT NULL,
+        meaning_correct INTEGER NOT NULL DEFAULT 0,
+        meaning_incorrect INTEGER NOT NULL DEFAULT 0,
+        reading_correct INTEGER NOT NULL DEFAULT 0,
+        reading_incorrect INTEGER NOT NULL DEFAULT 0,
+        hidden INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (wanikani_user_id, subject_id, recorded_at),
+        FOREIGN KEY (wanikani_user_id) REFERENCES wanikani_accounts(wanikani_user_id) ON DELETE CASCADE,
+        FOREIGN KEY (subject_id) REFERENCES wk_subjects(subject_id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_wk_review_stat_history_user_recorded
+        ON wk_review_stat_history(wanikani_user_id, recorded_at)`,
+    `INSERT OR IGNORE INTO wk_review_stat_history (
+        wanikani_user_id, review_statistic_id, subject_id, recorded_at,
+        meaning_correct, meaning_incorrect, reading_correct, reading_incorrect, hidden
+     )
+     SELECT wanikani_user_id, review_statistic_id, subject_id, data_updated_at,
+            meaning_correct, meaning_incorrect, reading_correct, reading_incorrect, hidden
+     FROM wk_review_statistics
+     WHERE data_updated_at IS NOT NULL`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
     { version: 3, name: 'long_goals_alerted_count', statements: SCHEMA_V3 },
     { version: 4, name: 'jst_default_timezone', statements: SCHEMA_V4 },
+    { version: 5, name: 'review_stat_snapshot_correct_counts', statements: SCHEMA_V5 },
+    { version: 6, name: 'review_stat_counter_history', statements: SCHEMA_V6 },
 ];
 
 async function runMigrations({ get, all, run }) {

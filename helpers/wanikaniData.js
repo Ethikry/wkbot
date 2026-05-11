@@ -60,16 +60,30 @@ async function wkRequest(pathOrUrl, apiKey, opts = {}) {
                 clearTimeout(timer);
                 const retryAfter = parseInt(res.headers.get('Retry-After') || '60', 10);
                 if (attempt < retries) {
+                    console.warn('[wanikani] rate limited; retrying', {
+                        url,
+                        attempt: attempt + 1,
+                        retries,
+                        retryAfterSeconds: retryAfter,
+                    });
                     await sleep(retryAfter * 1000);
                     continue;
                 }
                 const body = await res.text().catch(() => '');
-                throw new Error(`WaniKani API rate-limited: ${body.slice(0, 200)}`);
+                const err = new Error(`WaniKani API rate-limited: ${body.slice(0, 200)}`);
+                err.status = res.status;
+                err.url = url;
+                err.responseBody = body.slice(0, 500);
+                throw err;
             }
 
             if (!res.ok) {
                 const body = await res.text().catch(() => '');
-                throw new Error(`WaniKani API ${res.status}: ${body.slice(0, 200)}`);
+                const err = new Error(`WaniKani API ${res.status}: ${body.slice(0, 200)}`);
+                err.status = res.status;
+                err.url = url;
+                err.responseBody = body.slice(0, 500);
+                throw err;
             }
 
             const raw = await res.json();
@@ -90,9 +104,19 @@ async function wkRequest(pathOrUrl, apiKey, opts = {}) {
             clearTimeout(timer);
             lastErr = err;
             if (attempt < retries && (err.name === 'AbortError' || err.code === 'ECONNRESET')) {
+                err.url = url;
+                err.attempt = attempt + 1;
+                console.warn('[wanikani] transient request failure; retrying', {
+                    url,
+                    attempt: attempt + 1,
+                    retries,
+                    timeoutMs,
+                }, err);
                 await sleep(1000 * (attempt + 1));
                 continue;
             }
+            err.url = err.url ?? url;
+            err.attempt = err.attempt ?? attempt + 1;
             if (attempt >= retries) break;
         }
     }
@@ -498,27 +522,108 @@ async function getLevelProgress(account, level) {
     return { kanji: await tally('kanji'), radicals: await tally('radical') };
 }
 
-// Approximation of recent accuracy. review_statistics totals are cumulative per
-// item; rows updated in the window are the ones that saw activity.
+function countDelta(current, baseline) {
+    return Math.max(0, (current || 0) - (baseline || 0));
+}
+
+function isOnOrAfter(isoDate, cutoffMs) {
+    if (!isoDate) return false;
+    const ts = new Date(isoDate).getTime();
+    return Number.isFinite(ts) && ts >= cutoffMs;
+}
+
+const REVIEW_STAT_BASELINE_CHUNK_SIZE = 500;
+
+async function getReviewStatBaselines(wanikaniUserId, subjectIds, cutoffISO) {
+    const out = new Map();
+    for (let i = 0; i < subjectIds.length; i += REVIEW_STAT_BASELINE_CHUNK_SIZE) {
+        const chunk = subjectIds.slice(i, i + REVIEW_STAT_BASELINE_CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = await db.all(
+            `WITH latest AS (
+                SELECT subject_id, MAX(recorded_at) AS recorded_at
+                FROM wk_review_stat_history
+                WHERE wanikani_user_id = ?
+                  AND subject_id IN (${placeholders})
+                  AND recorded_at <= ?
+                GROUP BY subject_id
+             )
+             SELECT h.subject_id,
+                    h.meaning_correct, h.meaning_incorrect,
+                    h.reading_correct, h.reading_incorrect
+             FROM wk_review_stat_history h
+             JOIN latest l
+               ON l.subject_id = h.subject_id
+              AND l.recorded_at = h.recorded_at
+             WHERE h.wanikani_user_id = ?`,
+            [wanikaniUserId, ...chunk, cutoffISO, wanikaniUserId]
+        );
+        for (const row of rows) out.set(row.subject_id, row);
+    }
+    return out;
+}
+
+// Rolling accuracy from review_statistics counter deltas. The WK endpoint only
+// gives cumulative per-subject counters, so we compare current stats against
+// the latest stored counter history at the start of the window.
 async function getHitRate(account, days = 30) {
     await ensureReviewStatsSynced(account);
-    const since = new Date();
-    since.setUTCDate(since.getUTCDate() - days);
+    const windowDays = Math.max(1, Number.isFinite(days) ? days : 30);
+    const cutoff = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
+    const cutoffMs = cutoff.getTime();
+    const cutoffISO = cutoff.toISOString();
+
     const rows = await db.all(
-        `SELECT meaning_correct, meaning_incorrect, reading_correct, reading_incorrect
+        `SELECT subject_id, created_at,
+                meaning_correct, meaning_incorrect,
+                reading_correct, reading_incorrect
          FROM wk_review_statistics
-         WHERE wanikani_user_id = ? AND data_updated_at >= ?`,
-        [account.wanikani_user_id, since.toISOString()]
+         WHERE wanikani_user_id = ?
+           AND hidden = 0
+           AND data_updated_at >= ?`,
+        [account.wanikani_user_id, cutoffISO]
     );
     if (rows.length === 0) return null;
-    let correct = 0, total = 0;
+
+    const subjectIds = [...new Set(rows.map(r => r.subject_id))];
+    const baselineMap = await getReviewStatBaselines(account.wanikani_user_id, subjectIds, cutoffISO);
+
+    let correct = 0, total = 0, subjectCount = 0;
+    let missingBaseline = false;
     for (const s of rows) {
-        correct += (s.meaning_correct || 0) + (s.reading_correct || 0);
-        total += (s.meaning_correct || 0) + (s.reading_correct || 0)
-               + (s.meaning_incorrect || 0) + (s.reading_incorrect || 0);
+        const base = baselineMap.get(s.subject_id);
+        let meaningCorrect, meaningIncorrect, readingCorrect, readingIncorrect;
+
+        if (isOnOrAfter(s.created_at, cutoffMs)) {
+            meaningCorrect = s.meaning_correct || 0;
+            meaningIncorrect = s.meaning_incorrect || 0;
+            readingCorrect = s.reading_correct || 0;
+            readingIncorrect = s.reading_incorrect || 0;
+        } else if (base) {
+            meaningCorrect = countDelta(s.meaning_correct, base.meaning_correct);
+            meaningIncorrect = countDelta(s.meaning_incorrect, base.meaning_incorrect);
+            readingCorrect = countDelta(s.reading_correct, base.reading_correct);
+            readingIncorrect = countDelta(s.reading_incorrect, base.reading_incorrect);
+        } else {
+            missingBaseline = true;
+            continue;
+        }
+
+        const rowCorrect = meaningCorrect + readingCorrect;
+        const rowTotal = rowCorrect + meaningIncorrect + readingIncorrect;
+        if (rowTotal === 0) continue;
+        correct += rowCorrect;
+        total += rowTotal;
+        subjectCount++;
     }
+    if (missingBaseline) return null;
     if (total === 0) return null;
-    return { hitRate: correct / total, sampleSize: rows.length, windowDays: days };
+    return {
+        hitRate: correct / total,
+        sampleSize: total,
+        subjectCount,
+        windowDays,
+    };
 }
 
 async function getLevelProgressions(account) {
