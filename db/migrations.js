@@ -510,6 +510,28 @@ const SCHEMA_V6 = [
      WHERE data_updated_at IS NOT NULL`,
 ];
 
+const SCHEMA_V7 = [
+    `CREATE TABLE IF NOT EXISTS command_usage (
+        command_usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_name TEXT NOT NULL,
+        subcommand_name TEXT,
+        guild_id TEXT,
+        channel_id TEXT,
+        discord_user_id TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT,
+        duration_ms INTEGER,
+        status TEXT NOT NULL DEFAULT 'started' CHECK (status IN ('started', 'success', 'failed')),
+        error TEXT
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_command_usage_started_at
+        ON command_usage(started_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_command_usage_command_started
+        ON command_usage(command_name, started_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_command_usage_guild_started
+        ON command_usage(guild_id, started_at)`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -517,6 +539,7 @@ const MIGRATIONS = [
     { version: 4, name: 'jst_default_timezone', statements: SCHEMA_V4 },
     { version: 5, name: 'review_stat_snapshot_correct_counts', statements: SCHEMA_V5 },
     { version: 6, name: 'review_stat_counter_history', statements: SCHEMA_V6 },
+    { version: 7, name: 'command_usage_log', statements: SCHEMA_V7 },
 ];
 
 async function runMigrations({ get, all, run }) {

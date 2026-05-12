@@ -12,6 +12,7 @@ const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
 const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal, computeFastestPaceDays } = require('../helpers/wanikaniData');
 const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
+const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const {
     paceOptionsFor,
     projectPace,
@@ -35,6 +36,7 @@ module.exports = {
 
     async execute(interaction) {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await awaitInteractionStateRefresh(interaction, 'goals');
         const payload = await buildOverviewPayload(interaction.user.id, interaction.guildId);
         return interaction.editReply(payload);
     },
