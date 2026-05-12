@@ -111,6 +111,7 @@ module.exports = {
 };
 
 function formatLevelProgress(level, progress) {
+    if (level >= 60) return '🏆 Max level reached — congratulations!';
     const k = progress.kanji;
     const r = progress.radicals;
     const lines = [];

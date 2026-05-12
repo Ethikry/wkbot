@@ -532,6 +532,15 @@ const SCHEMA_V7 = [
         ON command_usage(guild_id, started_at)`,
 ];
 
+// Zero out daily_snapshots rows polluted by the vacation-toggle bulk-update
+// bug in scheduler.updateSnapshotsAndStreaks. No human realistically completes
+// 500+ reviews or lessons in a single day; the only source of such rows is
+// the bulk-updated-assignments bucketing bug fixed alongside this migration.
+const SCHEMA_V8 = [
+    `UPDATE daily_snapshots SET reviews_completed = 0 WHERE reviews_completed > 500`,
+    `UPDATE daily_snapshots SET lessons_completed = 0 WHERE lessons_completed > 500`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -540,6 +549,7 @@ const MIGRATIONS = [
     { version: 5, name: 'review_stat_snapshot_correct_counts', statements: SCHEMA_V5 },
     { version: 6, name: 'review_stat_counter_history', statements: SCHEMA_V6 },
     { version: 7, name: 'command_usage_log', statements: SCHEMA_V7 },
+    { version: 8, name: 'zero_out_vacation_review_spikes', statements: SCHEMA_V8 },
 ];
 
 async function runMigrations({ get, all, run }) {
