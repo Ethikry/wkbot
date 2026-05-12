@@ -1,5 +1,5 @@
 const { SlashCommandBuilder, ChannelType, MessageFlags } = require('discord.js');
-const { isModerator } = require('../helpers/permissions');
+const { isMaster, isModerator } = require('../helpers/permissions');
 const { success, error, base } = require('../helpers/embeds');
 const { rescheduleGuild } = require('../scheduler');
 const { DEFAULT_TIME_ZONE, isValidTimeZone, normalizeTimeZone, resolveTimeZone } = require('../helpers/botTime');
@@ -55,9 +55,10 @@ module.exports = {
             o.setName('modrole').setDescription('Role allowed to run /config')),
 
     async execute(interaction, client) {
-        if (!(await isModerator(interaction))) {
+        const masterOverride = isMaster(interaction.user.id);
+        if (!masterOverride && !(await isModerator(interaction))) {
             return interaction.reply({
-                embeds: [error('Forbidden', 'You need the configured mod role, or Manage Server permission, to run this.')],
+                embeds: [error('Forbidden', 'You need the configured mod role, Manage Server permission, or MASTER override to run this.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
