@@ -89,6 +89,7 @@ module.exports = {
                         name: '📅 30 Day Heatmap',
                         value: [
                             heatmap,
+                            '0 ⬛🟦🟩🟨🟧🟥 200+',
                             `**${totalReviews}** reviews · **${totalLessons}** lessons completed in the last 30 days`,
                         ].join('\n'),
                         inline: false,
