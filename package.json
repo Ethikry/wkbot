@@ -9,7 +9,8 @@
     "clear-commands": "node clear-commands.js",
     "dev": "nodemon index.js",
     "inspect": "node scripts/inspect.js",
-    "usage": "node scripts/inspect.js usage"
+    "usage": "node scripts/inspect.js usage",
+    "redeploy": "./redeploy.sh"
   },
   "keywords": [],
   "author": "",
