@@ -2,6 +2,7 @@ const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { base, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { evaluateAchievements } = require('../helpers/achievements');
+const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const db = require('../db');
 
 module.exports = {
@@ -20,6 +21,7 @@ module.exports = {
         }
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await awaitInteractionStateRefresh(interaction, 'achievements');
 
         // Re-evaluate so the user sees up-to-date status, not just whatever the
         // hourly slow-loop has caught.

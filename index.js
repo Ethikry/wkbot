@@ -21,6 +21,8 @@ const { scheduleAll } = require('./scheduler');
 const { startHealthServer } = require('./server');
 const { warnIfMissing } = require('./helpers/crypto');
 const { error: errorEmbed } = require('./helpers/embeds');
+const { recordCommandStart, recordCommandFinish } = require('./helpers/commandUsage');
+const { startInteractionStateRefresh } = require('./helpers/interactionState');
 
 async function main() {
     if (!process.env.TOKEN) {
@@ -78,11 +80,24 @@ async function main() {
     };
 
     const handleInteraction = async (interaction) => {
+        let commandUsageId = null;
+        let commandStartedAtMs = null;
         try {
             if (interaction.isChatInputCommand()) {
                 const command = client.commands.get(interaction.commandName);
                 if (!command) return;
+                commandStartedAtMs = Date.now();
+                commandUsageId = await recordCommandStart(interaction).catch(err => {
+                    console.error('[commandUsage/start]', err);
+                    return null;
+                });
+                const stateRefresh = startInteractionStateRefresh(interaction);
+                stateRefresh?.catch(err => console.error(`[stateRefresh/${interaction.commandName}]`, err));
                 await command.execute(interaction, client);
+                await recordCommandFinish(commandUsageId, {
+                    status: 'success',
+                    startedAtMs: commandStartedAtMs,
+                }).catch(err => console.error('[commandUsage/finish]', err));
                 return;
             }
             if (interaction.isButton()) {
@@ -98,6 +113,11 @@ async function main() {
                 return;
             }
         } catch (err) {
+            await recordCommandFinish(commandUsageId, {
+                status: 'failed',
+                startedAtMs: commandStartedAtMs,
+                error: err,
+            }).catch(finishErr => console.error('[commandUsage/finish]', finishErr));
             const label = interaction.isChatInputCommand?.()
                 ? `/${interaction.commandName}`
                 : interaction.customId
