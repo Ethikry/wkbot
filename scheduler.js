@@ -954,6 +954,12 @@ async function paceAlertJob(client) {
 // missed cron without making the loop expensive.
 const SNAPSHOT_LOOKBACK_DAYS = 3;
 
+// Vacation-mode entry/exit re-stamps every assignment's data_updated_at at
+// once. A real human review session never produces 50 items in the same
+// wall-clock second, so we treat any such cluster as a WK-side bulk mutation
+// and drop it from the review/lesson buckets.
+const BULK_UPDATE_SECOND_THRESHOLD = 50;
+
 async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
     const settings = await getOrCreateSettings(guildId);
     const timeZone = resolveTimeZone(settings.timezone);
@@ -1008,9 +1014,20 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
 
             // Bucket activity into per-day counts. Reviews = item already
             // started before the day; lessons = item started during the day.
+            const perSecondCounts = new Map();
+            for (const it of items) {
+                const sec = Math.floor(new Date(it.data_updated_at).getTime() / 1000);
+                perSecondCounts.set(sec, (perSecondCounts.get(sec) || 0) + 1);
+            }
+            let bulkFiltered = 0;
             const byDay = new Map(days.map(d => [d.dateKey, { reviews: 0, lessons: 0 }]));
             for (const it of items) {
                 const updatedAt = new Date(it.data_updated_at).getTime();
+                const sec = Math.floor(updatedAt / 1000);
+                if (perSecondCounts.get(sec) > BULK_UPDATE_SECOND_THRESHOLD) {
+                    bulkFiltered++;
+                    continue;
+                }
                 const startedAt = new Date(it.started_at).getTime();
                 for (const d of days) {
                     const start = new Date(d.startISO).getTime();
@@ -1022,6 +1039,11 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
                         break;
                     }
                 }
+            }
+            if (bulkFiltered > 0) {
+                console.warn(
+                    `[scheduler] filtered ${bulkFiltered} bulk-updated assignments for user ${row.discord_user_id} (likely vacation toggle)`
+                );
             }
 
             for (const d of days) {
