@@ -41,7 +41,12 @@ module.exports = {
                 discord_user_id: userId,
                 wanikani_user_id: account.wanikani_user_id,
                 api_token_encrypted: account.api_token_encrypted,
-            }]);
+            }], {
+                userMaxAgeMs: 0,
+                summaryMaxAgeMs: 0,
+                reviewStatsMaxAgeMs: 0,
+                assignmentMaxAgeMs: 0,
+            });
 
             const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
             const today = botDateStr(0, settings?.timezone);

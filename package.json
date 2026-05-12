@@ -7,7 +7,8 @@
     "deploy": "node deploy-commands.js",
     "deploy-and-start": "node deploy-commands.js && node index.js",
     "clear-commands": "node clear-commands.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "usage": "node scripts/command-usage.js"
   },
   "keywords": [],
   "author": "",

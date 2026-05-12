@@ -4,6 +4,7 @@ const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { base, error } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
 const { DEFAULT_TIME_ZONE, botDateKey, resolveTimeZone, startOfBotDayUtcIso } = require('../helpers/botTime');
+const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const db = require('../db');
 
 module.exports = {
@@ -37,6 +38,7 @@ module.exports = {
         await interaction.deferReply();
 
         try {
+            await awaitInteractionStateRefresh(interaction, 'reviews');
             const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
             const timeZone = resolveTimeZone(settings?.timezone);
             const today = botDateKey(new Date(), timeZone);

@@ -1,15 +1,22 @@
 const { PermissionFlagsBits } = require('discord.js');
 const db = require('../db');
 
+function normalizeDiscordId(value) {
+    return String(value ?? '')
+        .trim()
+        .replace(/^<@!?/, '')
+        .replace(/>$/, '');
+}
+
 function getMasterIds() {
     return (process.env.MASTER || '')
-        .split(',')
-        .map(s => s.trim())
+        .split(/[,\s]+/)
+        .map(normalizeDiscordId)
         .filter(Boolean);
 }
 
 function isMaster(userId) {
-    return getMasterIds().includes(userId);
+    return getMasterIds().includes(normalizeDiscordId(userId));
 }
 
 async function isModerator(interaction) {
