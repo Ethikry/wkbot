@@ -4,6 +4,7 @@ const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { base, error, renderMonthlyHeatmap } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
 const { DEFAULT_TIME_ZONE, addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const db = require('../db');
 
 const HEATMAP_DAYS = 30;
@@ -40,6 +41,7 @@ module.exports = {
         await interaction.deferReply();
 
         try {
+            await awaitInteractionStateRefresh(interaction, 'wkstats');
             const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
             const timeZone = resolveTimeZone(settings?.timezone);
             const today = botDateKey(new Date(), timeZone);
@@ -87,7 +89,7 @@ module.exports = {
                         name: '📅 30 Day Heatmap',
                         value: [
                             heatmap,
-                            `**${totalReviews}** reviews · **${totalLessons}** lessons in the last 30 days`,
+                            `**${totalReviews}** reviews · **${totalLessons}** lessons completed in the last 30 days`,
                         ].join('\n'),
                         inline: false,
                     },

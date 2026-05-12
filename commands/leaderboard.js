@@ -2,6 +2,7 @@ const { SlashCommandBuilder } = require('discord.js');
 const { base, error } = require('../helpers/embeds');
 const { addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const { buildWeeklyExtras } = require('../helpers/weeklyExtras');
+const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const db = require('../db');
 
 module.exports = {
@@ -12,6 +13,7 @@ module.exports = {
 
     async execute(interaction) {
         await interaction.deferReply();
+        await awaitInteractionStateRefresh(interaction, 'leaderboard');
 
         const guildId = interaction.guild.id;
         const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);

@@ -849,23 +849,23 @@ async function paceAlertJob(client) {
                     getRemainingLessonsForGoal(account, goal.target_level, account.level).catch(() => null),
                     computeFastestPaceDays(account, account.level, goal.target_level).catch(() => null),
                 ]);
-                const proj = projectPace({
+                const physicalProj = projectPace({
                     targetLevel: goal.target_level,
                     currentLevel: account.level,
                     deadline: goal.deadline,
-                    hitRate: goal.hit_rate,
+                    hitRate: 1.0,
                     dailyLessons: goal.daily_lessons,
                     itemCounts,
                     srsDaysPerLevel: fastest?.avgDaysPerLevel,
                 });
 
-                if (proj.underWaniKaniMinimum) {
-                    const levelsRemaining = proj.levelsRemaining;
+                if (physicalProj.underWaniKaniMinimum) {
+                    const levelsRemaining = physicalProj.levelsRemaining;
                     embed = new EmbedBuilder()
                         .setColor(COLOR_ERROR)
                         .setTitle('⛔ Goal no longer attainable')
                         .setDescription([
-                            `Your deadline is **${goal.deadline}** (${proj.daysRemaining} day${proj.daysRemaining === 1 ? '' : 's'} away), but reaching **Level ${goal.target_level}** from Level ${account.level} now needs at least **${proj.minimumSrsDays} days** under WaniKani's SRS at your hit rate (${(proj.effectiveHitRate * 100).toFixed(0)}%).`,
+                            `Your deadline is **${goal.deadline}** (${physicalProj.daysRemaining} day${physicalProj.daysRemaining === 1 ? '' : 's'} away), but reaching **Level ${goal.target_level}** from Level ${account.level} now needs at least **${physicalProj.minimumSrsDays} days** under WaniKani's SRS timing.`,
                             `That's ${levelsRemaining} level${levelsRemaining === 1 ? '' : 's'} to clear and the SRS timing simply doesn't fit anymore.`,
                             '',
                             'Run `/goals` to extend the deadline, lower the target, or clear the goal.',
@@ -874,14 +874,14 @@ async function paceAlertJob(client) {
                         ].join('\n'))
                         .setTimestamp()
                         .setFooter(FOOTER);
-                } else if (!proj.feasibleAtPace) {
-                    const overshoot = proj.projectedDays - proj.daysRemaining;
+                } else if (!physicalProj.feasibleAtPace) {
+                    const overshoot = physicalProj.projectedDays - physicalProj.daysRemaining;
                     embed = new EmbedBuilder()
                         .setColor(COLOR_WARN)
                         .setTitle('⚠️ Falling behind your goal')
                         .setDescription([
-                            `At **${proj.lessonsPerDay} lessons/day** you'd finish around **${proj.projectedFinish}** — about **${overshoot} day${overshoot === 1 ? '' : 's'}** past your deadline (${goal.deadline}).`,
-                            `${proj.totalLessons} lesson${proj.totalLessons === 1 ? '' : 's'} remain across ${proj.levelsRemaining} level${proj.levelsRemaining === 1 ? '' : 's'}.`,
+                            `At **${physicalProj.lessonsPerDay} lessons/day** you'd finish around **${physicalProj.projectedFinish}** — about **${overshoot} day${overshoot === 1 ? '' : 's'}** past your deadline (${goal.deadline}).`,
+                            `${physicalProj.totalLessons} lesson${physicalProj.totalLessons === 1 ? '' : 's'} remain across ${physicalProj.levelsRemaining} level${physicalProj.levelsRemaining === 1 ? '' : 's'}.`,
                             'Bumping your daily lessons up will close the gap; run `/goals` to adjust.',
                             '',
                             'Disable with `/goals` → Configure alerts.',
@@ -954,13 +954,17 @@ async function paceAlertJob(client) {
 // missed cron without making the loop expensive.
 const SNAPSHOT_LOOKBACK_DAYS = 3;
 
-async function updateSnapshotsAndStreaks(guildId, rows) {
+async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
     const settings = await getOrCreateSettings(guildId);
     const timeZone = resolveTimeZone(settings.timezone);
     const {
-        ensureUserSynced, ensureReviewStatsSynced,
+        ensureUserSynced, ensureSummarySynced, ensureReviewStatsSynced,
         getCompletedItemsSince, getSrsBreakdown,
     } = require('./helpers/wanikaniData');
+    const userMaxAgeMs = options.userMaxAgeMs ?? 0;
+    const summaryMaxAgeMs = options.summaryMaxAgeMs ?? 60 * 1000;
+    const reviewStatsMaxAgeMs = options.reviewStatsMaxAgeMs ?? 0;
+    const assignmentMaxAgeMs = options.assignmentMaxAgeMs ?? 4 * 60 * 1000;
 
     // Build the list of guild-local days we'll write snapshots for, with the
     // window boundaries needed to bucket assignments updates into them.
@@ -975,8 +979,9 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
 
     for (const row of rows) {
         try {
-            await ensureUserSynced(row, 0);
-            await ensureReviewStatsSynced(row, 0);
+            await ensureUserSynced(row, userMaxAgeMs);
+            await ensureSummarySynced(row, summaryMaxAgeMs);
+            await ensureReviewStatsSynced(row, reviewStatsMaxAgeMs);
 
             const acct = await db.get(
                 `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
@@ -986,7 +991,7 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
             // ensureAssignmentsSynced is invoked inside getCompletedItemsSince
             // with a 4-min staleness floor — back-to-back callers (e.g. the
             // 5-min summaryRefreshJob) won't pile up redundant syncs.
-            const items = await getCompletedItemsSince(row, earliestStartISO);
+            const items = await getCompletedItemsSince(row, earliestStartISO, assignmentMaxAgeMs);
             const srs = await getSrsBreakdown(row);
             const totals = await db.get(
                 `SELECT COUNT(*) AS total_assignments,
@@ -1155,7 +1160,7 @@ async function updateSnapshotsAndStreaks(guildId, rows) {
 // every guild this user belongs to and runs updateSnapshotsAndStreaks against
 // it, so a user's heatmap and streak come alive within minutes of a review
 // rather than waiting for the nightly daily job.
-async function updateSnapshotsAndStreaksForAccount(account) {
+async function updateSnapshotsAndStreaksForAccount(account, options = {}) {
     const memberships = await db.all(
         `SELECT guild_id FROM guild_members WHERE discord_user_id = ?`,
         [account.discord_user_id]
@@ -1166,7 +1171,7 @@ async function updateSnapshotsAndStreaksForAccount(account) {
             wanikani_user_id: account.wanikani_user_id,
             api_token_encrypted: account.api_token_encrypted,
         };
-        await updateSnapshotsAndStreaks(m.guild_id, [row]);
+        await updateSnapshotsAndStreaks(m.guild_id, [row], options);
     }
 }
 
@@ -1259,6 +1264,7 @@ module.exports = {
     dailyGlobalsAndUserSyncJob,
     paceAlertJob,
     updateSnapshotsAndStreaks,
+    updateSnapshotsAndStreaksForAccount,
     botDateStr,
     utcDateStr,
 };
