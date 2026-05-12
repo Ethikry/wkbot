@@ -78,17 +78,18 @@ module.exports = {
                     { name: 'Lessons Pending', value: `${pendingLessons}`, inline: true },
                     { name: 'Reviews Due', value: `**${dueRightNow}** now · +${next24Excl} next 24h`, inline: true },
                     { name: '🔓 Level Progress', value: levelProgressLine, inline: false },
-                    { name: '​', value: '**SRS Breakdown**', inline: false },
-                    { name: `🌱 Apprentice: ${srs.apprentice}`, value: '​', inline: true },
-                    { name: `🌿 Guru: ${srs.guru}`, value: '​', inline: true },
-                    { name: `🌳 Master: ${srs.master}`, value: '​', inline: true },
-                    { name: `✨ Enlightened: ${srs.enlightened}`, value: '​', inline: true },
-                    { name: `🔥 Burned: ${srs.burned}`, value: '​', inline: true },
+                    {
+                        name: '📚 SRS',
+                        value:
+                            `🌱 Apprentice **${srs.apprentice}** · 🌿 Guru **${srs.guru}** · 🌳 Master **${srs.master}**\n` +
+                            `✨ Enlightened **${srs.enlightened}** · 🔥 Burned **${srs.burned}**`,
+                        inline: false,
+                    },
                     {
                         name: '📅 30 Day Heatmap',
                         value: [
                             heatmap,
-                            `**${totalReviews}** reviews · **${totalLessons}** lessons`,
+                            `**${totalReviews}** reviews · **${totalLessons}** lessons completed in the last 30 days`,
                         ].join('\n'),
                         inline: false,
                     },
@@ -123,9 +124,10 @@ function formatLevelProgress(level, progress) {
         lines.push('Kanji at Guru+: *(none unlocked yet at this level)*');
     }
 
-    // Radicals don't gate level-up directly (only kanji 90% does), but they're
-    // a useful signal of how far through the level the user is.
-    if (r.total > 0) {
+    // Radicals don't gate level-up directly (only kanji 90% does), but they
+    // indirectly gate kanji unlocks. Hide the line once all radicals on this
+    // level are Guru+ — at that point they no longer affect level-up.
+    if (r.total > 0 && r.passed < r.total) {
         lines.push(`Radicals at Guru+: **${r.passed}/${r.total}** (${r.percent}%)`);
     }
 
