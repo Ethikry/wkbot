@@ -23,6 +23,7 @@ const { warnIfMissing } = require('./helpers/crypto');
 const { error: errorEmbed } = require('./helpers/embeds');
 const { recordCommandStart, recordCommandFinish } = require('./helpers/commandUsage');
 const { startInteractionStateRefresh } = require('./helpers/interactionState');
+const { getMasterIds } = require('./helpers/permissions');
 
 async function main() {
     if (!process.env.TOKEN) {
@@ -61,6 +62,36 @@ async function main() {
 
     client.once(Events.ClientReady, async (readyClient) => {
         console.log(`Logged in as ${readyClient.user.tag}`);
+
+        const masterIds = getMasterIds();
+        if (masterIds.length === 0) {
+            console.log('[bootstrap] Master users: (none configured)');
+        } else {
+            const names = await Promise.all(masterIds.map(async (id) => {
+                try {
+                    const user = await readyClient.users.fetch(id);
+                    return user.displayName;
+                } catch {
+                    return `${id} (unresolved)`;
+                }
+            }));
+            console.log(`[bootstrap] Master users: ${names.join(', ')}`);
+        }
+
+        const guildNames = [...readyClient.guilds.cache.values()].map(g => g.name).sort();
+        if (guildNames.length === 0) {
+            console.log('[bootstrap] Connected servers: (none)');
+        } else {
+            console.log(`[bootstrap] Connected servers (${guildNames.length}): ${guildNames.join(', ')}`);
+        }
+
+        try {
+            const row = await db.get('SELECT COUNT(*) AS n FROM wanikani_accounts');
+            console.log(`[bootstrap] Linked WaniKani accounts: ${row?.n ?? 0}`);
+        } catch (err) {
+            console.warn('[bootstrap] Failed to count linked WaniKani accounts:', err);
+        }
+
         try {
             await scheduleAll(readyClient);
             console.log('Schedules initialized');
