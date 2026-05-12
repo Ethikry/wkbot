@@ -53,7 +53,7 @@ function bucketEmoji(reviews) {
 
 function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone = getBotTimeZone()) {
     const cells = recentDateKeys(days, timeZone).map(dateStr =>
-        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0).repeat(3)
+        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0)
     );
     const rows = [];
     for (let i = 0; i < cells.length; i += columns) {
@@ -62,15 +62,12 @@ function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone 
     return rows.join('\n');
 }
 
-const HEATMAP_LEGEND = '⬛ none · 🟦 <20 · 🟩 <50 · 🟨 <100 · 🟧 <200 · 🟥 200+';
-
 module.exports = {
     base,
     success,
     error,
     warn,
     renderMonthlyHeatmap,
-    HEATMAP_LEGEND,
     COLOR_PRIMARY,
     COLOR_SUCCESS,
     COLOR_ERROR,
