@@ -8,6 +8,7 @@ const TYPE_LABEL = {
     reviews_cleared:   '🧹 Reviews cleared',
     daily_summary:     '📅 Daily summary',
     shame:             '💢 Shame',
+    streak_risk:       '🔥 Streak risk',
 };
 
 const STATUS_ICON = {
@@ -29,6 +30,7 @@ module.exports = {
 
         const settings = await db.get(
             `SELECT reviews_ping_enabled, shame_enabled, cleared_enabled,
+                    streak_reminder_enabled,
                     dm_enabled, channel_enabled, min_review_count
              FROM reminder_settings
              WHERE guild_id = ? AND discord_user_id = ?`,
@@ -52,9 +54,10 @@ module.exports = {
         );
 
         const embed = base('🔔 Your Reminders').addFields(
-            { name: 'Daily ping', value: settings.reviews_ping_enabled ? 'on' : 'off', inline: true },
+            { name: 'Reviews-available DM', value: settings.reviews_ping_enabled ? 'on' : 'off', inline: true },
             { name: 'Shame messages', value: settings.shame_enabled ? 'on' : 'off', inline: true },
             { name: 'Queue-cleared announce', value: settings.cleared_enabled ? 'on' : 'off', inline: true },
+            { name: 'Streak risk DM', value: settings.streak_reminder_enabled ? 'on' : 'off', inline: true },
         );
 
         if (events.length === 0) {

@@ -31,7 +31,7 @@ const SCHEMA_V1 = [
         weekly_leaderboard_time TEXT NOT NULL DEFAULT '20:00',
         level_up_announcements_enabled INTEGER NOT NULL DEFAULT 1,
         burn_celebrations_enabled INTEGER NOT NULL DEFAULT 1,
-        reviews_cleared_announcements_enabled INTEGER NOT NULL DEFAULT 0,
+        reviews_cleared_announcements_enabled INTEGER NOT NULL DEFAULT 1,
         mod_role_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -274,6 +274,7 @@ const SCHEMA_V1 = [
         reviews_ping_enabled INTEGER NOT NULL DEFAULT 1,
         shame_enabled INTEGER NOT NULL DEFAULT 0,
         cleared_enabled INTEGER NOT NULL DEFAULT 1,
+        streak_reminder_enabled INTEGER NOT NULL DEFAULT 1,
         min_review_count INTEGER NOT NULL DEFAULT 1,
         dm_enabled INTEGER NOT NULL DEFAULT 1,
         channel_enabled INTEGER NOT NULL DEFAULT 0,
@@ -291,7 +292,7 @@ const SCHEMA_V1 = [
         guild_id TEXT NOT NULL,
         discord_user_id TEXT NOT NULL,
         wanikani_user_id TEXT NOT NULL,
-        reminder_type TEXT NOT NULL CHECK (reminder_type IN ('reviews_available', 'lessons_available', 'reviews_cleared', 'daily_summary', 'shame')),
+        reminder_type TEXT NOT NULL CHECK (reminder_type IN ('reviews_available', 'lessons_available', 'reviews_cleared', 'daily_summary', 'shame', 'streak_risk')),
         review_count INTEGER,
         lesson_count INTEGER,
         scheduled_for TEXT,
@@ -541,6 +542,84 @@ const SCHEMA_V8 = [
     `UPDATE daily_snapshots SET lessons_completed = 0 WHERE lessons_completed > 500`,
 ];
 
+// Default reviews-cleared announcements were off in the original schema; flip
+// existing guilds on so the feature actually fires. Admins can still disable
+// via /config if they don't want it.
+const SCHEMA_V9 = [
+    `UPDATE guild_settings
+        SET reviews_cleared_announcements_enabled = 1,
+            updated_at = CURRENT_TIMESTAMP
+      WHERE reviews_cleared_announcements_enabled = 0`,
+];
+
+// Reviews-available DMs used to share long_goals.last_alerted_* with the pace
+// alert. Account-scoped columns let either path fire independently and let
+// users without a long_goal receive the DM via reminder_settings.
+const SCHEMA_V10 = [
+    `ALTER TABLE wanikani_accounts ADD COLUMN last_reviews_alerted_at TEXT`,
+    `ALTER TABLE wanikani_accounts ADD COLUMN last_reviews_alerted_count INTEGER`,
+];
+
+// Streak-risk reminder: a new per-user opt-in flag + an expanded
+// reminder_events.reminder_type CHECK that includes 'streak_risk'. SQLite
+// can't alter a CHECK constraint in place, so the events table is rebuilt.
+const SCHEMA_V11 = [
+    `ALTER TABLE reminder_settings ADD COLUMN streak_reminder_enabled INTEGER NOT NULL DEFAULT 1`,
+    `CREATE TABLE reminder_events_v11 (
+        reminder_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        wanikani_user_id TEXT NOT NULL,
+        reminder_type TEXT NOT NULL CHECK (reminder_type IN ('reviews_available', 'lessons_available', 'reviews_cleared', 'daily_summary', 'shame', 'streak_risk')),
+        review_count INTEGER,
+        lesson_count INTEGER,
+        scheduled_for TEXT,
+        sent_at TEXT,
+        delivery_target TEXT NOT NULL CHECK (delivery_target IN ('dm', 'channel')),
+        discord_channel_id TEXT,
+        discord_message_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+        error TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (guild_id, discord_user_id) REFERENCES guild_members(guild_id, discord_user_id) ON DELETE CASCADE,
+        FOREIGN KEY (wanikani_user_id) REFERENCES wanikani_accounts(wanikani_user_id) ON DELETE CASCADE
+    )`,
+    `INSERT INTO reminder_events_v11 SELECT * FROM reminder_events`,
+    `DROP TABLE reminder_events`,
+    `ALTER TABLE reminder_events_v11 RENAME TO reminder_events`,
+    `CREATE INDEX IF NOT EXISTS idx_reminder_events_pending ON reminder_events(status, scheduled_for)`,
+    `CREATE INDEX IF NOT EXISTS idx_reminder_events_user_sent ON reminder_events(discord_user_id, sent_at)`,
+];
+
+// Guild-aggregate achievements. Definitions live alongside per-user ones; a
+// 'guild_*' category prefix distinguishes them. Guild unlocks have their own
+// table keyed only on (guild_id, achievement_key) — no user dimension.
+const GUILD_ACHIEVEMENT_DEFS_V12 = [
+    ['guild_10k_reviews',   'Ten Thousand Strong',   'Server members complete 10,000 cumulative reviews.',            'guild_volume'],
+    ['guild_100k_reviews',  'Hundred Thousand Club', 'Server members complete 100,000 cumulative reviews.',           'guild_volume'],
+    ['guild_1k_burns',      'Burned Together',       'Server members collectively burn 1,000 items.',                 'guild_burn'],
+    ['guild_10k_burns',     'Pyre Brigade',          'Server members collectively burn 10,000 items.',                'guild_burn'],
+    ['guild_all_level_10',  'Pleasant Together',     'Every member of the server reaches level 10 (needs ≥3 members).', 'guild_milestone'],
+    ['guild_all_level_30',  'Painful Together',      'Every member of the server reaches level 30 (needs ≥3 members).', 'guild_milestone'],
+    ['guild_streak_total_100', 'Streak Synergy',     'The server has 100 cumulative days of active streaks.',         'guild_streak'],
+].map(([key, name, description, category]) => (
+    `INSERT OR IGNORE INTO achievement_definitions (achievement_key, name, description, category)
+     VALUES (${[key, name, description, category].map(s => `'${s.replace(/'/g, "''")}'`).join(', ')})`
+));
+
+const SCHEMA_V12 = [
+    `CREATE TABLE IF NOT EXISTS guild_achievements (
+        guild_id TEXT NOT NULL,
+        achievement_key TEXT NOT NULL,
+        unlocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        metric_value INTEGER,
+        PRIMARY KEY (guild_id, achievement_key),
+        FOREIGN KEY (guild_id) REFERENCES guild_settings(guild_id) ON DELETE CASCADE,
+        FOREIGN KEY (achievement_key) REFERENCES achievement_definitions(achievement_key) ON DELETE CASCADE
+    )`,
+    ...GUILD_ACHIEVEMENT_DEFS_V12,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -550,6 +629,10 @@ const MIGRATIONS = [
     { version: 6, name: 'review_stat_counter_history', statements: SCHEMA_V6 },
     { version: 7, name: 'command_usage_log', statements: SCHEMA_V7 },
     { version: 8, name: 'zero_out_vacation_review_spikes', statements: SCHEMA_V8 },
+    { version: 9, name: 'enable_cleared_announcements_default', statements: SCHEMA_V9 },
+    { version: 10, name: 'wanikani_accounts_reviews_alerted', statements: SCHEMA_V10 },
+    { version: 11, name: 'streak_risk_reminders', statements: SCHEMA_V11 },
+    { version: 12, name: 'guild_achievements', statements: SCHEMA_V12 },
 ];
 
 async function runMigrations({ get, all, run }) {

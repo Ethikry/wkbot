@@ -3,7 +3,8 @@ const { fetchAllPages, getSubjectsByIds } = require('../helpers/wanikaniData');
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { decrypt } = require('../helpers/crypto');
 const { base, error } = require('../helpers/embeds');
-const { botDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { botDateKey, addDaysToDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { writeReviewStatSnapshots } = require('../helpers/reviewStatSnapshot');
 const db = require('../db');
 
 const MISTAKE_WINDOW_DAYS = 7;
@@ -80,7 +81,27 @@ module.exports = {
                  WHERE s.wanikani_user_id = ?`,
                 [wanikaniUserId, ...subjectIds, cutoffDateKey, wanikaniUserId]
             );
-            const baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
+            let baselineMap = new Map(snapRows.map(r => [r.subject_id, r]));
+
+            // Backfill: if any reviewed subjects have no pre-window snapshot
+            // (existing users from before the setup-time baseline landed), seed
+            // one at the cutoff date using current cumulative counts. Net
+            // effect is "no mistakes counted for pre-baseline period" — honest
+            // rather than skipping the subject entirely.
+            const missingSubjectIds = subjectIds.filter(id => !baselineMap.has(id));
+            if (missingSubjectIds.length > 0) {
+                const backfillDateKey = addDaysToDateKey(cutoffDateKey, -1);
+                await writeReviewStatSnapshots(account.wanikani_user_id, backfillDateKey);
+                const backfilled = await db.all(
+                    `SELECT subject_id, meaning_incorrect, reading_incorrect
+                     FROM review_stat_snapshots
+                     WHERE wanikani_user_id = ?
+                       AND subject_id IN (${missingSubjectIds.map(() => '?').join(',')})
+                       AND snapshot_date = ?`,
+                    [wanikaniUserId, ...missingSubjectIds, backfillDateKey]
+                );
+                for (const r of backfilled) baselineMap.set(r.subject_id, r);
+            }
 
             let skippedForBaseline = 0;
             const errored = currentStats.map(s => {
