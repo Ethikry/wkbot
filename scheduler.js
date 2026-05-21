@@ -19,6 +19,8 @@ const { pickShameLine } = require('./helpers/shame');
 const { generateShameLine } = require('./helpers/anthropic');
 const { logReminderEvent } = require('./helpers/reminderEvents');
 const { evaluateAchievements } = require('./helpers/achievements');
+const { evaluateGuildAchievements } = require('./helpers/guildAchievements');
+const { writeReviewStatSnapshots } = require('./helpers/reviewStatSnapshot');
 const { buildWeeklyExtras } = require('./helpers/weeklyExtras');
 const {
     DEFAULT_TIME_ZONE,
@@ -35,7 +37,6 @@ let dailySyncJobHandle = null;
 let paceAlertJobHandle = null;
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
-const TWENTY_HOURS_MS = 20 * 60 * 60 * 1000;
 const START_OF_BOT_DAY = (timeZone) => {
     const resolved = resolveTimeZone(timeZone);
     return startOfBotDayUtcIso(botDateStr(0, resolved), resolved);
@@ -160,7 +161,7 @@ function summaryEmbed(title, description, summaries) {
             const next24Excl = Math.max(0, s.dueNext24Hours - s.dueRightNow);
             embed.addFields({
                 name: s.username,
-                value: `Lvl **${s.level}** • Lessons **${s.pendingLessons}** • Now **${s.dueRightNow}** • Next 24h **+${next24Excl}**`,
+                value: `Lvl **${s.level}** • Lessons **${s.pendingLessons}** • Reviews **${s.dueRightNow}** • Next 24h **+${next24Excl}**`,
                 inline: false,
             });
         }
@@ -205,6 +206,32 @@ async function dailyJob(client, guildId) {
     }
 
     await updateSnapshotsAndStreaks(guildId, rows);
+
+    // Server-wide achievements run after snapshots so aggregate totals reflect
+    // today's activity. Announce newly unlocked ones to the output channel.
+    try {
+        const unlocked = await evaluateGuildAchievements(guildId);
+        if (unlocked.length) {
+            const channel = await resolveOutputChannel(guild, settings);
+            if (channel) {
+                const defs = await db.all(
+                    `SELECT achievement_key, name, description FROM achievement_definitions
+                     WHERE achievement_key IN (${unlocked.map(() => '?').join(',')})`,
+                    unlocked
+                );
+                const lines = defs.map(d => `🏆 **${d.name}** — ${d.description}`);
+                const embed = new EmbedBuilder()
+                    .setColor(COLOR_PRIMARY)
+                    .setTitle('🏰 Server Achievement Unlocked!')
+                    .setDescription(lines.join('\n'))
+                    .setTimestamp()
+                    .setFooter(FOOTER);
+                await channel.send({ embeds: [embed] });
+            }
+        }
+    } catch (err) {
+        console.error(`[guildAchievements] ${guildId}:`, err);
+    }
 }
 
 async function fetchShameContext(discordUserId) {
@@ -401,7 +428,7 @@ async function summaryRefreshJob(client) {
         try {
             await wkSync.syncSummary(account);
             await scheduleNextReviewTimer(client, account);
-            await maybeResetGoalAlertBaseline(account);
+            await maybeResetReviewsAlertBaseline(account);
             await updateSnapshotsAndStreaksForAccount(account).catch(err =>
                 console.error(`[summaryRefresh/snapshots] ${account.wanikani_user_id}:`, err)
             );
@@ -428,28 +455,29 @@ async function summaryRefreshJob(client) {
     }
 }
 
-// Reset the goal-alert baseline whenever the queue is observed empty so that
-// the next batch of unlocks correctly registers as "new reviews". Also keeps
-// the baseline in sync if the user does reviews without ever fully clearing —
-// once the count drops below the prior alert level, we shrink the baseline so
-// growth back above it triggers exactly one alert.
-async function maybeResetGoalAlertBaseline(account) {
+// Reset the reviews-available alert baseline whenever the queue is observed
+// empty so that the next batch of unlocks correctly registers as "new
+// reviews". Also keeps the baseline in sync if the user does reviews without
+// ever fully clearing — once the count drops below the prior alert level, we
+// shrink the baseline so growth back above it triggers exactly one alert.
+async function maybeResetReviewsAlertBaseline(account) {
     const cache = await db.get(
         `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
         [account.wanikani_user_id]
     );
     const dueRightNow = cache?.review_count_now ?? 0;
-    const goal = await db.get(
-        `SELECT last_alerted_review_count FROM long_goals WHERE discord_user_id = ?`,
-        [account.discord_user_id]
+    const acct = await db.get(
+        `SELECT last_reviews_alerted_count FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+        [account.wanikani_user_id]
     );
-    if (!goal) return;
-    const prev = goal.last_alerted_review_count ?? 0;
+    if (!acct) return;
+    const prev = acct.last_reviews_alerted_count ?? 0;
     if (dueRightNow < prev) {
         await db.run(
-            `UPDATE long_goals SET last_alerted_review_count = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE discord_user_id = ?`,
-            [dueRightNow, account.discord_user_id]
+            `UPDATE wanikani_accounts
+                SET last_reviews_alerted_count = ?, updated_at = CURRENT_TIMESTAMP
+              WHERE wanikani_user_id = ?`,
+            [dueRightNow, account.wanikani_user_id]
         );
     }
 }
@@ -581,15 +609,23 @@ async function reviewTimerFired(client, account) {
         console.warn(`[reviewTimer/syncSummary] ${account.wanikani_user_id}:`, err);
     }
 
-    const goal = await db.get(
-        `SELECT notify_enabled, last_alerted_at, last_alerted_review_count, target_level, deadline
-         FROM long_goals WHERE discord_user_id = ?`,
+    // Opt-in is now per-user via reminder_settings.reviews_ping_enabled —
+    // any guild row enabling it qualifies the user for the global DM.
+    const optIn = await db.get(
+        `SELECT 1 AS opted FROM reminder_settings
+         WHERE discord_user_id = ? AND reviews_ping_enabled = 1 LIMIT 1`,
         [account.discord_user_id]
     );
-    if (!goal || goal.notify_enabled !== 1) {
+    if (!optIn) {
         await scheduleNextReviewTimer(client, account);
         return;
     }
+
+    const acctState = await db.get(
+        `SELECT last_reviews_alerted_at, last_reviews_alerted_count
+         FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+        [account.wanikani_user_id]
+    );
 
     const cache = await db.get(
         `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
@@ -600,11 +636,12 @@ async function reviewTimerFired(client, account) {
     // When the queue empties, reset the alert baseline so the next unlock
     // is correctly recognised as "new reviews".
     if (dueRightNow <= 0) {
-        if ((goal.last_alerted_review_count ?? 0) !== 0) {
+        if ((acctState?.last_reviews_alerted_count ?? 0) !== 0) {
             await db.run(
-                `UPDATE long_goals SET last_alerted_review_count = 0, updated_at = CURRENT_TIMESTAMP
-                 WHERE discord_user_id = ?`,
-                [account.discord_user_id]
+                `UPDATE wanikani_accounts
+                    SET last_reviews_alerted_count = 0, updated_at = CURRENT_TIMESTAMP
+                  WHERE wanikani_user_id = ?`,
+                [account.wanikani_user_id]
             );
         }
         await scheduleNextReviewTimer(client, account);
@@ -613,7 +650,7 @@ async function reviewTimerFired(client, account) {
 
     // Only alert when the count actually grew since the last alert — otherwise
     // a non-empty queue would re-page the user every time a new bucket unlocks.
-    const prevCount = goal.last_alerted_review_count ?? 0;
+    const prevCount = acctState?.last_reviews_alerted_count ?? 0;
     if (dueRightNow <= prevCount) {
         await scheduleNextReviewTimer(client, account);
         return;
@@ -621,8 +658,8 @@ async function reviewTimerFired(client, account) {
 
     // Small floor against the 5-minute summaryRefreshJob racing the timer for
     // the same unlock — avoids double-DM during the overlap window.
-    if (goal.last_alerted_at) {
-        const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
+    if (acctState?.last_reviews_alerted_at) {
+        const ageMs = Date.now() - new Date(acctState.last_reviews_alerted_at).getTime();
         if (ageMs >= 0 && ageMs < 5 * 60 * 1000) {
             await scheduleNextReviewTimer(client, account);
             return;
@@ -650,7 +687,7 @@ async function reviewTimerFired(client, account) {
         }
         lines.push(
             '',
-            'Disable with `/goals` → Configure alerts.'
+            'Disable with `/setup ping:false`.'
         );
         const embed = new EmbedBuilder()
             .setColor(COLOR_PRIMARY)
@@ -661,10 +698,12 @@ async function reviewTimerFired(client, account) {
         try {
             const sent = await user.send({ embeds: [embed] });
             await db.run(
-                `UPDATE long_goals
-                 SET last_alerted_at = ?, last_alerted_review_count = ?, updated_at = CURRENT_TIMESTAMP
-                 WHERE discord_user_id = ?`,
-                [new Date().toISOString(), dueRightNow, account.discord_user_id]
+                `UPDATE wanikani_accounts
+                    SET last_reviews_alerted_at = ?,
+                        last_reviews_alerted_count = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                  WHERE wanikani_user_id = ?`,
+                [new Date().toISOString(), dueRightNow, account.wanikani_user_id]
             );
             await logReminderEvent({
                 discordUserId: account.discord_user_id,
@@ -697,6 +736,42 @@ async function reviewTimerFired(client, account) {
 // is not time-critical, so it runs once per hour against freshly-synced caches.
 
 async function slowDetectionJob(client) {
+    // Sync each WaniKani account exactly once per tick, capturing
+    // previous/current level (and burned count) before any guild loop runs.
+    // Doing the sync inside the per-guild loop caused multi-guild users to
+    // miss level-up announcements in every guild after the first: the second
+    // guild's "previous" read picked up the already-synced row, so the diff
+    // was always zero.
+    const accountRows = await db.all(
+        `SELECT DISTINCT wa.wanikani_user_id, wa.discord_user_id, wa.api_token_encrypted
+         FROM wanikani_accounts wa
+         JOIN guild_members gm ON gm.discord_user_id = wa.discord_user_id`
+    );
+
+    const accountState = new Map(); // wanikani_user_id -> { previousLevel, level, burned }
+    for (const row of accountRows) {
+        try {
+            const accountBefore = await db.get(
+                `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+                [row.wanikani_user_id]
+            );
+            const previousLevel = accountBefore?.level ?? null;
+
+            await wkSync.syncUser(row);
+            await wkSync.syncAssignments(row);
+
+            const accountAfter = await db.get(
+                `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+                [row.wanikani_user_id]
+            );
+            const level = accountAfter?.level ?? previousLevel;
+            const burned = await getBurnedCount(row).catch(() => null);
+            accountState.set(row.wanikani_user_id, { previousLevel, level, burned });
+        } catch (err) {
+            console.error(`[slowDetection/sync] ${row.wanikani_user_id}:`, err);
+        }
+    }
+
     for (const guild of client.guilds.cache.values()) {
         try {
             const settings = await getOrCreateSettings(guild.id);
@@ -705,30 +780,16 @@ async function slowDetectionJob(client) {
             for (const row of rows) {
                 try {
                     const apiKey = decrypt(row.api_token_encrypted);
-                    const accountBefore = await db.get(
-                        `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
-                        [row.wanikani_user_id]
-                    );
-                    const previousLevel = accountBefore?.level ?? null;
+                    const state = accountState.get(row.wanikani_user_id);
+                    if (!state) continue;
+                    const { previousLevel, level, burned } = state;
 
-                    await wkSync.syncUser(row);
-                    await wkSync.syncAssignments(row);
-
-                    const accountAfter = await db.get(
-                        `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
-                        [row.wanikani_user_id]
-                    );
-                    const level = accountAfter?.level ?? previousLevel;
-                    const burned = settings.burn_celebrations_enabled
-                        ? await getBurnedCount(row).catch(() => null)
-                        : null;
-
-                    const state = await db.get(
+                    const lastResetState = await db.get(
                         `SELECT last_reset_checked_at FROM bot_user_state
                          WHERE guild_id = ? AND discord_user_id = ?`,
                         [guild.id, row.discord_user_id]
                     );
-                    await checkUserResets(apiKey, row.discord_user_id, guild.id, row.wanikani_user_id, state?.last_reset_checked_at ?? null);
+                    await checkUserResets(apiKey, row.discord_user_id, guild.id, row.wanikani_user_id, lastResetState?.last_reset_checked_at ?? null);
 
                     if (
                         channel &&
@@ -743,6 +804,8 @@ async function slowDetectionJob(client) {
                             .setTimestamp()
                             .setFooter(FOOTER);
                         await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
+                    } else if (previousLevel === null) {
+                        console.log(`[slowDetection] ${row.discord_user_id}@${guild.id}: no prior level, skipping level-up announcement (first sync)`);
                     }
 
                     const burnKey = `${guild.id}::${row.discord_user_id}`;
@@ -826,9 +889,20 @@ async function paceAlertJob(client) {
 
     for (const goal of goals) {
         try {
+            // Pick the user's primary guild timezone so "same bot-day" lines
+            // up with the day they perceive (their daily summary's day).
+            const tzRow = await db.get(
+                `SELECT gs.timezone FROM guild_members gm
+                 JOIN guild_settings gs ON gs.guild_id = gm.guild_id
+                 WHERE gm.discord_user_id = ?
+                 ORDER BY gm.joined_bot_at ASC LIMIT 1`,
+                [goal.discord_user_id]
+            );
+            const tz = resolveTimeZone(tzRow?.timezone);
+            const todayKey = botDateStr(0, tz);
             if (goal.last_alerted_at) {
-                const ageMs = Date.now() - new Date(goal.last_alerted_at).getTime();
-                if (ageMs >= 0 && ageMs < TWENTY_HOURS_MS) continue;
+                const lastDayKey = botDateKey(new Date(goal.last_alerted_at), tz);
+                if (lastDayKey === todayKey) continue;
             }
 
             // Load fresh account state — current level drives the projection,
@@ -839,10 +913,19 @@ async function paceAlertJob(client) {
                 [goal.wanikani_user_id]
             );
 
+            // Always refresh the projection timestamp so /goals callers and
+            // ops can tell when the job last evaluated this goal — even if no
+            // alert is emitted today.
+            await db.run(
+                `UPDATE long_goals SET last_projection_at = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE discord_user_id = ?`,
+                [new Date().toISOString(), goal.discord_user_id]
+            );
+
             // Severity ladder: attainability → cumulative pace → today's
             // ratio. Higher tiers subsume lower ones so we only send the most
-            // serious applicable alert (and the 20-hour gate above keeps us
-            // from re-paging every cron tick).
+            // serious applicable alert (and the same-bot-day gate above keeps
+            // us from re-paging within the user's day).
             let embed = null;
             if (account && goal.deadline && goal.target_level > account.level) {
                 const [itemCounts, fastest] = await Promise.all([
@@ -947,6 +1030,123 @@ async function paceAlertJob(client) {
             console.error(`[paceAlert] ${goal.discord_user_id}:`, err);
         }
     }
+}
+
+// Fires ~2 hours before the guild's daily_summary_time. For each member with
+// an active streak whose last review was yesterday (not today), checks the
+// live queue: if reviews are due and none have been done today, the streak is
+// at risk. Sends either a shame DM (if the user opted in) or a gentle nudge.
+async function streakRiskJob(client, guildId) {
+    console.log(`[streakRisk] guild=${guildId}`);
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return;
+    const settings = await getOrCreateSettings(guildId);
+    const tz = resolveTimeZone(settings.timezone);
+    const today = botDateStr(0, tz);
+    const yesterday = botDateStr(-1, tz);
+
+    const candidates = await db.all(
+        `SELECT
+             gm.discord_user_id,
+             wa.wanikani_user_id,
+             wa.current_vacation_started_at,
+             s.current_streak,
+             COALESCE(rs.streak_reminder_enabled, 1) AS streak_reminder_enabled,
+             COALESCE(rs.shame_enabled, 0) AS shame_enabled,
+             COALESCE(cache.review_count_now, 0) AS due_now,
+             COALESCE(ds.reviews_completed, 0) AS reviews_today
+         FROM guild_members gm
+         JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
+         JOIN streaks s ON s.guild_id = gm.guild_id AND s.discord_user_id = gm.discord_user_id
+         LEFT JOIN reminder_settings rs
+             ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
+         LEFT JOIN wk_summary_cache cache ON cache.wanikani_user_id = wa.wanikani_user_id
+         LEFT JOIN daily_snapshots ds
+             ON ds.guild_id = gm.guild_id
+             AND ds.discord_user_id = gm.discord_user_id
+             AND ds.snapshot_date = ?
+         WHERE gm.guild_id = ?
+           AND s.current_streak >= 1
+           AND s.last_review_date = ?`,
+        [today, guildId, yesterday]
+    );
+
+    for (const c of candidates) {
+        if (c.current_vacation_started_at) continue;
+        if (c.due_now <= 0) continue;
+        if (c.reviews_today > 0) continue;
+        const wantsShame = c.shame_enabled === 1;
+        const wantsGentle = c.streak_reminder_enabled === 1;
+        if (!wantsShame && !wantsGentle) continue;
+
+        try {
+            const user = await client.users.fetch(c.discord_user_id).catch(() => null);
+            if (!user) continue;
+
+            let embed;
+            if (wantsShame) {
+                const userTag = `<@${c.discord_user_id}>`;
+                const ctx = await fetchShameContext(c.discord_user_id);
+                const generated = await generateShameLine({
+                    user: userTag,
+                    name: '',
+                    lessons: 0,
+                    medal: '',
+                    level: ctx.level,
+                    knownKanji: ctx.knownKanji,
+                }).catch(() => null);
+                const body = generated ?? pickShameLine({ user: userTag });
+                embed = new EmbedBuilder()
+                    .setColor(COLOR_WARN)
+                    .setTitle('💢 Your streak is on the line')
+                    .setDescription(`${body}\n\n**${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting · **${c.current_streak}**-day streak at risk.`)
+                    .setTimestamp()
+                    .setFooter(FOOTER);
+            } else {
+                embed = new EmbedBuilder()
+                    .setColor(COLOR_WARN)
+                    .setTitle('🔥 Streak about to break')
+                    .setDescription([
+                        `You have **${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting and a **${c.current_streak}**-day streak on the line.`,
+                        'Clear at least one review today to keep the streak alive.',
+                        '',
+                        'Disable with `/setup` (streak reminders).',
+                    ].join('\n'))
+                    .setTimestamp()
+                    .setFooter(FOOTER);
+            }
+
+            const sent = await user.send({ embeds: [embed] });
+            await logReminderEvent({
+                guildId,
+                discordUserId: c.discord_user_id,
+                wanikaniUserId: c.wanikani_user_id,
+                reminderType: wantsShame ? 'shame' : 'streak_risk',
+                deliveryTarget: 'dm',
+                reviewCount: c.due_now,
+                messageId: sent?.id ?? null,
+                status: 'sent',
+            }).catch(e => console.error('[logReminderEvent/streakRisk]', e));
+        } catch (err) {
+            console.warn(`[streakRisk] ${c.discord_user_id}@${guildId}:`, err);
+            await logReminderEvent({
+                guildId,
+                discordUserId: c.discord_user_id,
+                wanikaniUserId: c.wanikani_user_id,
+                reminderType: wantsShame ? 'shame' : 'streak_risk',
+                deliveryTarget: 'dm',
+                reviewCount: c.due_now,
+                status: 'failed',
+                error: err.message,
+            }).catch(e => console.error('[logReminderEvent/streakRisk failed]', e));
+        }
+    }
+}
+
+function shiftTime(time, deltaHours) {
+    const [h, m] = time.split(':').map(Number);
+    const total = (h * 60 + m + deltaHours * 60 + 24 * 60) % (24 * 60);
+    return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
 }
 
 // Number of days the per-call lookback covers. Choosing 3 means we backfill
@@ -1142,30 +1342,7 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
 
             // Snapshot review_statistics for /mistakes baselines using today's
             // local date so the baseline join lines up with bot-day history.
-            const recentStats = await db.all(
-                `SELECT subject_id, meaning_incorrect, reading_incorrect, percentage_correct
-                 FROM wk_review_statistics
-                 WHERE wanikani_user_id = ? AND hidden = 0`,
-                [row.wanikani_user_id]
-            );
-            for (const s of recentStats) {
-                await db.run(
-                    `INSERT INTO review_stat_snapshots (
-                        wanikani_user_id, subject_id, snapshot_date,
-                        meaning_incorrect, reading_incorrect, percentage_correct
-                     ) VALUES (?, ?, ?, ?, ?, ?)
-                     ON CONFLICT(wanikani_user_id, subject_id, snapshot_date) DO UPDATE SET
-                        meaning_incorrect = excluded.meaning_incorrect,
-                        reading_incorrect = excluded.reading_incorrect,
-                        percentage_correct = excluded.percentage_correct`,
-                    [
-                        row.wanikani_user_id, s.subject_id, today,
-                        s.meaning_incorrect || 0,
-                        s.reading_incorrect || 0,
-                        s.percentage_correct || 0,
-                    ]
-                );
-            }
+            await writeReviewStatSnapshots(row.wanikani_user_id, today);
 
             await db.run(
                 `DELETE FROM review_stat_snapshots
@@ -1223,6 +1400,14 @@ async function scheduleGuild(client, guildId) {
             { timezone: tz }
         ));
     }
+
+    // Streak-risk check ~2 hours before the bot-day rollover so users get a
+    // nudge with time left to do at least one review.
+    addJob(guildId, cron.schedule(
+        cronExpr(shiftTime(settings.daily_summary_time, -2)),
+        () => streakRiskJob(client, guildId).catch(err => console.error('[streakRiskJob]', err)),
+        { timezone: tz }
+    ));
 }
 
 async function rescheduleGuild(client, guildId) {
@@ -1285,6 +1470,7 @@ module.exports = {
     slowDetectionJob,
     dailyGlobalsAndUserSyncJob,
     paceAlertJob,
+    streakRiskJob,
     updateSnapshotsAndStreaks,
     updateSnapshotsAndStreaksForAccount,
     botDateStr,

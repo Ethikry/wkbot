@@ -119,7 +119,7 @@ function formatLevelProgress(level, progress) {
     if (k.total > 0) {
         const ready = k.passed >= k.threshold;
         lines.push(
-            `Kanji to level up: ${progressBar(k.passed, k.threshold)} **${k.passed}/${k.threshold}** (${k.percent}%)` +
+            `Kanji at Guru+: ${progressBar(k.passed, k.threshold)} **${k.passed}/${k.threshold}** (${k.percent}%)` +
             (ready ? ' — ready to level up! 🎉' : ` — ${k.remaining} to go`)
         );
     } else {

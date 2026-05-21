@@ -3,7 +3,14 @@ const { isApiKeyFormatValid } = require('../helpers/apikeyTest');
 const { encrypt } = require('../helpers/crypto');
 const { success, error, base } = require('../helpers/embeds');
 const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
+const { recordPoll } = require('../helpers/zerostate');
+const wkSync = require('../helpers/wkSync');
+const { ensureReviewStatsSynced } = require('../helpers/wanikaniData');
+const { writeReviewStatSnapshots } = require('../helpers/reviewStatSnapshot');
+const { botDateKey, addDaysToDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
+
+const MISTAKE_WINDOW_DAYS = 7;
 
 const WK_REVISION = '20170710';
 
@@ -19,7 +26,7 @@ module.exports = {
         )
         .addBooleanOption(opt =>
             opt.setName('ping')
-                .setDescription('Receive daily ping with your stats')
+                .setDescription('DM me when new reviews unlock')
                 .setRequired(false)
         )
         .addBooleanOption(opt =>
@@ -31,6 +38,11 @@ module.exports = {
             opt.setName('cleared')
                 .setDescription('Announce in channel when you clear your review queue (requires server to have this enabled)')
                 .setRequired(false)
+        )
+        .addBooleanOption(opt =>
+            opt.setName('streak')
+                .setDescription('DM me before my review streak breaks')
+                .setRequired(false)
         ),
 
     async execute(interaction) {
@@ -38,6 +50,7 @@ module.exports = {
         const pingOpt = interaction.options.getBoolean('ping');
         const shameOpt = interaction.options.getBoolean('shame');
         const clearedOpt = interaction.options.getBoolean('cleared');
+        const streakOpt = interaction.options.getBoolean('streak');
         const discordUserId = interaction.user.id;
         const guildId = interaction.guild.id;
         const displayName = interaction.member?.displayName ?? interaction.user.username;
@@ -77,6 +90,12 @@ module.exports = {
 
         if (apiKey) {
             await upsertWanikaniAccount(discordUserId, apiKey, wkUser);
+            // Seed wk_summary_cache and a queue_history bootstrap row so the
+            // cleared-queue detector has a "before" sample if the user clears
+            // before the first 5-minute summary refresh.
+            await bootstrapSummary(discordUserId, guildId).catch(err =>
+                console.warn(`[setup/bootstrapSummary] ${discordUserId}:`, err)
+            );
         } else if (!existingAccount) {
             return interaction.editReply({
                 embeds: [error(
@@ -87,7 +106,8 @@ module.exports = {
         }
 
         const existingReminders = await db.get(
-            `SELECT reviews_ping_enabled, shame_enabled, cleared_enabled FROM reminder_settings
+            `SELECT reviews_ping_enabled, shame_enabled, cleared_enabled, streak_reminder_enabled
+             FROM reminder_settings
              WHERE guild_id = ? AND discord_user_id = ?`,
             [guildId, discordUserId]
         );
@@ -101,17 +121,21 @@ module.exports = {
         const cleared = clearedOpt === null
             ? (existingReminders?.cleared_enabled ?? 1)
             : (clearedOpt ? 1 : 0);
+        const streak = streakOpt === null
+            ? (existingReminders?.streak_reminder_enabled ?? 1)
+            : (streakOpt ? 1 : 0);
 
         await db.run(
             `INSERT INTO reminder_settings
-                (guild_id, discord_user_id, reviews_ping_enabled, shame_enabled, cleared_enabled)
-             VALUES (?, ?, ?, ?, ?)
+                (guild_id, discord_user_id, reviews_ping_enabled, shame_enabled, cleared_enabled, streak_reminder_enabled)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
                 reviews_ping_enabled = excluded.reviews_ping_enabled,
                 shame_enabled = excluded.shame_enabled,
                 cleared_enabled = excluded.cleared_enabled,
+                streak_reminder_enabled = excluded.streak_reminder_enabled,
                 updated_at = CURRENT_TIMESTAMP`,
-            [guildId, discordUserId, ping, shame, cleared]
+            [guildId, discordUserId, ping, shame, cleared, streak]
         );
 
         if (apiKey || !existingAccount) {
@@ -120,21 +144,23 @@ module.exports = {
                     'Setup Complete',
                     [
                         wkUser ? `Linked to WaniKani user **${wkUser.username}** (level ${wkUser.level}).` : 'Account linked.',
-                        `Daily pings: **${ping ? 'enabled' : 'disabled'}**.`,
+                        `Reviews-available DM: **${ping ? 'enabled' : 'disabled'}**.`,
                         `Shame messages: **${shame ? 'enabled' : 'disabled'}**.`,
                         `Queue-cleared announcements: **${cleared ? 'enabled' : 'disabled'}**.`,
+                        `Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`,
                     ].join('\n')
                 )],
             });
         }
 
         const lines = [];
-        if (pingOpt !== null) lines.push(`Daily pings: **${ping ? 'enabled' : 'disabled'}**.`);
+        if (pingOpt !== null) lines.push(`Reviews-available DM: **${ping ? 'enabled' : 'disabled'}**.`);
         if (shameOpt !== null) lines.push(`Shame messages: **${shame ? 'enabled' : 'disabled'}**.`);
         if (clearedOpt !== null) lines.push(`Queue-cleared announcements: **${cleared ? 'enabled' : 'disabled'}**.`);
+        if (streakOpt !== null) lines.push(`Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`);
 
         if (lines.length === 0) {
-            return interaction.editReply({ embeds: [showUserSettings({ ping, shame, cleared })] });
+            return interaction.editReply({ embeds: [showUserSettings({ ping, shame, cleared, streak })] });
         }
         return interaction.editReply({
             embeds: [success('Settings Updated', lines.join('\n'))],
@@ -187,6 +213,41 @@ async function upsertGuildMember(guildId, discordUserId) {
     );
 }
 
+async function bootstrapSummary(discordUserId, guildId) {
+    const account = await db.get(
+        `SELECT wanikani_user_id, api_token_encrypted FROM wanikani_accounts
+         WHERE discord_user_id = ?`,
+        [discordUserId]
+    );
+    if (!account) return;
+    await wkSync.syncSummary(account);
+    const cache = await db.get(
+        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+        [account.wanikani_user_id]
+    );
+    const dueRightNow = cache?.review_count_now ?? 0;
+    await recordPoll(discordUserId, guildId, dueRightNow, account.wanikani_user_id);
+
+    // Seed a backdated review_stat baseline so /mistakes works for this user
+    // immediately rather than waiting a week for the snapshot history to
+    // accumulate. Backdated key sits just outside the 7-day mistake window so
+    // the baseline query (snapshot_date <= cutoff) always finds it.
+    try {
+        await ensureReviewStatsSynced(account);
+        const settings = await db.get(
+            `SELECT timezone FROM guild_settings WHERE guild_id = ?`,
+            [guildId]
+        );
+        const tz = resolveTimeZone(settings?.timezone);
+        const today = botDateKey(new Date(), tz);
+        const baselineKey = addDaysToDateKey(today, -(MISTAKE_WINDOW_DAYS + 1));
+        await writeReviewStatSnapshots(account.wanikani_user_id, baselineKey);
+        await writeReviewStatSnapshots(account.wanikani_user_id, today);
+    } catch (err) {
+        console.warn(`[setup/baselineSnapshot] ${discordUserId}:`, err);
+    }
+}
+
 function tokenHint(token) {
     return `…${token.slice(-4)}`;
 }
@@ -236,10 +297,11 @@ async function upsertWanikaniAccount(discordUserId, apiKey, wkUser) {
     );
 }
 
-function showUserSettings({ ping, shame, cleared }) {
+function showUserSettings({ ping, shame, cleared, streak }) {
     return base('⚙️ Your Settings').addFields(
-        { name: 'Daily pings', value: ping ? 'enabled' : 'disabled', inline: true },
+        { name: 'Reviews-available DM', value: ping ? 'enabled' : 'disabled', inline: true },
         { name: 'Shame messages', value: shame ? 'enabled' : 'disabled', inline: true },
         { name: 'Queue-cleared announcements', value: cleared ? 'enabled' : 'disabled', inline: true },
+        { name: 'Streak risk DM', value: streak ? 'enabled' : 'disabled', inline: true },
     );
 }
