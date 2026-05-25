@@ -439,8 +439,15 @@ async function summaryRefreshJob(client) {
     for (const account of accounts) {
         try {
             await wkSync.syncSummary(account);
-            await scheduleNextReviewTimer(client, account);
             await maybeResetReviewsAlertBaseline(account);
+            // Catch up on any unlock that already passed without a DM —
+            // happens after a bot restart (the in-memory timer map is empty
+            // at boot and only the *next future* bucket gets a timer) or for
+            // a freshly-linked account whose current queue is already due.
+            await maybeSendReviewsAvailableDM(client, account).catch(err =>
+                console.error(`[summaryRefresh/catchupDM] ${account.wanikani_user_id}:`, err)
+            );
+            await scheduleNextReviewTimer(client, account);
             await updateSnapshotsAndStreaksForAccount(account).catch(err =>
                 console.error(`[summaryRefresh/snapshots] ${account.wanikani_user_id}:`, err)
             );
@@ -620,7 +627,20 @@ async function reviewTimerFired(client, account) {
     } catch (err) {
         console.warn(`[reviewTimer/syncSummary] ${account.wanikani_user_id}:`, err);
     }
+    await maybeSendReviewsAvailableDM(client, account);
+    await scheduleNextReviewTimer(client, account);
+}
 
+// Decide whether the user should get a "reviews available" DM right now and,
+// if so, send it. Callable from both the per-account setTimeout (`reviewTimerFired`)
+// and the 5-minute `summaryRefreshJob` so that buckets which transitioned during
+// bot downtime — or queues that were already due when the user first linked,
+// before any timer existed — get caught up on the next cron tick instead of
+// silently waiting for a future bucket unlock that may be hours away.
+//
+// Idempotent against repeated calls thanks to the 5-minute floor on
+// `last_reviews_alerted_at` and the `dueRightNow > prevCount` check.
+async function maybeSendReviewsAvailableDM(client, account) {
     // Opt-in lives in user_reminder_settings (true cross-guild scope — the DM
     // is user-scoped). No row = default-on, matching the pre-split behavior.
     const userPrefs = await db.get(
@@ -628,10 +648,7 @@ async function reviewTimerFired(client, account) {
         [account.discord_user_id]
     );
     const reviewsDmEnabled = userPrefs ? userPrefs.reviews_dm_enabled === 1 : true;
-    if (!reviewsDmEnabled) {
-        await scheduleNextReviewTimer(client, account);
-        return;
-    }
+    if (!reviewsDmEnabled) return;
 
     const acctState = await db.get(
         `SELECT last_reviews_alerted_at, last_reviews_alerted_count
@@ -656,26 +673,19 @@ async function reviewTimerFired(client, account) {
                 [account.wanikani_user_id]
             );
         }
-        await scheduleNextReviewTimer(client, account);
         return;
     }
 
     // Only alert when the count actually grew since the last alert — otherwise
-    // a non-empty queue would re-page the user every time a new bucket unlocks.
+    // a non-empty queue would re-page the user every time the cron tick fires.
     const prevCount = acctState?.last_reviews_alerted_count ?? 0;
-    if (dueRightNow <= prevCount) {
-        await scheduleNextReviewTimer(client, account);
-        return;
-    }
+    if (dueRightNow <= prevCount) return;
 
-    // Small floor against the 5-minute summaryRefreshJob racing the timer for
-    // the same unlock — avoids double-DM during the overlap window.
+    // Floor against rapid re-fires: if we DM'd this user in the last 5 minutes
+    // (either via timer or via a previous catch-up tick), don't spam them.
     if (acctState?.last_reviews_alerted_at) {
         const ageMs = Date.now() - new Date(acctState.last_reviews_alerted_at).getTime();
-        if (ageMs >= 0 && ageMs < 5 * 60 * 1000) {
-            await scheduleNextReviewTimer(client, account);
-            return;
-        }
+        if (ageMs >= 0 && ageMs < 5 * 60 * 1000) return;
     }
 
     const nextBucket = await db.get(
@@ -687,60 +697,58 @@ async function reviewTimerFired(client, account) {
     );
 
     const user = await client.users.fetch(account.discord_user_id).catch(() => null);
-    if (user) {
-        const newlyAvailable = Math.max(0, dueRightNow - prevCount);
-        const lines = [
-            `**${newlyAvailable}** new review${newlyAvailable === 1 ? '' : 's'} just became available.`,
-            `Total in queue: **${dueRightNow}**.`,
-        ];
-        if (nextBucket) {
-            const ts = Math.floor(new Date(nextBucket.available_at).getTime() / 1000);
-            lines.push(`Next batch: **+${nextBucket.subject_count}** <t:${ts}:R> (<t:${ts}:t>).`);
-        }
-        lines.push(
-            '',
-            'Disable with `/setup reviews_dm:false`.'
-        );
-        const embed = new EmbedBuilder()
-            .setColor(COLOR_PRIMARY)
-            .setTitle('📚 New reviews available')
-            .setDescription(lines.join('\n'))
-            .setTimestamp()
-            .setFooter(FOOTER);
-        try {
-            const sent = await user.send({ embeds: [embed] });
-            await db.run(
-                `UPDATE wanikani_accounts
-                    SET last_reviews_alerted_at = ?,
-                        last_reviews_alerted_count = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                  WHERE wanikani_user_id = ?`,
-                [new Date().toISOString(), dueRightNow, account.wanikani_user_id]
-            );
-            await logReminderEvent({
-                discordUserId: account.discord_user_id,
-                wanikaniUserId: account.wanikani_user_id,
-                reminderType: 'reviews_available',
-                deliveryTarget: 'dm',
-                reviewCount: dueRightNow,
-                messageId: sent?.id ?? null,
-                status: 'sent',
-            }).catch(e => console.error('[logReminderEvent]', e));
-        } catch (err) {
-            console.warn(`[reviewDM] ${account.discord_user_id}:`, err);
-            await logReminderEvent({
-                discordUserId: account.discord_user_id,
-                wanikaniUserId: account.wanikani_user_id,
-                reminderType: 'reviews_available',
-                deliveryTarget: 'dm',
-                reviewCount: dueRightNow,
-                status: 'failed',
-                error: err.message,
-            }).catch(e => console.error('[logReminderEvent/failed reviewDM]', e));
-        }
-    }
+    if (!user) return;
 
-    await scheduleNextReviewTimer(client, account);
+    const newlyAvailable = Math.max(0, dueRightNow - prevCount);
+    const lines = [
+        `**${newlyAvailable}** new review${newlyAvailable === 1 ? '' : 's'} just became available.`,
+        `Total in queue: **${dueRightNow}**.`,
+    ];
+    if (nextBucket) {
+        const ts = Math.floor(new Date(nextBucket.available_at).getTime() / 1000);
+        lines.push(`Next batch: **+${nextBucket.subject_count}** <t:${ts}:R> (<t:${ts}:t>).`);
+    }
+    lines.push(
+        '',
+        'Disable with `/setup reviews_dm:false`.'
+    );
+    const embed = new EmbedBuilder()
+        .setColor(COLOR_PRIMARY)
+        .setTitle('📚 New reviews available')
+        .setDescription(lines.join('\n'))
+        .setTimestamp()
+        .setFooter(FOOTER);
+    try {
+        const sent = await user.send({ embeds: [embed] });
+        await db.run(
+            `UPDATE wanikani_accounts
+                SET last_reviews_alerted_at = ?,
+                    last_reviews_alerted_count = ?,
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE wanikani_user_id = ?`,
+            [new Date().toISOString(), dueRightNow, account.wanikani_user_id]
+        );
+        await logReminderEvent({
+            discordUserId: account.discord_user_id,
+            wanikaniUserId: account.wanikani_user_id,
+            reminderType: 'reviews_available',
+            deliveryTarget: 'dm',
+            reviewCount: dueRightNow,
+            messageId: sent?.id ?? null,
+            status: 'sent',
+        }).catch(e => console.error('[logReminderEvent]', e));
+    } catch (err) {
+        console.warn(`[reviewDM] ${account.discord_user_id}:`, err);
+        await logReminderEvent({
+            discordUserId: account.discord_user_id,
+            wanikaniUserId: account.wanikani_user_id,
+            reminderType: 'reviews_available',
+            deliveryTarget: 'dm',
+            reviewCount: dueRightNow,
+            status: 'failed',
+            error: err.message,
+        }).catch(e => console.error('[logReminderEvent/failed reviewDM]', e));
+    }
 }
 
 // ── slow-loop detection (hourly) ────────────────────────────────────────
