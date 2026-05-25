@@ -41,6 +41,8 @@ module.exports = {
             o.setName('daily').setDescription('Daily summary post: true=enable, false=disable'))
         .addBooleanOption(o =>
             o.setName('weekly').setDescription('Weekly leaderboard: true=enable, false=disable'))
+        .addBooleanOption(o =>
+            o.setName('cleared').setDescription('Queue-cleared announcements: true=enable, false=disable'))
         .addStringOption(o =>
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
@@ -70,13 +72,14 @@ module.exports = {
         const levelup = interaction.options.getBoolean('levelup');
         const daily = interaction.options.getBoolean('daily');
         const weekly = interaction.options.getBoolean('weekly');
+        const cleared = interaction.options.getBoolean('cleared');
         const weeklyDay = interaction.options.getString('weekly_day');
         const time = interaction.options.getString('time');
         const timezone = interaction.options.getString('timezone');
         const channel = interaction.options.getChannel('channel');
         const modrole = interaction.options.getRole('modrole');
 
-        const noneSet = [burn, levelup, daily, weekly, weeklyDay, time, timezone, channel, modrole]
+        const noneSet = [burn, levelup, daily, weekly, cleared, weeklyDay, time, timezone, channel, modrole]
             .every(v => v === null);
 
         if (noneSet) {
@@ -130,6 +133,11 @@ module.exports = {
             params.push(weekly ? 1 : 0);
             summary.push(`Weekly leaderboard: **${weekly ? 'on' : 'off'}**`);
             scheduleChanged = true;
+        }
+        if (cleared !== null) {
+            fields.push('reviews_cleared_announcements_enabled = ?');
+            params.push(cleared ? 1 : 0);
+            summary.push(`Queue-cleared announcements: **${cleared ? 'on' : 'off'}**`);
         }
         if (weeklyDay !== null) {
             fields.push('weekly_leaderboard_day = ?');
@@ -200,6 +208,7 @@ async function showSettings(interaction, guildId) {
             { name: 'Mod role', value: modRoleStr, inline: false },
             { name: 'Level-up announcements', value: s.level_up_announcements_enabled ? 'on' : 'off', inline: true },
             { name: 'Burn celebrations', value: s.burn_celebrations_enabled ? 'on' : 'off', inline: true },
+            { name: 'Queue-cleared announcements', value: s.reviews_cleared_announcements_enabled ? 'on' : 'off', inline: true },
         );
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }

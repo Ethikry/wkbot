@@ -272,6 +272,9 @@ const SCHEMA_V1 = [
         guild_id TEXT NOT NULL,
         discord_user_id TEXT NOT NULL,
         reviews_ping_enabled INTEGER NOT NULL DEFAULT 1,
+        reviews_dm_enabled INTEGER NOT NULL DEFAULT 1,
+        burn_announcement_enabled INTEGER NOT NULL DEFAULT 1,
+        levelup_announcement_enabled INTEGER NOT NULL DEFAULT 1,
         shame_enabled INTEGER NOT NULL DEFAULT 0,
         cleared_enabled INTEGER NOT NULL DEFAULT 1,
         streak_reminder_enabled INTEGER NOT NULL DEFAULT 1,
@@ -285,6 +288,16 @@ const SCHEMA_V1 = [
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (guild_id, discord_user_id),
         FOREIGN KEY (guild_id, discord_user_id) REFERENCES guild_members(guild_id, discord_user_id) ON DELETE CASCADE
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS user_reminder_settings (
+        discord_user_id TEXT PRIMARY KEY,
+        reviews_dm_enabled INTEGER NOT NULL DEFAULT 1,
+        streak_reminder_enabled INTEGER NOT NULL DEFAULT 1,
+        shame_enabled INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (discord_user_id) REFERENCES discord_users(discord_user_id) ON DELETE CASCADE
     )`,
 
     `CREATE TABLE IF NOT EXISTS reminder_events (
@@ -620,6 +633,50 @@ const SCHEMA_V12 = [
     ...GUILD_ACHIEVEMENT_DEFS_V12,
 ];
 
+// Split the overloaded `reviews_ping_enabled` flag into two: the existing
+// column now exclusively controls the @mention in daily/weekly channel posts,
+// while a new `reviews_dm_enabled` column controls the per-unlock review DM.
+// Seed `reviews_dm_enabled` from the user's prior `reviews_ping_enabled` so
+// existing opt-outs carry over without surprise re-enables.
+const SCHEMA_V13 = [
+    `ALTER TABLE reminder_settings ADD COLUMN reviews_dm_enabled INTEGER NOT NULL DEFAULT 1`,
+    `UPDATE reminder_settings SET reviews_dm_enabled = reviews_ping_enabled`,
+];
+
+// Split reminder preferences into a true user-level layer (DM-style toggles,
+// which are inherently cross-guild because they deliver via DM) and a
+// per-guild layer (channel post opt-ins, where the guild context matters).
+//
+// New `user_reminder_settings` holds reviews_dm / streak / shame. Backfill
+// takes MAX across the user's existing per-guild rows so any explicit opt-in
+// (or shame opt-in) carries over; users who had everything off everywhere
+// keep that state.
+//
+// `reminder_settings` keeps its per-guild scope but picks up new opt-out
+// columns for the channel-post features that previously had no per-user
+// override (weekly @mention, burn announcements, level-up announcements).
+const SCHEMA_V14 = [
+    `CREATE TABLE IF NOT EXISTS user_reminder_settings (
+        discord_user_id TEXT PRIMARY KEY,
+        reviews_dm_enabled INTEGER NOT NULL DEFAULT 1,
+        streak_reminder_enabled INTEGER NOT NULL DEFAULT 1,
+        shame_enabled INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (discord_user_id) REFERENCES discord_users(discord_user_id) ON DELETE CASCADE
+    )`,
+    `INSERT OR IGNORE INTO user_reminder_settings
+        (discord_user_id, reviews_dm_enabled, streak_reminder_enabled, shame_enabled)
+     SELECT discord_user_id,
+            MAX(reviews_dm_enabled),
+            MAX(streak_reminder_enabled),
+            MAX(shame_enabled)
+     FROM reminder_settings
+     GROUP BY discord_user_id`,
+    `ALTER TABLE reminder_settings ADD COLUMN burn_announcement_enabled INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE reminder_settings ADD COLUMN levelup_announcement_enabled INTEGER NOT NULL DEFAULT 1`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -633,6 +690,8 @@ const MIGRATIONS = [
     { version: 10, name: 'wanikani_accounts_reviews_alerted', statements: SCHEMA_V10 },
     { version: 11, name: 'streak_risk_reminders', statements: SCHEMA_V11 },
     { version: 12, name: 'guild_achievements', statements: SCHEMA_V12 },
+    { version: 13, name: 'split_reviews_ping_into_dm', statements: SCHEMA_V13 },
+    { version: 14, name: 'user_level_reminder_settings', statements: SCHEMA_V14 },
 ];
 
 async function runMigrations({ get, all, run }) {
