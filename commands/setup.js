@@ -17,7 +17,7 @@ const WK_REVISION = '20170710';
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('setup')
-        .setDescription('Link your WaniKani account and set personal preferences')
+        .setDescription('Link your WaniKani account and set personal (cross-server) preferences')
         .setDMPermission(false)
         .addStringOption(opt =>
             opt.setName('apikey')
@@ -25,32 +25,26 @@ module.exports = {
                 .setRequired(false)
         )
         .addBooleanOption(opt =>
-            opt.setName('ping')
+            opt.setName('reviews_dm')
                 .setDescription('DM me when new reviews unlock')
-                .setRequired(false)
-        )
-        .addBooleanOption(opt =>
-            opt.setName('shame')
-                .setDescription('Show shame messages alongside your name in daily/weekly posts when you fall short')
-                .setRequired(false)
-        )
-        .addBooleanOption(opt =>
-            opt.setName('cleared')
-                .setDescription('Announce in channel when you clear your review queue (requires server to have this enabled)')
                 .setRequired(false)
         )
         .addBooleanOption(opt =>
             opt.setName('streak')
                 .setDescription('DM me before my review streak breaks')
                 .setRequired(false)
+        )
+        .addBooleanOption(opt =>
+            opt.setName('shame')
+                .setDescription('Allow shame DMs when you fall short (channel-post shame is configured per server via /guild_setup)')
+                .setRequired(false)
         ),
 
     async execute(interaction) {
         const apiKey = interaction.options.getString('apikey');
-        const pingOpt = interaction.options.getBoolean('ping');
-        const shameOpt = interaction.options.getBoolean('shame');
-        const clearedOpt = interaction.options.getBoolean('cleared');
+        const reviewsDmOpt = interaction.options.getBoolean('reviews_dm');
         const streakOpt = interaction.options.getBoolean('streak');
+        const shameOpt = interaction.options.getBoolean('shame');
         const discordUserId = interaction.user.id;
         const guildId = interaction.guild.id;
         const displayName = interaction.member?.displayName ?? interaction.user.username;
@@ -105,37 +99,33 @@ module.exports = {
             });
         }
 
-        const existingReminders = await db.get(
-            `SELECT reviews_ping_enabled, shame_enabled, cleared_enabled, streak_reminder_enabled
-             FROM reminder_settings
-             WHERE guild_id = ? AND discord_user_id = ?`,
-            [guildId, discordUserId]
+        const existingUser = await db.get(
+            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled
+             FROM user_reminder_settings
+             WHERE discord_user_id = ?`,
+            [discordUserId]
         );
 
-        const ping = pingOpt === null
-            ? (existingReminders?.reviews_ping_enabled ?? 1)
-            : (pingOpt ? 1 : 0);
-        const shame = shameOpt === null
-            ? (existingReminders?.shame_enabled ?? 0)
-            : (shameOpt ? 1 : 0);
-        const cleared = clearedOpt === null
-            ? (existingReminders?.cleared_enabled ?? 1)
-            : (clearedOpt ? 1 : 0);
+        const reviewsDm = reviewsDmOpt === null
+            ? (existingUser?.reviews_dm_enabled ?? 1)
+            : (reviewsDmOpt ? 1 : 0);
         const streak = streakOpt === null
-            ? (existingReminders?.streak_reminder_enabled ?? 1)
+            ? (existingUser?.streak_reminder_enabled ?? 1)
             : (streakOpt ? 1 : 0);
+        const shame = shameOpt === null
+            ? (existingUser?.shame_enabled ?? 0)
+            : (shameOpt ? 1 : 0);
 
         await db.run(
-            `INSERT INTO reminder_settings
-                (guild_id, discord_user_id, reviews_ping_enabled, shame_enabled, cleared_enabled, streak_reminder_enabled)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-                reviews_ping_enabled = excluded.reviews_ping_enabled,
-                shame_enabled = excluded.shame_enabled,
-                cleared_enabled = excluded.cleared_enabled,
+            `INSERT INTO user_reminder_settings
+                (discord_user_id, reviews_dm_enabled, streak_reminder_enabled, shame_enabled)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(discord_user_id) DO UPDATE SET
+                reviews_dm_enabled = excluded.reviews_dm_enabled,
                 streak_reminder_enabled = excluded.streak_reminder_enabled,
+                shame_enabled = excluded.shame_enabled,
                 updated_at = CURRENT_TIMESTAMP`,
-            [guildId, discordUserId, ping, shame, cleared, streak]
+            [discordUserId, reviewsDm, streak, shame]
         );
 
         if (apiKey || !existingAccount) {
@@ -144,23 +134,23 @@ module.exports = {
                     'Setup Complete',
                     [
                         wkUser ? `Linked to WaniKani user **${wkUser.username}** (level ${wkUser.level}).` : 'Account linked.',
-                        `Reviews-available DM: **${ping ? 'enabled' : 'disabled'}**.`,
-                        `Shame messages: **${shame ? 'enabled' : 'disabled'}**.`,
-                        `Queue-cleared announcements: **${cleared ? 'enabled' : 'disabled'}**.`,
+                        `Reviews-available DM: **${reviewsDm ? 'enabled' : 'disabled'}**.`,
                         `Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`,
+                        `Shame DMs: **${shame ? 'enabled' : 'disabled'}**.`,
+                        '',
+                        'Server-specific options (channel @mention, queue-clear / burn / level-up announcements, channel shame) live under `/guild_setup`.',
                     ].join('\n')
                 )],
             });
         }
 
         const lines = [];
-        if (pingOpt !== null) lines.push(`Reviews-available DM: **${ping ? 'enabled' : 'disabled'}**.`);
-        if (shameOpt !== null) lines.push(`Shame messages: **${shame ? 'enabled' : 'disabled'}**.`);
-        if (clearedOpt !== null) lines.push(`Queue-cleared announcements: **${cleared ? 'enabled' : 'disabled'}**.`);
+        if (reviewsDmOpt !== null) lines.push(`Reviews-available DM: **${reviewsDm ? 'enabled' : 'disabled'}**.`);
         if (streakOpt !== null) lines.push(`Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`);
+        if (shameOpt !== null) lines.push(`Shame DMs: **${shame ? 'enabled' : 'disabled'}**.`);
 
         if (lines.length === 0) {
-            return interaction.editReply({ embeds: [showUserSettings({ ping, shame, cleared, streak })] });
+            return interaction.editReply({ embeds: [showUserSettings({ reviewsDm, streak, shame })] });
         }
         return interaction.editReply({
             embeds: [success('Settings Updated', lines.join('\n'))],
@@ -297,11 +287,15 @@ async function upsertWanikaniAccount(discordUserId, apiKey, wkUser) {
     );
 }
 
-function showUserSettings({ ping, shame, cleared, streak }) {
+function showUserSettings({ reviewsDm, streak, shame }) {
     return base('⚙️ Your Settings').addFields(
-        { name: 'Reviews-available DM', value: ping ? 'enabled' : 'disabled', inline: true },
-        { name: 'Shame messages', value: shame ? 'enabled' : 'disabled', inline: true },
-        { name: 'Queue-cleared announcements', value: cleared ? 'enabled' : 'disabled', inline: true },
+        { name: 'Reviews-available DM', value: reviewsDm ? 'enabled' : 'disabled', inline: true },
         { name: 'Streak risk DM', value: streak ? 'enabled' : 'disabled', inline: true },
+        { name: 'Shame DMs', value: shame ? 'enabled' : 'disabled', inline: true },
+        {
+            name: 'Per-server options',
+            value: 'Run `/guild_setup` in a server to configure @mentions, queue-clear / burn / level-up announcements, and channel shame.',
+            inline: false,
+        },
     );
 }
