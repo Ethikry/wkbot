@@ -170,6 +170,8 @@ async function showSetup(db) {
                rs.reviews_ping_enabled,
                rs.shame_enabled,
                rs.cleared_enabled,
+               rs.burn_announcement_enabled,
+               rs.levelup_announcement_enabled,
                rs.min_review_count,
                rs.dm_enabled,
                rs.channel_enabled,
@@ -185,6 +187,18 @@ async function showSetup(db) {
         ORDER BY rs.guild_id, COALESCE(du.display_name, du.global_name, rs.discord_user_id)
     `);
 
+    const userReminders = await all(db, `
+        SELECT urs.discord_user_id,
+               du.display_name,
+               du.global_name,
+               urs.reviews_dm_enabled,
+               urs.streak_reminder_enabled,
+               urs.shame_enabled
+        FROM user_reminder_settings urs
+        LEFT JOIN discord_users du ON du.discord_user_id = urs.discord_user_id
+        ORDER BY COALESCE(du.display_name, du.global_name, urs.discord_user_id)
+    `);
+
     section(`Per-guild user preferences (${reminders.length})`);
     if (reminders.length === 0) {
         console.log('(none)');
@@ -196,9 +210,11 @@ async function showSetup(db) {
             return {
                 guild: r.guild_id,
                 user: nameOf(r),
-                ping: flag(r.reviews_ping_enabled),
+                mention: flag(r.reviews_ping_enabled),
                 shame: flag(r.shame_enabled),
                 cleared: flag(r.cleared_enabled),
+                burn: flag(r.burn_announcement_enabled),
+                levelup: flag(r.levelup_announcement_enabled),
                 'min reviews': r.min_review_count,
                 dm: flag(r.dm_enabled),
                 channel: flag(r.channel_enabled),
@@ -208,6 +224,18 @@ async function showSetup(db) {
                 'opt out (rem)': flag(r.reminders_opt_out),
             };
         }));
+    }
+
+    section(`Personal (cross-server) reminder prefs (${userReminders.length})`);
+    if (userReminders.length === 0) {
+        console.log('(none)');
+    } else {
+        console.table(userReminders.map(r => ({
+            user: nameOf(r),
+            'reviews dm': flag(r.reviews_dm_enabled),
+            'streak dm': flag(r.streak_reminder_enabled),
+            'shame dm': flag(r.shame_enabled),
+        })));
     }
 }
 

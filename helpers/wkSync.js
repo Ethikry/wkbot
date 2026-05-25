@@ -528,6 +528,29 @@ async function syncSummary(account) {
                 );
             }
         }
+        // On 304 the bucket rows are unchanged but real time has advanced —
+        // buckets whose available_at slid into the past won't be counted in the
+        // cached review_count_now until the next non-304 sync. Recompute it
+        // from the bucket table so reviewTimerFired sees the unlock and DMs
+        // actually fire.
+        if (res.notModified) {
+            const live = await db.get(
+                `SELECT COALESCE(SUM(subject_count), 0) AS due_now
+                 FROM wk_summary_buckets
+                 WHERE wanikani_user_id = ?
+                   AND bucket_type = 'review'
+                   AND datetime(available_at) <= datetime('now')`,
+                [wkId]
+            );
+            if (live) {
+                await db.run(
+                    `UPDATE wk_summary_cache
+                        SET review_count_now = ?, fetched_at = CURRENT_TIMESTAMP
+                      WHERE wanikani_user_id = ?`,
+                    [live.due_now, wkId]
+                );
+            }
+        }
         await saveUserSyncState(wkId, 'summary', {
             etag: res.etag, lastModified: res.lastModified,
             dataUpdatedAt: res.dataUpdatedAt,
