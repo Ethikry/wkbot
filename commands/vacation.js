@@ -27,7 +27,18 @@ module.exports = {
         try {
             const userJson = await wkFetch('/user', apiKey);
             const onVacation = !!userJson.data.current_vacation_started_at;
+            const newDm = onVacation ? 0 : 1;
             const newPing = onVacation ? 0 : 1;
+            // reviews_dm is user-scoped (DM is cross-guild). reviews_ping is
+            // per-guild — toggle just this guild's channel mention.
+            await db.run(
+                `INSERT INTO user_reminder_settings (discord_user_id, reviews_dm_enabled)
+                 VALUES (?, ?)
+                 ON CONFLICT(discord_user_id) DO UPDATE SET
+                    reviews_dm_enabled = excluded.reviews_dm_enabled,
+                    updated_at = CURRENT_TIMESTAMP`,
+                [userId, newDm]
+            );
             await db.run(
                 `INSERT INTO reminder_settings (guild_id, discord_user_id, reviews_ping_enabled)
                  VALUES (?, ?, ?)

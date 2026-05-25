@@ -28,21 +28,31 @@ module.exports = {
         const userId = interaction.user.id;
         const guildId = interaction.guild.id;
 
-        const settings = await db.get(
-            `SELECT reviews_ping_enabled, shame_enabled, cleared_enabled,
-                    streak_reminder_enabled,
-                    dm_enabled, channel_enabled, min_review_count
+        const guildSettings = await db.get(
+            `SELECT reviews_ping_enabled,
+                    shame_enabled, cleared_enabled,
+                    burn_announcement_enabled, levelup_announcement_enabled,
+                    min_review_count
              FROM reminder_settings
              WHERE guild_id = ? AND discord_user_id = ?`,
             [guildId, userId]
         );
 
-        if (!settings) {
+        const userSettings = await db.get(
+            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled
+             FROM user_reminder_settings
+             WHERE discord_user_id = ?`,
+            [userId]
+        );
+
+        if (!guildSettings && !userSettings) {
             return interaction.reply({
-                embeds: [error('No Settings', 'Run `/setup` in this server first to register reminder preferences.')],
+                embeds: [error('No Settings', 'Run `/setup` to register reminder preferences.')],
                 flags: MessageFlags.Ephemeral,
             });
         }
+        const settings = guildSettings ?? {};
+        const userPrefs = userSettings ?? {};
 
         const events = await db.all(
             `SELECT reminder_type, delivery_target, status, sent_at, review_count, lesson_count, error
@@ -53,12 +63,19 @@ module.exports = {
             [userId]
         );
 
-        const embed = base('🔔 Your Reminders').addFields(
-            { name: 'Reviews-available DM', value: settings.reviews_ping_enabled ? 'on' : 'off', inline: true },
-            { name: 'Shame messages', value: settings.shame_enabled ? 'on' : 'off', inline: true },
-            { name: 'Queue-cleared announce', value: settings.cleared_enabled ? 'on' : 'off', inline: true },
-            { name: 'Streak risk DM', value: settings.streak_reminder_enabled ? 'on' : 'off', inline: true },
-        );
+        const embed = base('🔔 Your Reminders')
+            .addFields(
+                { name: '— Personal (cross-server) —', value: '`/setup` to change', inline: false },
+                { name: 'Reviews-available DM', value: (userPrefs.reviews_dm_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Streak risk DM', value: (userPrefs.streak_reminder_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Shame DMs', value: (userPrefs.shame_enabled ?? 0) ? 'on' : 'off', inline: true },
+                { name: '— This server —', value: '`/guild_setup` to change', inline: false },
+                { name: 'Daily/weekly @mention', value: (settings.reviews_ping_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Queue-cleared announce', value: (settings.cleared_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Burn announce', value: (settings.burn_announcement_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Level-up announce', value: (settings.levelup_announcement_enabled ?? 1) ? 'on' : 'off', inline: true },
+                { name: 'Channel shame', value: (settings.shame_enabled ?? 0) ? 'on' : 'off', inline: true },
+            );
 
         if (events.length === 0) {
             embed.addFields({ name: 'Recent activity', value: '_No reminders sent yet._' });

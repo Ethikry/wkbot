@@ -91,8 +91,9 @@ async function resolveOutputChannel(guild, settings) {
     return fallback ?? null;
 }
 
-// Returns one row per (guild_member with linked WK account), with reminder flags
-// folded in via LEFT JOIN. Defaults match the prior apikeys defaults.
+// Returns one row per (guild_member with linked WK account), with both
+// per-guild reminder flags and user-level prefs folded in. Defaults match
+// each layer's defaults.
 async function getGuildMembers(guildId) {
     return db.all(
         `SELECT
@@ -101,11 +102,16 @@ async function getGuildMembers(guildId) {
              wa.api_token_encrypted,
              COALESCE(rs.reviews_ping_enabled, 1) AS ping_enabled,
              COALESCE(rs.shame_enabled, 0) AS shame_enabled,
-             COALESCE(rs.cleared_enabled, 1) AS cleared_enabled
+             COALESCE(rs.cleared_enabled, 1) AS cleared_enabled,
+             COALESCE(rs.burn_announcement_enabled, 1) AS burn_announcement_enabled,
+             COALESCE(rs.levelup_announcement_enabled, 1) AS levelup_announcement_enabled,
+             COALESCE(urs.shame_enabled, 0) AS user_shame_enabled
          FROM guild_members gm
          JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
          LEFT JOIN reminder_settings rs
              ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
+         LEFT JOIN user_reminder_settings urs
+             ON urs.discord_user_id = gm.discord_user_id
          WHERE gm.guild_id = ?`,
         [guildId]
     );
@@ -273,6 +279,7 @@ async function leaderboardJob(client, guildId) {
         `SELECT
              gm.discord_user_id,
              COALESCE(rs.shame_enabled, 0) AS shame_enabled,
+             COALESCE(rs.reviews_ping_enabled, 1) AS ping_enabled,
              COALESCE(SUM(ds.reviews_completed), 0) AS reviews,
              COALESCE(SUM(ds.lessons_completed), 0) AS lessons
          FROM guild_members gm
@@ -283,7 +290,7 @@ async function leaderboardJob(client, guildId) {
          LEFT JOIN reminder_settings rs
              ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
          WHERE gm.guild_id = ?
-         GROUP BY gm.discord_user_id, rs.shame_enabled
+         GROUP BY gm.discord_user_id, rs.shame_enabled, rs.reviews_ping_enabled
          ORDER BY reviews DESC, lessons DESC, gm.discord_user_id ASC`,
         [sinceStr, guildId]
     );
@@ -301,6 +308,7 @@ async function leaderboardJob(client, guildId) {
             reviews: r.reviews,
             lessons: r.lessons,
             shameEnabled: r.shame_enabled === 1,
+            pingEnabled: r.ping_enabled === 1,
         };
     }));
 
@@ -354,7 +362,11 @@ async function leaderboardJob(client, guildId) {
         embed.addFields({ name: '🔥 Longest Streaks', value: streakLines.join('\n'), inline: false });
     }
 
-    await channel.send({ embeds: [embed] });
+    const pingList = enriched.filter(e => e.pingEnabled).map(e => `<@${e.userId}>`);
+    await channel.send({
+        content: pingList.length ? pingList.join(' ') : undefined,
+        embeds: [embed],
+    });
 }
 
 function clipDescription(s) {
@@ -609,14 +621,14 @@ async function reviewTimerFired(client, account) {
         console.warn(`[reviewTimer/syncSummary] ${account.wanikani_user_id}:`, err);
     }
 
-    // Opt-in is now per-user via reminder_settings.reviews_ping_enabled —
-    // any guild row enabling it qualifies the user for the global DM.
-    const optIn = await db.get(
-        `SELECT 1 AS opted FROM reminder_settings
-         WHERE discord_user_id = ? AND reviews_ping_enabled = 1 LIMIT 1`,
+    // Opt-in lives in user_reminder_settings (true cross-guild scope — the DM
+    // is user-scoped). No row = default-on, matching the pre-split behavior.
+    const userPrefs = await db.get(
+        `SELECT reviews_dm_enabled FROM user_reminder_settings WHERE discord_user_id = ?`,
         [account.discord_user_id]
     );
-    if (!optIn) {
+    const reviewsDmEnabled = userPrefs ? userPrefs.reviews_dm_enabled === 1 : true;
+    if (!reviewsDmEnabled) {
         await scheduleNextReviewTimer(client, account);
         return;
     }
@@ -687,7 +699,7 @@ async function reviewTimerFired(client, account) {
         }
         lines.push(
             '',
-            'Disable with `/setup ping:false`.'
+            'Disable with `/setup reviews_dm:false`.'
         );
         const embed = new EmbedBuilder()
             .setColor(COLOR_PRIMARY)
@@ -794,6 +806,7 @@ async function slowDetectionJob(client) {
                     if (
                         channel &&
                         settings.level_up_announcements_enabled &&
+                        row.levelup_announcement_enabled !== 0 &&
                         previousLevel !== null &&
                         level > previousLevel
                     ) {
@@ -813,6 +826,7 @@ async function slowDetectionJob(client) {
                     if (
                         channel &&
                         settings.burn_celebrations_enabled &&
+                        row.burn_announcement_enabled !== 0 &&
                         burned !== null &&
                         previousBurned !== undefined &&
                         burned > previousBurned
@@ -1045,21 +1059,23 @@ async function streakRiskJob(client, guildId) {
     const today = botDateStr(0, tz);
     const yesterday = botDateStr(-1, tz);
 
+    // Streak DM + shame variant are user-scoped preferences (DMs are
+    // inherently cross-guild). Defaults match user_reminder_settings: streak
+    // on, shame off.
     const candidates = await db.all(
         `SELECT
              gm.discord_user_id,
              wa.wanikani_user_id,
              wa.current_vacation_started_at,
              s.current_streak,
-             COALESCE(rs.streak_reminder_enabled, 1) AS streak_reminder_enabled,
-             COALESCE(rs.shame_enabled, 0) AS shame_enabled,
+             COALESCE(urs.streak_reminder_enabled, 1) AS streak_reminder_enabled,
+             COALESCE(urs.shame_enabled, 0) AS shame_enabled,
              COALESCE(cache.review_count_now, 0) AS due_now,
              COALESCE(ds.reviews_completed, 0) AS reviews_today
          FROM guild_members gm
          JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
          JOIN streaks s ON s.guild_id = gm.guild_id AND s.discord_user_id = gm.discord_user_id
-         LEFT JOIN reminder_settings rs
-             ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
+         LEFT JOIN user_reminder_settings urs ON urs.discord_user_id = gm.discord_user_id
          LEFT JOIN wk_summary_cache cache ON cache.wanikani_user_id = wa.wanikani_user_id
          LEFT JOIN daily_snapshots ds
              ON ds.guild_id = gm.guild_id
@@ -1078,6 +1094,22 @@ async function streakRiskJob(client, guildId) {
         const wantsShame = c.shame_enabled === 1;
         const wantsGentle = c.streak_reminder_enabled === 1;
         if (!wantsShame && !wantsGentle) continue;
+
+        // Cross-guild dedupe: streak-risk crons run per-guild, but the DM is
+        // user-scoped. If we already sent (or attempted) a streak DM in the
+        // last 12h skip this one so members of multiple servers don't get
+        // duplicate (and sometimes mismatched variant) reminders.
+        const recent = await db.get(
+            `SELECT 1 AS hit FROM reminder_events
+             WHERE discord_user_id = ?
+               AND reminder_type IN ('streak_risk', 'shame')
+               AND delivery_target = 'dm'
+               AND sent_at IS NOT NULL
+               AND datetime(sent_at) > datetime('now', '-12 hours')
+             LIMIT 1`,
+            [c.discord_user_id]
+        );
+        if (recent) continue;
 
         try {
             const user = await client.users.fetch(c.discord_user_id).catch(() => null);
@@ -1098,8 +1130,13 @@ async function streakRiskJob(client, guildId) {
                 const body = generated ?? pickShameLine({ user: userTag });
                 embed = new EmbedBuilder()
                     .setColor(COLOR_WARN)
-                    .setTitle('💢 Your streak is on the line')
-                    .setDescription(`${body}\n\n**${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting · **${c.current_streak}**-day streak at risk.`)
+                    .setTitle(`💢 Your ${c.current_streak}-day streak is on the line`)
+                    .setDescription([
+                        body,
+                        '',
+                        `**${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting · **${c.current_streak}**-day streak at risk.`,
+                        '-# Clear at least one review today to keep the streak alive.',
+                    ].join('\n'))
                     .setTimestamp()
                     .setFooter(FOOTER);
             } else {
