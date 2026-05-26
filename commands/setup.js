@@ -7,6 +7,7 @@ const { recordPoll } = require('../helpers/zerostate');
 const wkSync = require('../helpers/wkSync');
 const { ensureReviewStatsSynced } = require('../helpers/wanikaniData');
 const { writeReviewStatSnapshots } = require('../helpers/reviewStatSnapshot');
+const { parseSleepHour, formatSleepHours } = require('../helpers/sleepHours');
 const { botDateKey, addDaysToDateKey, resolveTimeZone } = require('../helpers/botTime');
 const db = require('../db');
 
@@ -38,6 +39,20 @@ module.exports = {
             opt.setName('shame')
                 .setDescription('Allow shame DMs when you fall short (channel-post shame is configured per server via /guild_setup)')
                 .setRequired(false)
+        )
+        .addIntegerOption(opt =>
+            opt.setName('sleep_start')
+                .setDescription('Suppress reminder DMs starting at this local hour (0-23). Set with sleep_end to enable.')
+                .setMinValue(0)
+                .setMaxValue(23)
+                .setRequired(false)
+        )
+        .addIntegerOption(opt =>
+            opt.setName('sleep_end')
+                .setDescription('Resume reminder DMs at this local hour (0-23). Set with sleep_start to enable.')
+                .setMinValue(0)
+                .setMaxValue(23)
+                .setRequired(false)
         ),
 
     async execute(interaction) {
@@ -45,6 +60,8 @@ module.exports = {
         const reviewsDmOpt = interaction.options.getBoolean('reviews_dm');
         const streakOpt = interaction.options.getBoolean('streak');
         const shameOpt = interaction.options.getBoolean('shame');
+        const sleepStartOpt = interaction.options.getInteger('sleep_start');
+        const sleepEndOpt = interaction.options.getInteger('sleep_end');
         const discordUserId = interaction.user.id;
         const guildId = interaction.guild.id;
         const displayName = interaction.member?.displayName ?? interaction.user.username;
@@ -100,7 +117,8 @@ module.exports = {
         }
 
         const existingUser = await db.get(
-            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled
+            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled,
+                    sleep_start_hour, sleep_end_hour
              FROM user_reminder_settings
              WHERE discord_user_id = ?`,
             [discordUserId]
@@ -115,17 +133,26 @@ module.exports = {
         const shame = shameOpt === null
             ? (existingUser?.shame_enabled ?? 0)
             : (shameOpt ? 1 : 0);
+        const sleepStart = sleepStartOpt === null
+            ? (existingUser?.sleep_start_hour ?? null)
+            : parseSleepHour(sleepStartOpt, 'sleep_start');
+        const sleepEnd = sleepEndOpt === null
+            ? (existingUser?.sleep_end_hour ?? null)
+            : parseSleepHour(sleepEndOpt, 'sleep_end');
 
         await db.run(
             `INSERT INTO user_reminder_settings
-                (discord_user_id, reviews_dm_enabled, streak_reminder_enabled, shame_enabled)
-             VALUES (?, ?, ?, ?)
+                (discord_user_id, reviews_dm_enabled, streak_reminder_enabled, shame_enabled,
+                 sleep_start_hour, sleep_end_hour)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(discord_user_id) DO UPDATE SET
                 reviews_dm_enabled = excluded.reviews_dm_enabled,
                 streak_reminder_enabled = excluded.streak_reminder_enabled,
                 shame_enabled = excluded.shame_enabled,
+                sleep_start_hour = excluded.sleep_start_hour,
+                sleep_end_hour = excluded.sleep_end_hour,
                 updated_at = CURRENT_TIMESTAMP`,
-            [discordUserId, reviewsDm, streak, shame]
+            [discordUserId, reviewsDm, streak, shame, sleepStart, sleepEnd]
         );
 
         if (apiKey || !existingAccount) {
@@ -137,6 +164,7 @@ module.exports = {
                         `Reviews-available DM: **${reviewsDm ? 'enabled' : 'disabled'}**.`,
                         `Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`,
                         `Shame DMs: **${shame ? 'enabled' : 'disabled'}**.`,
+                        `Sleep hours: **${formatSleepHours(sleepStart, sleepEnd)}**.`,
                         '',
                         'Server-specific options (channel @mention, queue-clear / burn / level-up announcements, channel shame) live under `/guild_setup`.',
                     ].join('\n')
@@ -148,9 +176,12 @@ module.exports = {
         if (reviewsDmOpt !== null) lines.push(`Reviews-available DM: **${reviewsDm ? 'enabled' : 'disabled'}**.`);
         if (streakOpt !== null) lines.push(`Streak risk DM: **${streak ? 'enabled' : 'disabled'}**.`);
         if (shameOpt !== null) lines.push(`Shame DMs: **${shame ? 'enabled' : 'disabled'}**.`);
+        if (sleepStartOpt !== null || sleepEndOpt !== null) {
+            lines.push(`Sleep hours: **${formatSleepHours(sleepStart, sleepEnd)}**.`);
+        }
 
         if (lines.length === 0) {
-            return interaction.editReply({ embeds: [showUserSettings({ reviewsDm, streak, shame })] });
+            return interaction.editReply({ embeds: [showUserSettings({ reviewsDm, streak, shame, sleepStart, sleepEnd })] });
         }
         return interaction.editReply({
             embeds: [success('Settings Updated', lines.join('\n'))],
@@ -287,11 +318,12 @@ async function upsertWanikaniAccount(discordUserId, apiKey, wkUser) {
     );
 }
 
-function showUserSettings({ reviewsDm, streak, shame }) {
+function showUserSettings({ reviewsDm, streak, shame, sleepStart, sleepEnd }) {
     return base('⚙️ Your Settings').addFields(
         { name: 'Reviews-available DM', value: reviewsDm ? 'enabled' : 'disabled', inline: true },
         { name: 'Streak risk DM', value: streak ? 'enabled' : 'disabled', inline: true },
         { name: 'Shame DMs', value: shame ? 'enabled' : 'disabled', inline: true },
+        { name: 'Sleep hours', value: formatSleepHours(sleepStart, sleepEnd), inline: true },
         {
             name: 'Per-server options',
             value: 'Run `/guild_setup` in a server to configure @mentions, queue-clear / burn / level-up announcements, and channel shame.',

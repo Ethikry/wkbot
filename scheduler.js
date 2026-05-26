@@ -18,6 +18,7 @@ const { recordPoll } = require('./helpers/zerostate');
 const { pickShameLine } = require('./helpers/shame');
 const { generateShameLine } = require('./helpers/anthropic');
 const { logReminderEvent } = require('./helpers/reminderEvents');
+const { isWithinSleepWindow } = require('./helpers/sleepHours');
 const { evaluateAchievements } = require('./helpers/achievements');
 const { evaluateGuildAchievements } = require('./helpers/guildAchievements');
 const { writeReviewStatSnapshots } = require('./helpers/reviewStatSnapshot');
@@ -32,6 +33,7 @@ const {
 
 const guildJobs = new Map();
 let summaryRefreshJobHandle = null;
+let hourlyReviewCatchupJobHandle = null;
 let slowDetectionJobHandle = null;
 let dailySyncJobHandle = null;
 let paceAlertJobHandle = null;
@@ -474,6 +476,28 @@ async function summaryRefreshJob(client) {
     }
 }
 
+// Top-of-hour catchup. Runs at HH:00 alongside the regular */5 tick so that
+// at the moment reviews unlock — every WK reviews bucket lands on the hour —
+// the DM goes out within seconds even if the per-account setTimeout missed.
+// Cheaper than summaryRefreshJob: skips per-guild cleared-queue work and
+// snapshot/streak updates (the */5 tick still handles those).
+async function hourlyReviewCatchupJob(client) {
+    const accounts = await db.all(
+        `SELECT DISTINCT wanikani_user_id, discord_user_id, api_token_encrypted
+         FROM wanikani_accounts`
+    );
+    for (const account of accounts) {
+        try {
+            await wkSync.syncSummary(account);
+            await maybeResetReviewsAlertBaseline(account);
+            await maybeSendReviewsAvailableDM(client, account);
+            await scheduleNextReviewTimer(client, account);
+        } catch (err) {
+            console.error(`[hourlyReviewCatchup] ${account.wanikani_user_id}:`, err);
+        }
+    }
+}
+
 // Reset the reviews-available alert baseline whenever the queue is observed
 // empty so that the next batch of unlocks correctly registers as "new
 // reviews". Also keeps the baseline in sync if the user does reviews without
@@ -606,10 +630,11 @@ async function scheduleNextReviewTimer(client, account) {
     if (!next) return;
     let ms = new Date(next.available_at).getTime() - Date.now();
     // Sanity bounds: don't queue absurdly long timers (summaryRefreshJob will
-    // re-schedule), and add a tiny buffer so the first sync picks up the unlock.
+    // re-schedule), and add a tiny buffer so the unlock boundary is safely past
+    // when maybeSendReviewsAvailableDM reads the bucket table.
     if (ms > 24 * 60 * 60 * 1000) return;
     if (ms < 0) ms = 0;
-    ms += 30 * 1000;
+    ms += 5 * 1000;
 
     const timer = setTimeout(() => {
         reviewTimers.delete(wkId);
@@ -650,17 +675,28 @@ async function maybeSendReviewsAvailableDM(client, account) {
     const reviewsDmEnabled = userPrefs ? userPrefs.reviews_dm_enabled === 1 : true;
     if (!reviewsDmEnabled) return;
 
+    if (await isWithinSleepWindow(account.discord_user_id)) return;
+
     const acctState = await db.get(
         `SELECT last_reviews_alerted_at, last_reviews_alerted_count
          FROM wanikani_accounts WHERE wanikani_user_id = ?`,
         [account.wanikani_user_id]
     );
 
-    const cache = await db.get(
-        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+    // Compute the live "due now" count from our local bucket table rather than
+    // trusting wk_summary_cache.review_count_now: WK's /summary endpoint can
+    // return stale review counts right at an unlock boundary, which used to
+    // make the per-account timer (firing at unlock+30s) miss the DM and wait
+    // for the next 5-minute cron tick.
+    const live = await db.get(
+        `SELECT COALESCE(SUM(subject_count), 0) AS due_now
+         FROM wk_summary_buckets
+         WHERE wanikani_user_id = ?
+           AND bucket_type = 'review'
+           AND datetime(available_at) <= datetime('now')`,
         [account.wanikani_user_id]
     );
-    const dueRightNow = cache?.review_count_now ?? 0;
+    const dueRightNow = live?.due_now ?? 0;
 
     // When the queue empties, reset the alert baseline so the next unlock
     // is correctly recognised as "new reviews".
@@ -703,6 +739,8 @@ async function maybeSendReviewsAvailableDM(client, account) {
     const lines = [
         `**${newlyAvailable}** new review${newlyAvailable === 1 ? '' : 's'} just became available.`,
         `Total in queue: **${dueRightNow}**.`,
+        '',
+        '[**Start reviews →**](https://www.wanikani.com/subjects/review)',
     ];
     if (nextBucket) {
         const ts = Math.floor(new Date(nextBucket.available_at).getTime() / 1000);
@@ -1102,6 +1140,7 @@ async function streakRiskJob(client, guildId) {
         const wantsShame = c.shame_enabled === 1;
         const wantsGentle = c.streak_reminder_enabled === 1;
         if (!wantsShame && !wantsGentle) continue;
+        if (await isWithinSleepWindow(c.discord_user_id)) continue;
 
         // Cross-guild dedupe: streak-risk crons run per-guild, but the DM is
         // user-scoped. If we already sent (or attempted) a streak DM in the
@@ -1143,6 +1182,7 @@ async function streakRiskJob(client, guildId) {
                         body,
                         '',
                         `**${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting · **${c.current_streak}**-day streak at risk.`,
+                        '[**Start reviews →**](https://www.wanikani.com/subjects/review)',
                         '-# Clear at least one review today to keep the streak alive.',
                     ].join('\n'))
                     .setTimestamp()
@@ -1153,6 +1193,7 @@ async function streakRiskJob(client, guildId) {
                     .setTitle('🔥 Streak about to break')
                     .setDescription([
                         `You have **${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting and a **${c.current_streak}**-day streak on the line.`,
+                        '[**Start reviews →**](https://www.wanikani.com/subjects/review)',
                         'Clear at least one review today to keep the streak alive.',
                         '',
                         'Disable with `/setup` (streak reminders).',
@@ -1472,6 +1513,18 @@ async function scheduleAll(client) {
         summaryRefreshJobHandle = cron.schedule(
             '*/5 * * * *',
             () => summaryRefreshJob(client).catch(err => console.error('[summaryRefreshJob]', err)),
+            { timezone: 'UTC' }
+        );
+    }
+    // WK reviews unlock on the hour. The */5 cron above does hit :00, but if
+    // the per-account setTimeout misfires (bot restart, sync error, or a stale
+    // /summary response) the next catchup wouldn't run until :05. This second
+    // job at HH:00 backstops the timer so users get pinged within seconds of
+    // the unlock instead of up to 5 minutes later.
+    if (!hourlyReviewCatchupJobHandle) {
+        hourlyReviewCatchupJobHandle = cron.schedule(
+            '0 * * * *',
+            () => hourlyReviewCatchupJob(client).catch(err => console.error('[hourlyReviewCatchupJob]', err)),
             { timezone: 'UTC' }
         );
     }

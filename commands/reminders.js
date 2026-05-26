@@ -1,5 +1,6 @@
 const { SlashCommandBuilder, MessageFlags } = require('discord.js');
 const { base, error } = require('../helpers/embeds');
+const { formatSleepHours } = require('../helpers/sleepHours');
 const db = require('../db');
 
 const TYPE_LABEL = {
@@ -39,7 +40,8 @@ module.exports = {
         );
 
         const userSettings = await db.get(
-            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled
+            `SELECT reviews_dm_enabled, streak_reminder_enabled, shame_enabled,
+                    sleep_start_hour, sleep_end_hour
              FROM user_reminder_settings
              WHERE discord_user_id = ?`,
             [userId]
@@ -69,6 +71,7 @@ module.exports = {
                 { name: 'Reviews-available DM', value: (userPrefs.reviews_dm_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Streak risk DM', value: (userPrefs.streak_reminder_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Shame DMs', value: (userPrefs.shame_enabled ?? 0) ? 'on' : 'off', inline: true },
+                { name: 'Sleep hours', value: formatSleepHours(userPrefs.sleep_start_hour, userPrefs.sleep_end_hour), inline: true },
                 { name: '— This server —', value: '`/guild_setup` to change', inline: false },
                 { name: 'Daily/weekly @mention', value: (settings.reviews_ping_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Queue-cleared announce', value: (settings.cleared_enabled ?? 1) ? 'on' : 'off', inline: true },
