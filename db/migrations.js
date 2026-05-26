@@ -677,6 +677,16 @@ const SCHEMA_V14 = [
     `ALTER TABLE reminder_settings ADD COLUMN levelup_announcement_enabled INTEGER NOT NULL DEFAULT 1`,
 ];
 
+// Optional quiet hours window per user. Hours are integers 0-23 interpreted in
+// the user's primary guild timezone at send time. When both columns are non-null
+// the DM-sending paths (reviews_available, streak_risk, shame) skip delivery
+// while the current local hour is inside [start, end) — wrapping past midnight
+// if end <= start.
+const SCHEMA_V15 = [
+    `ALTER TABLE user_reminder_settings ADD COLUMN sleep_start_hour INTEGER`,
+    `ALTER TABLE user_reminder_settings ADD COLUMN sleep_end_hour INTEGER`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -692,6 +702,7 @@ const MIGRATIONS = [
     { version: 12, name: 'guild_achievements', statements: SCHEMA_V12 },
     { version: 13, name: 'split_reviews_ping_into_dm', statements: SCHEMA_V13 },
     { version: 14, name: 'user_level_reminder_settings', statements: SCHEMA_V14 },
+    { version: 15, name: 'user_sleep_hours', statements: SCHEMA_V15 },
 ];
 
 async function runMigrations({ get, all, run }) {
