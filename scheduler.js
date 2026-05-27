@@ -432,6 +432,10 @@ async function checkUserResets(apiKey, discordUserId, guildId, wanikaniUserId, l
 // in the same job because it also depends on the freshly-synced summary.
 
 const reviewTimers = new Map(); // wanikani_user_id -> NodeJS.Timeout
+// Prevents the concurrent summaryRefreshJob + hourlyReviewCatchupJob calls that
+// both fire at HH:00 from racing through maybeSendReviewsAvailableDM and
+// double-sending. JS is single-threaded so the has()+add() pair is atomic.
+const dmSendInFlight = new Set(); // wanikani_user_id values currently inside maybeSendReviewsAvailableDM
 
 async function summaryRefreshJob(client) {
     const accounts = await db.all(
@@ -666,6 +670,9 @@ async function reviewTimerFired(client, account) {
 // Idempotent against repeated calls thanks to the 5-minute floor on
 // `last_reviews_alerted_at` and the `dueRightNow > prevCount` check.
 async function maybeSendReviewsAvailableDM(client, account) {
+    if (dmSendInFlight.has(account.wanikani_user_id)) return;
+    dmSendInFlight.add(account.wanikani_user_id);
+    try {
     // Opt-in lives in user_reminder_settings (true cross-guild scope — the DM
     // is user-scoped). No row = default-on, matching the pre-split behavior.
     const userPrefs = await db.get(
@@ -786,6 +793,9 @@ async function maybeSendReviewsAvailableDM(client, account) {
             status: 'failed',
             error: err.message,
         }).catch(e => console.error('[logReminderEvent/failed reviewDM]', e));
+    }
+    } finally {
+        dmSendInFlight.delete(account.wanikani_user_id);
     }
 }
 
