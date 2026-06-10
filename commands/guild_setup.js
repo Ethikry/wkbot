@@ -5,8 +5,9 @@ const db = require('../db');
 // Per-guild personal preferences. Personal DM preferences (reviews_dm, streak,
 // shame DMs) live cross-guild under `/setup`. This command only controls how
 // the *current server's* channel posts treat the user — whether to @mention,
-// whether to celebrate their queue clears / burns / level-ups in chat, and
-// whether to include shame about them in this server's daily/weekly posts.
+// whether their queue clears / burns appear in the daily recap's Highlights,
+// whether to announce level-ups, and whether to include shame about them in
+// this server's daily/weekly posts.
 //
 // Guild admins still need to enable each feature server-wide via `/config`
 // before any per-user opt-in here has any effect.
@@ -15,22 +16,22 @@ const FIELDS = [
     {
         option: 'mention',
         column: 'reviews_ping_enabled',
-        description: '@mention me in the daily summary and weekly leaderboard posts',
+        description: '@mention me in the daily recap and weekly leaderboard posts',
         label: 'Daily/weekly @mention',
         defaultValue: 1,
     },
     {
         option: 'cleared',
         column: 'cleared_enabled',
-        description: 'Announce when I clear my review queue in this server',
-        label: 'Queue-cleared announcement',
+        description: "Include my queue clears in this server's daily recap",
+        label: 'Recap: queue clears',
         defaultValue: 1,
     },
     {
         option: 'burn',
         column: 'burn_announcement_enabled',
-        description: 'Announce my burns in this server',
-        label: 'Burn announcement',
+        description: "Include my burns in this server's daily recap",
+        label: 'Recap: burns',
         defaultValue: 1,
     },
     {

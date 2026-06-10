@@ -3,17 +3,15 @@ const { EmbedBuilder } = require('discord.js');
 const db = require('./db');
 const { decrypt } = require('./helpers/crypto');
 const {
-    getWaniKaniData,
-    getReviewsCompletedSince,
-    getBurnedCount,
     getResetsSince,
     clearCacheForApiKey,
     getRemainingLessonsForGoal,
     computeFastestPaceDays,
 } = require('./helpers/wanikaniData');
 const { projectPace } = require('./helpers/longgoal');
+const { buildDailyRecap, finalizeGoalDay } = require('./helpers/dailyRecap');
 const wkSync = require('./helpers/wkSync');
-const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, COLOR_SUCCESS, FOOTER } = require('./helpers/embeds');
+const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, FOOTER } = require('./helpers/embeds');
 const { recordPoll } = require('./helpers/zerostate');
 const { pickShameLine } = require('./helpers/shame');
 const { generateShameLine } = require('./helpers/anthropic');
@@ -39,17 +37,6 @@ let dailySyncJobHandle = null;
 let paceAlertJobHandle = null;
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
-const START_OF_BOT_DAY = (timeZone) => {
-    const resolved = resolveTimeZone(timeZone);
-    return startOfBotDayUtcIso(botDateStr(0, resolved), resolved);
-};
-
-// Transient burn-count cache. The new schema deliberately doesn't persist this:
-// `bot_user_state` is for bot bookkeeping only, and the WK API cache (wk_assignments)
-// isn't yet wired up by the scheduler. After a bot restart the first poll silently
-// calibrates without firing a celebration — this is a deliberate trade-off vs.
-// either reading wk_assignments on every tick or polluting bot_user_state.
-const burnedCountByMember = new Map(); // key: `${guildId}::${discordUserId}`
 
 function clearGuildJobs(guildId) {
     const jobs = guildJobs.get(guildId);
@@ -119,64 +106,6 @@ async function getGuildMembers(guildId) {
     );
 }
 
-async function fetchUserSummaries(guild, rows) {
-    return Promise.all(rows.map(async row => {
-        const member = await guild.members.fetch(row.discord_user_id).catch(() => null);
-        const username = member ? member.displayName : 'Unknown';
-        try {
-            const data = await getWaniKaniData(row);
-            await recordPoll(row.discord_user_id, guild.id, data.dueRightNow, row.wanikani_user_id).catch(err =>
-                console.error(`[recordPoll] ${row.discord_user_id}@${guild.id}:`, err)
-            );
-            return {
-                userId: row.discord_user_id,
-                username,
-                ping: row.ping_enabled === 1,
-                shame: row.shame_enabled === 1,
-                onVacation: !!data.userData.current_vacation_started_at,
-                level: data.userData.level,
-                pendingLessons: data.pendingLessons,
-                dueRightNow: data.dueRightNow,
-                dueNext24Hours: data.dueNext24Hours,
-            };
-        } catch (err) {
-            console.error(`[scheduler] WK fetch failed for ${row.discord_user_id}:`, err);
-            return {
-                userId: row.discord_user_id,
-                username,
-                ping: row.ping_enabled === 1,
-                shame: row.shame_enabled === 1,
-                error: true,
-            };
-        }
-    }));
-}
-
-function summaryEmbed(title, description, summaries) {
-    const embed = new EmbedBuilder()
-        .setColor(COLOR_PRIMARY)
-        .setTitle(title)
-        .setTimestamp()
-        .setFooter(FOOTER);
-    if (description) embed.setDescription(description);
-
-    for (const s of summaries) {
-        if (s.error) {
-            embed.addFields({ name: s.username, value: '⚠️ Error fetching data', inline: false });
-        } else if (s.onVacation) {
-            embed.addFields({ name: s.username, value: '🏖️ Vacation mode', inline: false });
-        } else {
-            const next24Excl = Math.max(0, s.dueNext24Hours - s.dueRightNow);
-            embed.addFields({
-                name: s.username,
-                value: `Lvl **${s.level}** • Lessons **${s.pendingLessons}** • Reviews **${s.dueRightNow}** • Next 24h **+${next24Excl}**`,
-                inline: false,
-            });
-        }
-    }
-    return embed;
-}
-
 async function dailyJob(client, guildId) {
     console.log(`[daily] guild=${guildId}`);
     const guild = client.guilds.cache.get(guildId);
@@ -186,34 +115,53 @@ async function dailyJob(client, guildId) {
     const rows = await getGuildMembers(guildId);
     if (rows.length === 0) return;
 
+    const tz = resolveTimeZone(settings.timezone);
+    // The day being closed: one minute before the job fired. At the default
+    // midnight schedule that's yesterday; for a late-evening summary time
+    // it's the (almost-complete) current day.
+    const recapDateKey = botDateKey(new Date(Date.now() - 60 * 1000), tz);
+
+    // Snapshots first so the recap reads finalized data for the closing day,
+    // then goal results (which read the finalized snapshot rows).
+    await updateSnapshotsAndStreaks(guildId, rows);
+    await finalizeGoalDay(guildId, recapDateKey, tz).catch(err =>
+        console.error(`[finalizeGoalDay] ${guildId}:`, err)
+    );
+
     if (settings.daily_summary_enabled) {
         const channel = await resolveOutputChannel(guild, settings);
         if (channel) {
-            const summaries = await fetchUserSummaries(guild, rows);
-            const embed = summaryEmbed('📅 Daily WaniKani Summary', null, summaries);
+            const recap = await buildDailyRecap(guildId, guild, tz, recapDateKey);
+            if (recap) {
+                const embed = new EmbedBuilder()
+                    .setColor(COLOR_PRIMARY)
+                    .setTitle(recap.title)
+                    .setDescription(recap.description)
+                    .setTimestamp()
+                    .setFooter(FOOTER);
+                if (recap.fields.length) embed.addFields(...recap.fields);
 
-            const pingList = summaries.filter(s => s.ping).map(s => `<@${s.userId}>`);
-            const sent = await channel.send({
-                content: pingList.length ? pingList.join(' ') : undefined,
-                embeds: [embed],
-            });
-            // Log one daily_summary event per pinged member so /reminders history reflects them.
-            for (const row of rows) {
-                logReminderEvent({
-                    guildId,
-                    discordUserId: row.discord_user_id,
-                    wanikaniUserId: row.wanikani_user_id,
-                    reminderType: 'daily_summary',
-                    deliveryTarget: 'channel',
-                    channelId: channel.id,
-                    messageId: sent?.id ?? null,
-                    status: 'sent',
-                }).catch(e => console.error('[logReminderEvent/daily]', e));
+                const pingList = rows.filter(r => r.ping_enabled === 1).map(r => `<@${r.discord_user_id}>`);
+                const sent = await channel.send({
+                    content: pingList.length ? pingList.join(' ') : undefined,
+                    embeds: [embed],
+                });
+                // Log one daily_summary event per member so /reminders history reflects them.
+                for (const row of rows) {
+                    logReminderEvent({
+                        guildId,
+                        discordUserId: row.discord_user_id,
+                        wanikaniUserId: row.wanikani_user_id,
+                        reminderType: 'daily_summary',
+                        deliveryTarget: 'channel',
+                        channelId: channel.id,
+                        messageId: sent?.id ?? null,
+                        status: 'sent',
+                    }).catch(e => console.error('[logReminderEvent/daily]', e));
+                }
             }
         }
     }
-
-    await updateSnapshotsAndStreaks(guildId, rows);
 
     // Server-wide achievements run after snapshots so aggregate totals reflect
     // today's activity. Announce newly unlocked ones to the output channel.
@@ -428,8 +376,8 @@ async function checkUserResets(apiKey, discordUserId, guildId, wanikaniUserId, l
 // timer that fires exactly at the next review unlock — so the DM goes out at
 // unlock time rather than up-to-15-minutes-late as in the old poll.
 //
-// Per-guild work (queue_history bookkeeping, cleared-queue announcement) runs
-// in the same job because it also depends on the freshly-synced summary.
+// Per-guild work (queue_history bookkeeping) runs in the same job because it
+// also depends on the freshly-synced summary.
 
 const reviewTimers = new Map(); // wanikani_user_id -> NodeJS.Timeout
 // Prevents the concurrent summaryRefreshJob + hourlyReviewCatchupJob calls that
@@ -462,14 +410,19 @@ async function summaryRefreshJob(client) {
         }
     }
 
+    // Per-guild queue_history bookkeeping. This feeds the daily recap's
+    // queue-clears digest and the clear-queue goal evaluation, so it must
+    // keep polling even though the real-time cleared announcement is gone.
     for (const guild of client.guilds.cache.values()) {
         try {
-            const settings = await getOrCreateSettings(guild.id);
-            const channel = await resolveOutputChannel(guild, settings);
             const rows = await getGuildMembers(guild.id);
             for (const row of rows) {
                 try {
-                    await maybeAnnounceClearedQueue(client, guild, channel, settings, row);
+                    const cache = await db.get(
+                        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
+                        [row.wanikani_user_id]
+                    );
+                    await recordPoll(row.discord_user_id, guild.id, cache?.review_count_now ?? 0, row.wanikani_user_id);
                 } catch (err) {
                     console.error(`[summaryRefresh/guild] ${row.discord_user_id}@${guild.id}:`, err);
                 }
@@ -483,7 +436,7 @@ async function summaryRefreshJob(client) {
 // Top-of-hour catchup. Runs at HH:00 alongside the regular */5 tick so that
 // at the moment reviews unlock — every WK reviews bucket lands on the hour —
 // the DM goes out within seconds even if the per-account setTimeout missed.
-// Cheaper than summaryRefreshJob: skips per-guild cleared-queue work and
+// Cheaper than summaryRefreshJob: skips per-guild queue_history work and
 // snapshot/streak updates (the */5 tick still handles those).
 async function hourlyReviewCatchupJob(client) {
     const accounts = await db.all(
@@ -526,92 +479,6 @@ async function maybeResetReviewsAlertBaseline(account) {
               WHERE wanikani_user_id = ?`,
             [dueRightNow, account.wanikani_user_id]
         );
-    }
-}
-
-async function maybeAnnounceClearedQueue(client, guild, channel, settings, row) {
-    const cache = await db.get(
-        `SELECT review_count_now FROM wk_summary_cache WHERE wanikani_user_id = ?`,
-        [row.wanikani_user_id]
-    );
-    const dueRightNow = cache?.review_count_now ?? 0;
-
-    let cleared = false;
-    if (
-        channel &&
-        settings.reviews_cleared_announcements_enabled &&
-        row.cleared_enabled !== 0 &&
-        dueRightNow === 0
-    ) {
-        const prev = await db.get(
-            `SELECT queue_size FROM queue_history
-             WHERE guild_id = ? AND discord_user_id = ?
-             ORDER BY recorded_at DESC LIMIT 1`,
-            [guild.id, row.discord_user_id]
-        );
-        if (prev && prev.queue_size > 0) cleared = true;
-    }
-
-    await recordPoll(row.discord_user_id, guild.id, dueRightNow, row.wanikani_user_id);
-
-    if (!cleared) return;
-    try {
-        const reviewsToday = await getReviewsCompletedSince(row, START_OF_BOT_DAY(settings.timezone))
-            .catch(err => {
-                console.warn(`[cleared/reviewsToday] ${row.discord_user_id}@${guild.id}:`, err);
-                return null;
-            });
-        const nextBucket = await db.get(
-            `SELECT available_at, subject_count FROM wk_summary_buckets
-             WHERE wanikani_user_id = ? AND bucket_type = 'review'
-               AND datetime(available_at) > datetime('now')
-             ORDER BY available_at ASC LIMIT 1`,
-            [row.wanikani_user_id]
-        );
-        const head = reviewsToday !== null
-            ? `<@${row.discord_user_id}> just cleared their review queue — **${reviewsToday}** reviews done today!`
-            : `<@${row.discord_user_id}> just cleared their review queue — nice!`;
-        const description = nextBucket
-            ? `${head}\nNext batch: **+${nextBucket.subject_count}** <t:${Math.floor(new Date(nextBucket.available_at).getTime() / 1000)}:R>.`
-            : head;
-        const embed = new EmbedBuilder()
-            .setColor(COLOR_SUCCESS)
-            .setTitle('🧹 Reviews cleared!')
-            .setDescription(description)
-            .setTimestamp()
-            .setFooter(FOOTER);
-        const sent = await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
-        await db.run(
-            `INSERT INTO bot_user_state (guild_id, discord_user_id, wanikani_user_id, last_reviews_cleared_at)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-                 last_reviews_cleared_at = excluded.last_reviews_cleared_at,
-                 updated_at = CURRENT_TIMESTAMP`,
-            [guild.id, row.discord_user_id, row.wanikani_user_id, new Date().toISOString()]
-        );
-        await logReminderEvent({
-            guildId: guild.id,
-            discordUserId: row.discord_user_id,
-            wanikaniUserId: row.wanikani_user_id,
-            reminderType: 'reviews_cleared',
-            deliveryTarget: 'channel',
-            channelId: channel.id,
-            messageId: sent?.id ?? null,
-            reviewCount: reviewsToday,
-            status: 'sent',
-        }).catch(e => console.error('[logReminderEvent]', e));
-    } catch (err) {
-        console.error(`[cleared] ${row.discord_user_id}@${guild.id}:`, err);
-        await logReminderEvent({
-            guildId: guild.id,
-            discordUserId: row.discord_user_id,
-            wanikaniUserId: row.wanikani_user_id,
-            reminderType: 'reviews_cleared',
-            deliveryTarget: 'channel',
-            channelId: channel?.id ?? null,
-            status: 'failed',
-            error: err.message,
-        }).catch(e => console.error('[logReminderEvent/failed cleared]', e));
     }
 }
 
@@ -800,12 +667,14 @@ async function maybeSendReviewsAvailableDM(client, account) {
 }
 
 // ── slow-loop detection (hourly) ────────────────────────────────────────
-// Replaces the old 15-minute pollUsersJob. Level-up / burn / reset detection
-// is not time-critical, so it runs once per hour against freshly-synced caches.
+// Replaces the old 15-minute pollUsersJob. Level-up / reset detection is not
+// time-critical, so it runs once per hour against freshly-synced caches.
+// (Burn detection used to live here too; burns now surface in the daily
+// recap's Highlights digest instead of real-time posts.)
 
 async function slowDetectionJob(client) {
     // Sync each WaniKani account exactly once per tick, capturing
-    // previous/current level (and burned count) before any guild loop runs.
+    // previous/current level before any guild loop runs.
     // Doing the sync inside the per-guild loop caused multi-guild users to
     // miss level-up announcements in every guild after the first: the second
     // guild's "previous" read picked up the already-synced row, so the diff
@@ -833,8 +702,7 @@ async function slowDetectionJob(client) {
                 [row.wanikani_user_id]
             );
             const level = accountAfter?.level ?? previousLevel;
-            const burned = await getBurnedCount(row).catch(() => null);
-            accountState.set(row.wanikani_user_id, { previousLevel, level, burned });
+            accountState.set(row.wanikani_user_id, { previousLevel, level });
         } catch (err) {
             console.error(`[slowDetection/sync] ${row.wanikani_user_id}:`, err);
         }
@@ -850,7 +718,7 @@ async function slowDetectionJob(client) {
                     const apiKey = decrypt(row.api_token_encrypted);
                     const state = accountState.get(row.wanikani_user_id);
                     if (!state) continue;
-                    const { previousLevel, level, burned } = state;
+                    const { previousLevel, level } = state;
 
                     const lastResetState = await db.get(
                         `SELECT last_reset_checked_at FROM bot_user_state
@@ -877,26 +745,9 @@ async function slowDetectionJob(client) {
                         console.log(`[slowDetection] ${row.discord_user_id}@${guild.id}: no prior level, skipping level-up announcement (first sync)`);
                     }
 
-                    const burnKey = `${guild.id}::${row.discord_user_id}`;
-                    const previousBurned = burnedCountByMember.get(burnKey);
-                    if (
-                        channel &&
-                        settings.burn_celebrations_enabled &&
-                        row.burn_announcement_enabled !== 0 &&
-                        burned !== null &&
-                        previousBurned !== undefined &&
-                        burned > previousBurned
-                    ) {
-                        const delta = burned - previousBurned;
-                        const embed = new EmbedBuilder()
-                            .setColor(0xE67E22)
-                            .setTitle('🔥 Burned!')
-                            .setDescription(`<@${row.discord_user_id}> just burned **${delta}** item${delta === 1 ? '' : 's'} (total burned: **${burned}**)`)
-                            .setTimestamp()
-                            .setFooter(FOOTER);
-                        await channel.send({ embeds: [embed] });
-                    }
-                    if (burned !== null) burnedCountByMember.set(burnKey, burned);
+                    // Burns are no longer announced in real time — they show
+                    // up in the daily recap's Highlights digest instead
+                    // (helpers/dailyRecap.js reads wk_assignments.burned_at).
 
                     // Achievement check — runs against freshly-synced state.
                     await evaluateAchievements({
@@ -955,7 +806,7 @@ async function pollUsersJob(client) {
 }
 
 async function paceAlertJob(client) {
-    const goals = await db.all(`SELECT * FROM long_goals WHERE notify_enabled = 1`);
+    const goals = await db.all(`SELECT * FROM user_goals WHERE notify_enabled = 1`);
 
     for (const goal of goals) {
         try {
@@ -987,7 +838,7 @@ async function paceAlertJob(client) {
             // ops can tell when the job last evaluated this goal — even if no
             // alert is emitted today.
             await db.run(
-                `UPDATE long_goals SET last_projection_at = ?, updated_at = CURRENT_TIMESTAMP
+                `UPDATE user_goals SET last_projection_at = ?, updated_at = CURRENT_TIMESTAMP
                  WHERE discord_user_id = ?`,
                 [new Date().toISOString(), goal.discord_user_id]
             );
@@ -1075,7 +926,9 @@ async function paceAlertJob(client) {
                     .setTitle('⏳ Behind pace today')
                     .setDescription([
                         `You've done **${lessonsToday}/${target}** lessons today.`,
-                        `Goal: level **${goal.target_level}**${goal.deadline ? ` by **${goal.deadline}**` : ''}.`,
+                        goal.target_level
+                            ? `Goal: level **${goal.target_level}**${goal.deadline ? ` by **${goal.deadline}**` : ''}.`
+                            : `Goal: **${target}** lessons/day.`,
                         'Try to log a session today to stay on track.',
                         '',
                         'Disable with `/goals` → Configure alerts.',
@@ -1090,7 +943,7 @@ async function paceAlertJob(client) {
             try {
                 await user.send({ embeds: [embed] });
                 await db.run(
-                    `UPDATE long_goals SET last_alerted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
+                    `UPDATE user_goals SET last_alerted_at = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
                     [new Date().toISOString(), goal.discord_user_id]
                 );
             } catch (err) {
@@ -1553,7 +1406,7 @@ async function scheduleAll(client) {
             { timezone: 'UTC' }
         );
     }
-    // Level-up / burn / reset detection (hourly — not time-critical).
+    // Level-up / reset detection (hourly — not time-critical).
     if (!slowDetectionJobHandle) {
         slowDetectionJobHandle = cron.schedule(
             '0 * * * *',

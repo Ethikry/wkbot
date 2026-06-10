@@ -10,8 +10,7 @@ const {
 } = require('discord.js');
 const { base, success, error } = require('../helpers/embeds');
 const { getAccountForDiscordUser, getWanikaniUserId } = require('../helpers/userLink');
-const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal, computeFastestPaceDays } = require('../helpers/wanikaniData');
-const { DEFAULT_TIME_ZONE } = require('../helpers/botTime');
+const { getWaniKaniData, getHitRate, getRemainingLessonsForGoal, computeFastestPaceDays, getLevelUpETA } = require('../helpers/wanikaniData');
 const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const {
     paceOptionsFor,
@@ -28,6 +27,12 @@ const NAMESPACE = 'goals';
 const id = (...parts) => [NAMESPACE, ...parts].join(':');
 const isOurId = (s) => typeof s === 'string' && s.startsWith(`${NAMESPACE}:`);
 
+// One goal model, user-level (identical in every server): an optional
+// long-term target (level + deadline, which derives a lessons/day pace) plus
+// two daily commitments — lessons/day and "clear my review queue". There are
+// deliberately no numeric daily *review* targets: the SRS dictates how many
+// reviews come due, so such targets were either trivially met or impossible.
+
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('goals')
@@ -37,7 +42,7 @@ module.exports = {
     async execute(interaction) {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         await awaitInteractionStateRefresh(interaction, 'goals');
-        const payload = await buildOverviewPayload(interaction.user.id, interaction.guildId);
+        const payload = await buildOverviewPayload(interaction.user.id);
         return interaction.editReply(payload);
     },
 
@@ -47,12 +52,12 @@ module.exports = {
         const parts = interaction.customId.split(':');
         const action = parts[1];
 
-        if (action === 'set')              return showGoalTypeSelector(interaction);
+        if (action === 'set_lt')           return startLtWizardDM(interaction, client);
+        if (action === 'set_daily')        return showDailyModal(interaction);
+        if (action === 'toggle_clear')     return toggleClearQueue(interaction);
         if (action === 'alerts')           return showAlertConfig(interaction);
         if (action === 'clear')            return showClearConfirm(interaction);
         if (action === 'back')             return rebuildOverview(interaction);
-        if (action === 'set_lt')           return startLtWizardDM(interaction, client);
-        if (action === 'set_daily')        return showDailyModal(interaction);
         if (action === 'lt_start')         return showLtInitModal(interaction);
         if (action === 'lt_p')             return handleLtPace(interaction, parts[2]);
         if (action === 'lt_confirm')       return handleLtConfirm(interaction);
@@ -75,55 +80,54 @@ module.exports = {
 // Overview
 // ---------------------------------------------------------------------------
 
-async function buildOverviewPayload(userId, guildId) {
-    const [longGoal, dailyGoal] = await Promise.all([
-        db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [userId]),
-        guildId
-            ? db.get(`SELECT * FROM goals WHERE guild_id = ? AND discord_user_id = ?`, [guildId, userId])
-            : null,
-    ]);
+async function buildOverviewPayload(userId) {
+    const goal = await db.get(`SELECT * FROM user_goals WHERE discord_user_id = ?`, [userId]);
+
+    let account = null;
+    let currentLevel = null;
+    try {
+        account = await getAccountForDiscordUser(userId);
+        if (account) {
+            const wk = await getWaniKaniData(account);
+            currentLevel = wk.userData.level;
+        }
+    } catch (e) {
+        console.error('[goals overview] WK fetch:', e);
+    }
 
     const lines = [];
 
-    if (longGoal) {
-        let currentLevel = null;
+    if (goal?.target_level) {
         let proj = null;
-        try {
-            const account = await getAccountForDiscordUser(userId);
-            if (account) {
-                const wk = await getWaniKaniData(account);
-                currentLevel = wk.userData.level;
-                if (longGoal.deadline) {
-                    const [itemCounts, fastest] = await Promise.all([
-                        getRemainingLessonsForGoal(account, longGoal.target_level, currentLevel).catch(err => {
-                            console.warn('[goals overview] lesson count projection:', err);
-                            return null;
-                        }),
-                        computeFastestPaceDays(account, currentLevel, longGoal.target_level).catch(err => {
-                            console.warn('[goals overview] fastest pace projection:', err);
-                            return null;
-                        }),
-                    ]);
-                    proj = projectPace({
-                        targetLevel: longGoal.target_level,
-                        currentLevel,
-                        deadline: longGoal.deadline,
-                        hitRate: longGoal.hit_rate,
-                        dailyLessons: longGoal.daily_lessons,
-                        itemCounts,
-                        srsDaysPerLevel: fastest?.avgDaysPerLevel,
-                    });
-                }
+        if (currentLevel !== null && goal.deadline) {
+            try {
+                const [itemCounts, fastest] = await Promise.all([
+                    getRemainingLessonsForGoal(account, goal.target_level, currentLevel).catch(err => {
+                        console.warn('[goals overview] lesson count projection:', err);
+                        return null;
+                    }),
+                    computeFastestPaceDays(account, currentLevel, goal.target_level).catch(err => {
+                        console.warn('[goals overview] fastest pace projection:', err);
+                        return null;
+                    }),
+                ]);
+                proj = projectPace({
+                    targetLevel: goal.target_level,
+                    currentLevel,
+                    deadline: goal.deadline,
+                    hitRate: goal.hit_rate,
+                    dailyLessons: goal.daily_lessons,
+                    itemCounts,
+                    srsDaysPerLevel: fastest?.avgDaysPerLevel,
+                });
+            } catch (e) {
+                console.error('[goals overview] projection:', e);
             }
-        } catch (e) {
-            console.error('[goals overview] WK fetch:', e);
         }
 
         lines.push('**Long-term Goal**');
-        lines.push(`🎯 Level ${longGoal.target_level} by **${longGoal.deadline ?? 'no deadline'}**`);
+        lines.push(`🎯 Level ${goal.target_level} by **${goal.deadline ?? 'no deadline'}**`);
         if (currentLevel !== null) lines.push(`Current level: ${currentLevel}`);
-        lines.push(`Plan: ${fmtPace(longGoal.pace_mode)} — ${longGoal.daily_lessons ?? 0} lessons/day`);
-        lines.push(`Daily target: ${longGoal.daily_lessons ?? 0} lessons · ~${longGoal.daily_reviews ?? 0} reviews`);
         if (proj) {
             if (proj.underWaniKaniMinimum) {
                 lines.push(`⛔ Deadline is before your SRS-adjusted minimum — earliest projection **${proj.projectedFinish}**`);
@@ -133,69 +137,175 @@ async function buildOverviewPayload(userId, guildId) {
                 lines.push(`⚠️ Behind pace — projecting **${proj.projectedFinish}**, past deadline`);
             }
         }
-        lines.push('');
-        lines.push(`**Alerts:** ${longGoal.notify_enabled ? '🔔 on' : '🔕 off'}`);
     } else {
         lines.push('**Long-term Goal:** not set');
     }
 
-    if (guildId) {
-        lines.push('');
-        const hasDailyNumbers = dailyGoal && (dailyGoal.daily_lessons || dailyGoal.daily_all_lessons || dailyGoal.daily_reviews || dailyGoal.daily_all_reviews);
-        if (hasDailyNumbers) {
-            lines.push('**Daily Goals** (this server)');
-            if (dailyGoal.daily_all_lessons)  lines.push('• Lessons: **all**/day');
-            else if (dailyGoal.daily_lessons) lines.push(`• Lessons: **${dailyGoal.daily_lessons}**/day`);
-            if (dailyGoal.daily_all_reviews)  lines.push('• Clear review queue daily: **on**');
-            else if (dailyGoal.daily_reviews) lines.push(`• Reviews: **${dailyGoal.daily_reviews}**/day`);
-        } else if (longGoal) {
-            lines.push('**Daily Goals** (this server): derived from long-term goal');
-        } else {
-            lines.push('**Daily Goals** (this server): not set');
+    // Level-up ETA — on-demand motivation, computed from the local
+    // assignments cache (kanji progress at the current level).
+    if (account && currentLevel !== null && currentLevel < 60) {
+        try {
+            const eta = await getLevelUpETA(account, currentLevel);
+            if (eta) {
+                const unix = Math.floor(eta.eta.getTime() / 1000);
+                lines.push(`📈 Level ${currentLevel + 1} <t:${unix}:R> at current pace (${eta.passed}/${eta.threshold} kanji passed)`);
+            }
+        } catch (e) {
+            console.warn('[goals overview] level-up ETA:', e);
         }
     }
+
+    lines.push('');
+    lines.push('**Daily Commitments**');
+    lines.push(goal?.daily_lessons
+        ? `• Lessons: **${goal.daily_lessons}**/day`
+        : '• Lessons: no target');
+    lines.push(`• Clear review queue: **${goal?.clear_queue ? 'on' : 'off'}**`);
+
+    if (goal?.daily_lessons || goal?.clear_queue) {
+        const streak = await db.get(
+            `SELECT MAX(goal_current_streak) AS cur, MAX(goal_longest_streak) AS best
+             FROM streaks WHERE discord_user_id = ?`,
+            [userId]
+        );
+        if (streak?.best > 0) {
+            lines.push(`🎯 Goal streak: **${streak.cur ?? 0}** day${(streak.cur ?? 0) === 1 ? '' : 's'} (best ${streak.best})`);
+        }
+        lines.push('-# Checked nightly against your daily recap.');
+    }
+
+    lines.push('');
+    lines.push(`**Alerts:** ${goal?.notify_enabled ? '🔔 on' : '🔕 off'}`);
 
     const embed = base('🎯 Your Goals').setDescription(lines.join('\n'));
     return {
         embeds: [embed],
-        components: [overviewButtons()],
+        components: overviewButtons(goal),
     };
 }
 
-function overviewButtons() {
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(id('set')).setLabel('Set a goal').setEmoji('✍️').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(id('alerts')).setLabel('Configure alerts').setEmoji('🔔').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(id('clear')).setLabel('Clear goal').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
-    );
+function overviewButtons(goal) {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(id('set_lt')).setLabel('Set level target').setEmoji('🎯').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(id('set_daily')).setLabel('Daily lessons').setEmoji('✏️').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+                .setCustomId(id('toggle_clear'))
+                .setLabel(goal?.clear_queue ? 'Clear queue daily: on' : 'Clear queue daily: off')
+                .setEmoji('🧹')
+                .setStyle(goal?.clear_queue ? ButtonStyle.Success : ButtonStyle.Secondary),
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(id('alerts')).setLabel('Configure alerts').setEmoji('🔔').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(id('clear')).setLabel('Clear goal').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
+        ),
+    ];
 }
 
 async function rebuildOverview(interaction) {
     await interaction.deferUpdate();
-    const payload = await buildOverviewPayload(interaction.user.id, interaction.guildId);
+    const payload = await buildOverviewPayload(interaction.user.id);
     return interaction.editReply(payload);
 }
 
+// Upserts a user_goals row, preserving any columns not being set.
+async function upsertGoal(userId, wanikaniUserId, columns) {
+    const keys = Object.keys(columns);
+    await db.run(
+        `INSERT INTO user_goals (discord_user_id, wanikani_user_id, ${keys.join(', ')})
+         VALUES (?, ?, ${keys.map(() => '?').join(', ')})
+         ON CONFLICT(discord_user_id) DO UPDATE SET
+            wanikani_user_id = excluded.wanikani_user_id,
+            ${keys.map(k => `${k} = excluded.${k}`).join(', ')},
+            updated_at = CURRENT_TIMESTAMP`,
+        [userId, wanikaniUserId, ...keys.map(k => columns[k])]
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Goal type selector
+// Daily lessons modal
 // ---------------------------------------------------------------------------
 
-function showGoalTypeSelector(interaction) {
-    const embed = base('🎯 Set a Goal').setDescription([
-        '**Long-term goal**',
-        'Set a target WaniKani level and deadline. The bot calculates your required daily pace and tracks whether you\'re on track.',
-        '',
-        '**Daily goal**',
-        'Set specific daily lesson and/or review targets for this server\'s progress summary.',
-    ].join('\n'));
-    return interaction.update({
-        embeds: [embed],
-        components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(id('set_lt')).setLabel('Long-term goal').setEmoji('🎯').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(id('set_daily')).setLabel('Daily goal').setEmoji('📋').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(id('back')).setLabel('Back').setStyle(ButtonStyle.Secondary),
+async function showDailyModal(interaction) {
+    const existing = await db.get(
+        `SELECT daily_lessons FROM user_goals WHERE discord_user_id = ?`,
+        [interaction.user.id]
+    );
+    await interaction.showModal(
+        new ModalBuilder()
+            .setCustomId(id('m_daily'))
+            .setTitle('Daily lesson target')
+            .addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('lessons')
+                        .setLabel('Lessons per day (1–500, blank to remove)')
+                        .setStyle(TextInputStyle.Short)
+                        .setMaxLength(3)
+                        .setPlaceholder('e.g. 15')
+                        .setValue(existing?.daily_lessons ? String(existing.daily_lessons) : '')
+                        .setRequired(false),
+                ),
+            )
+    );
+}
+
+async function handleDailyModal(interaction) {
+    const lessonsRaw = interaction.fields.getTextInputValue('lessons').trim();
+
+    let dailyLessons = null;
+    if (lessonsRaw !== '' && lessonsRaw !== '0') {
+        const n = parseInt(lessonsRaw, 10);
+        if (!Number.isInteger(n) || n < 1 || n > 500) {
+            return respondModal(interaction, {
+                embeds: [error('Invalid Lessons', 'Enter a number between 1 and 500, or leave blank to remove the target.')],
+                components: [],
+            });
+        }
+        dailyLessons = n;
+    }
+
+    const wanikaniUserId = await getWanikaniUserId(interaction.user.id);
+    if (!wanikaniUserId) {
+        return respondModal(interaction, {
+            embeds: [error('No WaniKani Account', 'Run `/setup apikey:<token>` in a server to link your WaniKani account first.')],
+            components: [],
+        });
+    }
+    await upsertGoal(interaction.user.id, wanikaniUserId, { daily_lessons: dailyLessons });
+
+    return respondModal(interaction, {
+        embeds: [success(
+            'Daily Lessons Updated',
+            (dailyLessons
+                ? `Lessons: **${dailyLessons}**/day.`
+                : 'Daily lesson target removed.')
+            + '\nYour result shows in the daily recap each day.'
         )],
+        components: [backRow()],
     });
+}
+
+// ---------------------------------------------------------------------------
+// Clear-queue toggle
+// ---------------------------------------------------------------------------
+
+async function toggleClearQueue(interaction) {
+    await interaction.deferUpdate();
+    const wanikaniUserId = await getWanikaniUserId(interaction.user.id);
+    if (!wanikaniUserId) {
+        return interaction.editReply({
+            embeds: [error('No WaniKani Account', 'Run `/setup apikey:<token>` in a server to link your WaniKani account first.')],
+            components: [backRow()],
+        });
+    }
+    const existing = await db.get(
+        `SELECT clear_queue FROM user_goals WHERE discord_user_id = ?`,
+        [interaction.user.id]
+    );
+    await upsertGoal(interaction.user.id, wanikaniUserId, { clear_queue: existing?.clear_queue ? 0 : 1 });
+    const payload = await buildOverviewPayload(interaction.user.id);
+    return interaction.editReply(payload);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +470,7 @@ async function handleLtInitModal(interaction) {
         wizard.set(interaction.user.id, {
             targetLevel, currentLevel, deadline,
             hitRate, hitRateSampleSize, itemCounts, srsDaysPerLevel,
-            chosenPaceKey: null, customLessons: null, customHitRate: null,
+            chosenPaceKey: null, customLessons: null,
         });
 
         return interaction.editReply({
@@ -380,7 +490,7 @@ async function handleLtPace(interaction, paceKey) {
     const state = wizard.get(interaction.user.id);
     if (!state) {
         return interaction.update({
-            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set level target to start again.')],
             components: [],
         });
     }
@@ -392,7 +502,7 @@ async function handleLtPace(interaction, paceKey) {
             components: [],
         });
     }
-    wizard.update(interaction.user.id, { chosenPaceKey: paceKey, customLessons: null, customHitRate: null });
+    wizard.update(interaction.user.id, { chosenPaceKey: paceKey, customLessons: null });
     return interaction.update({
         embeds: [ltConfirmEmbed(state, chosen)],
         components: ltConfirmRows(),
@@ -403,7 +513,7 @@ async function handleLtCustomize(interaction) {
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return interaction.update({
-            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set level target to start again.')],
             components: [],
         });
     }
@@ -415,15 +525,6 @@ async function handleLtCustomize(interaction) {
         });
     }
     const currentLessons = state.customLessons ?? chosen.projection.lessonsPerDay;
-    const hitRatePlaceholder = `Uses last 30d: ${formatPercent(state.hitRate)}`;
-    const hitRateInput = new TextInputBuilder()
-        .setCustomId('hit_rate')
-        .setLabel('Hit rate override % (optional)')
-        .setStyle(TextInputStyle.Short)
-        .setMaxLength(6)
-        .setPlaceholder(hitRatePlaceholder)
-        .setRequired(false);
-    if (state.customHitRate) hitRateInput.setValue(String(Math.round(state.customHitRate * 100)));
 
     await interaction.showModal(
         new ModalBuilder()
@@ -438,9 +539,6 @@ async function handleLtCustomize(interaction) {
                         .setMinLength(1).setMaxLength(4)
                         .setValue(String(currentLessons))
                         .setRequired(true),
-                ),
-                new ActionRowBuilder().addComponents(
-                    hitRateInput,
                 ),
             )
     );
@@ -467,7 +565,6 @@ function impossibleGoalEmbed(state, projection) {
 
 async function handleLtCustomModal(interaction) {
     const lessons = parseInt(interaction.fields.getTextInputValue('lessons').trim(), 10);
-    const hitRateRaw = interaction.fields.getTextInputValue('hit_rate').trim();
 
     if (!Number.isInteger(lessons) || lessons < 1 || lessons > 500) {
         return respondModal(interaction, {
@@ -479,34 +576,22 @@ async function handleLtCustomModal(interaction) {
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return respondModal(interaction, {
-            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set level target to start again.')],
             components: [],
         });
     }
 
-    const customHitRate = parseHitRateOverride(hitRateRaw);
-    if (customHitRate === false) {
-        return respondModal(interaction, {
-            embeds: [error('Invalid Hit Rate', 'Enter a percentage from 1 to 100, a decimal from 0.01 to 1, or leave it blank.')],
-            components: ltConfirmRows(),
-        });
-    }
-
-    const finalHitRate = customHitRate ?? state.hitRate;
     const projection = projectPace({
         targetLevel: state.targetLevel,
         currentLevel: state.currentLevel,
         deadline: state.deadline,
-        hitRate: finalHitRate,
+        hitRate: state.hitRate,
         dailyLessons: lessons,
         itemCounts: state.itemCounts,
         srsDaysPerLevel: state.srsDaysPerLevel,
     });
 
-    // A lower custom hit rate can push the goal past the SRS minimum; we
-    // surface that via the ⛔ line in the confirm embed but no longer block
-    // saving — improving accuracy can recover the goal.
-    wizard.update(interaction.user.id, { customLessons: lessons, customHitRate });
+    wizard.update(interaction.user.id, { customLessons: lessons });
     const updated = wizard.get(interaction.user.id);
 
     return respondModal(interaction, {
@@ -519,7 +604,7 @@ async function handleLtConfirm(interaction) {
     const state = wizard.get(interaction.user.id);
     if (!state?.chosenPaceKey) {
         return interaction.update({
-            embeds: [error('Session Expired', 'Run `/goals` → Set a goal → Long-term goal to start again.')],
+            embeds: [error('Session Expired', 'Run `/goals` → Set level target to start again.')],
             components: [],
         });
     }
@@ -531,13 +616,7 @@ async function handleLtConfirm(interaction) {
         });
     }
     const finalLessons = chosen.projection.lessonsPerDay;
-    const finalReviews = chosen.projection.reviewsPerDay;
-    const finalDaysPerLevel = chosen.projection.daysPerLevel;
     const finalHitRate = chosen.projection.effectiveHitRate;
-    const levelsRemaining = Math.max(1, state.targetLevel - state.currentLevel);
-    const avgItemsPerLevel = state.itemCounts?.total
-        ? Math.round(state.itemCounts.total / levelsRemaining)
-        : null;
 
     const wanikaniUserId = await getWanikaniUserId(interaction.user.id);
     if (!wanikaniUserId) {
@@ -546,29 +625,12 @@ async function handleLtConfirm(interaction) {
             components: [],
         });
     }
-    await db.run(
-        `INSERT INTO long_goals (
-            discord_user_id, wanikani_user_id, target_level, deadline, pace_mode,
-            days_per_level, items_per_level,
-            daily_lessons, daily_reviews, hit_rate
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(discord_user_id) DO UPDATE SET
-            wanikani_user_id = excluded.wanikani_user_id,
-            target_level = excluded.target_level,
-            deadline = excluded.deadline,
-            pace_mode = excluded.pace_mode,
-            days_per_level = excluded.days_per_level,
-            items_per_level = excluded.items_per_level,
-            daily_lessons = excluded.daily_lessons,
-            daily_reviews = excluded.daily_reviews,
-            hit_rate = excluded.hit_rate,
-            updated_at = CURRENT_TIMESTAMP`,
-        [
-            interaction.user.id, wanikaniUserId, state.targetLevel, state.deadline, chosen.key,
-            finalDaysPerLevel, avgItemsPerLevel,
-            finalLessons, finalReviews, finalHitRate,
-        ]
-    );
+    await upsertGoal(interaction.user.id, wanikaniUserId, {
+        target_level: state.targetLevel,
+        deadline: state.deadline,
+        hit_rate: finalHitRate,
+        daily_lessons: finalLessons,
+    });
     wizard.remove(interaction.user.id);
 
     return interaction.update({
@@ -576,11 +638,10 @@ async function handleLtConfirm(interaction) {
             'Long-Term Goal Saved',
             [
                 `🎯 **Level ${state.targetLevel} by ${state.deadline}**`,
-                `Plan: ${chosen.label} (${finalLessons} lessons/day)`,
-                `Daily target: **${finalLessons}** lessons · **${finalReviews}** reviews`,
+                `Plan: ${chosen.label} — **${finalLessons}** lessons/day`,
                 `Projected finish: **${chosen.projection.projectedFinish}**`,
                 '',
-                'Run `/goals` in a server to view progress and configure alerts.',
+                'Run `/goals` to view progress and configure alerts.',
             ].join('\n')
         )],
         components: [],
@@ -596,131 +657,15 @@ async function handleLtCancel(interaction) {
 }
 
 // ---------------------------------------------------------------------------
-// Daily goal modal
-// ---------------------------------------------------------------------------
-
-async function showDailyModal(interaction) {
-    if (!interaction.guildId) {
-        return interaction.update({
-            embeds: [error('Server Only', 'Daily goals can only be set within a server, not in DMs.')],
-            components: [backRow()],
-        });
-    }
-    const existing = await db.get(
-        `SELECT daily_lessons, daily_reviews, daily_all_reviews, daily_all_lessons FROM goals WHERE guild_id = ? AND discord_user_id = ?`,
-        [interaction.guildId, interaction.user.id]
-    );
-    await interaction.showModal(
-        new ModalBuilder()
-            .setCustomId(id('m_daily'))
-            .setTitle('Set Daily Goals')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('lessons')
-                        .setLabel("Daily lesson target (0–500, or 'all')")
-                        .setStyle(TextInputStyle.Short)
-                        .setMaxLength(5)
-                        .setPlaceholder("e.g. 20")
-                        .setValue(existing?.daily_all_lessons ? 'all' : (existing?.daily_lessons ? String(existing.daily_lessons) : ''))
-                        .setRequired(false),
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('reviews')
-                        .setLabel("Daily review target (0–2000, or 'all')")
-                        .setStyle(TextInputStyle.Short)
-                        .setMaxLength(5)
-                        .setPlaceholder("e.g. 100")
-                        .setValue(existing?.daily_all_reviews ? 'all' : (existing?.daily_reviews ? String(existing.daily_reviews) : ''))
-                        .setRequired(false),
-                ),
-            )
-    );
-}
-
-async function handleDailyModal(interaction) {
-    if (!interaction.guildId) {
-        return respondModal(interaction, {
-            embeds: [error('Server Only', 'Daily goals require a server context.')],
-            components: [],
-        });
-    }
-
-    const lessonsRaw = interaction.fields.getTextInputValue('lessons').trim().toLowerCase();
-    const reviewsRaw = interaction.fields.getTextInputValue('reviews').trim().toLowerCase();
-
-    let dailyLessons = 0, dailyAllLessons = 0, dailyReviews = 0, dailyAllReviews = 0;
-
-    if (lessonsRaw === 'all') {
-        dailyAllLessons = 1;
-    } else if (lessonsRaw !== '') {
-        const n = parseInt(lessonsRaw, 10);
-        if (!Number.isInteger(n) || n < 0 || n > 500) {
-            return respondModal(interaction, {
-                embeds: [error('Invalid Lessons', "Enter a number between 0 and 500, or 'all'.")],
-                components: [],
-            });
-        }
-        dailyLessons = n;
-    }
-
-    if (reviewsRaw === 'all') {
-        dailyAllReviews = 1;
-    } else if (reviewsRaw !== '') {
-        const n = parseInt(reviewsRaw, 10);
-        if (!Number.isInteger(n) || n < 0 || n > 2000) {
-            return respondModal(interaction, {
-                embeds: [error('Invalid Reviews', "Enter a number between 0 and 2000, or 'all'.")],
-                components: [],
-            });
-        }
-        dailyReviews = n;
-    }
-
-    const { user: { id: userId }, guildId } = interaction;
-    await db.run(
-        `INSERT OR IGNORE INTO guild_settings (guild_id, timezone) VALUES (?, ?)`,
-        [guildId, DEFAULT_TIME_ZONE]
-    );
-    await db.run(
-        `INSERT OR IGNORE INTO guild_members (guild_id, discord_user_id) VALUES (?, ?)`,
-        [guildId, userId]
-    );
-    await db.run(
-        `INSERT INTO goals (guild_id, discord_user_id, daily_lessons, daily_all_lessons, daily_reviews, daily_all_reviews)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-            daily_lessons = excluded.daily_lessons,
-            daily_all_lessons = excluded.daily_all_lessons,
-            daily_reviews = excluded.daily_reviews,
-            daily_all_reviews = excluded.daily_all_reviews,
-            updated_at = CURRENT_TIMESTAMP`,
-        [guildId, userId, dailyLessons, dailyAllLessons, dailyReviews, dailyAllReviews]
-    );
-
-    const summaryParts = [
-        dailyAllLessons ? 'Lessons: **all**/day' : (dailyLessons ? `Lessons: **${dailyLessons}**/day` : null),
-        dailyAllReviews ? 'Clear review queue daily: **on**' : (dailyReviews ? `Reviews: **${dailyReviews}**/day` : null),
-        (!dailyAllLessons && !dailyLessons && !dailyAllReviews && !dailyReviews) ? 'No specific targets set.' : null,
-    ].filter(Boolean);
-
-    return respondModal(interaction, {
-        embeds: [success('Daily Goals Updated', summaryParts.join('\n') + '\nProgress appears in the daily summary.')],
-        components: [backRow()],
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Alert configuration
 // ---------------------------------------------------------------------------
 
 async function showAlertConfig(interaction) {
     await interaction.deferUpdate();
-    const goal = await db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [interaction.user.id]);
+    const goal = await db.get(`SELECT * FROM user_goals WHERE discord_user_id = ?`, [interaction.user.id]);
     if (!goal) {
         return interaction.editReply({
-            embeds: [error('No Long-Term Goal', 'Set a long-term goal first before configuring alerts.')],
+            embeds: [error('No Goal', 'Set a goal first before configuring alerts.')],
             components: [backRow()],
         });
     }
@@ -732,11 +677,11 @@ async function showAlertConfig(interaction) {
 
 async function toggleAlerts(interaction) {
     await interaction.deferUpdate();
-    const goal = await db.get(`SELECT * FROM long_goals WHERE discord_user_id = ?`, [interaction.user.id]);
-    if (!goal) return interaction.editReply({ embeds: [error('No Goal', 'Long-term goal not found.')], components: [] });
+    const goal = await db.get(`SELECT * FROM user_goals WHERE discord_user_id = ?`, [interaction.user.id]);
+    if (!goal) return interaction.editReply({ embeds: [error('No Goal', 'Goal not found.')], components: [] });
     const newVal = goal.notify_enabled ? 0 : 1;
     await db.run(
-        `UPDATE long_goals SET notify_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
+        `UPDATE user_goals SET notify_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE discord_user_id = ?`,
         [newVal, interaction.user.id]
     );
     goal.notify_enabled = newVal;
@@ -748,8 +693,8 @@ function alertEmbed(goal) {
         `**Notifications:** ${goal.notify_enabled ? '🔔 **on**' : '🔕 off'}`,
         '',
         'When on, you\'ll receive a DM:',
+        '• If your deadline becomes unattainable or you fall behind pace (checked nightly).',
         '• If you fall behind your daily lesson target (checked nightly).',
-        '• When new reviews become available (rate-limited to once per hour).',
     ].join('\n'));
 }
 
@@ -773,15 +718,13 @@ function alertButtons(goal) {
 
 function showClearConfirm(interaction) {
     return interaction.update({
-        embeds: [base('🗑️ Clear All Goals').setDescription([
-            'This will remove:',
-            '• Your long-term goal (if set)',
-            '• Your daily goals across all servers',
+        embeds: [base('🗑️ Clear Goal').setDescription([
+            'This will remove your goal — level target, daily lesson target, and the clear-queue commitment.',
             '',
             '**This cannot be undone.**',
         ].join('\n'))],
         components: [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(id('clear_yes')).setLabel('Yes, clear everything').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(id('clear_yes')).setLabel('Yes, clear it').setEmoji('🗑️').setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId(id('clear_no')).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
         )],
     });
@@ -789,16 +732,19 @@ function showClearConfirm(interaction) {
 
 async function execClear(interaction) {
     const userId = interaction.user.id;
-    const [ltResult] = await Promise.all([
+    const [result] = await Promise.all([
+        db.run(`DELETE FROM user_goals WHERE discord_user_id = ?`, [userId]),
+        // Legacy tables (pre-v16) — clear them too so a rollback doesn't
+        // resurrect a goal the user explicitly removed.
         db.run(`DELETE FROM long_goals WHERE discord_user_id = ?`, [userId]),
         db.run(`DELETE FROM goals WHERE discord_user_id = ?`, [userId]),
     ]);
     return interaction.update({
         embeds: [success(
-            'Goals Cleared',
-            ltResult.changes > 0
-                ? 'Your long-term goal and all daily goals have been removed.'
-                : 'No goals were set — nothing to clear.'
+            'Goal Cleared',
+            result.changes > 0
+                ? 'Your goal has been removed.'
+                : 'No goal was set — nothing to clear.'
         )],
         components: [],
     });
@@ -871,8 +817,8 @@ function ltConfirmEmbed(state, chosen, opts = {}) {
         `**Estimated reviews/day:** ~${p.reviewsPerDay}`,
         `**Projected finish:** ${p.projectedFinish}`,
         totalItems !== null ? `**Workload:** ${totalItems} lessons remaining (across ${p.levelsRemaining} levels)` : null,
-        `**Hit rate used:** ${formatPercent(p.effectiveHitRate)}${state.customHitRate ? ' (custom)' : ''}`,
-        opts.customized ? '*(targets customised)*' : null,
+        `**Hit rate used:** ${formatPercent(p.effectiveHitRate)}`,
+        opts.customized ? '*(lessons/day customised)*' : null,
         '',
         p.underWaniKaniMinimum
             ? '⛔ Your deadline is before the SRS-adjusted minimum, even with reviews cleared daily.'
@@ -880,7 +826,7 @@ function ltConfirmEmbed(state, chosen, opts = {}) {
                 ? '✅ This plan meets your deadline.'
                 : `⚠️ Projects finishing ${p.projectedFinish}, past your deadline. Consider a faster pace.`,
         '',
-        'Confirm to save, Customise to override lessons/day or hit rate, or Cancel.',
+        'Confirm to save, Customise to override lessons/day, or Cancel.',
     ].filter(s => s !== undefined && s !== null).join('\n'));
 }
 
@@ -943,12 +889,11 @@ function getChosenOption(state) {
 function buildCustomOption(state, projection = null) {
     const base = buildPresetMap(state)[state.chosenPaceKey];
     const lessonsPerDay = state.customLessons ?? base?.projection?.lessonsPerDay ?? 1;
-    const hitRate = state.customHitRate ?? state.hitRate;
     const proj = projection ?? projectPace({
         targetLevel: state.targetLevel,
         currentLevel: state.currentLevel,
         deadline: state.deadline,
-        hitRate,
+        hitRate: state.hitRate,
         dailyLessons: lessonsPerDay,
         itemCounts: state.itemCounts,
         srsDaysPerLevel: state.srsDaysPerLevel,
@@ -963,31 +908,9 @@ function buildCustomOption(state, projection = null) {
     };
 }
 
-function parseHitRateOverride(raw) {
-    if (!raw) return null;
-    const cleaned = raw.replace('%', '').trim();
-    if (cleaned === '') return null;
-    const n = Number(cleaned);
-    if (!Number.isFinite(n)) return false;
-    const asRate = n > 1 ? n / 100 : n;
-    if (asRate < 0.01 || asRate > 1) return false;
-    return asRate;
-}
-
 function formatPercent(rate) {
     const pct = (rate * 100);
     return `${pct >= 10 ? pct.toFixed(0) : pct.toFixed(1)}%`;
-}
-
-function fmtPace(mode) {
-    switch (mode) {
-        case 'goal':        return '🎯 Goal Rate';
-        case 'fastest':     return '🚀 Fastest SRS';
-        case 'ten':         return '📚 Comfortable';
-        case 'five':        return '🌱 Relaxed';
-        case 'custom':      return '🛠️ Custom';
-        default:            return mode || 'custom';
-    }
 }
 
 // respondModal: for modal submit handlers, update the originating message when possible

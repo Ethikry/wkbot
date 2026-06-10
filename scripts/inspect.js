@@ -51,76 +51,37 @@ function section(title) {
 }
 
 async function showGoals(db) {
-    const daily = await all(db, `
-        SELECT g.guild_id,
-               g.discord_user_id,
+    const goals = await all(db, `
+        SELECT ug.discord_user_id,
                du.display_name,
                du.global_name,
                wa.username AS wk_username,
                wa.level,
-               g.daily_lessons,
-               g.daily_reviews,
-               g.daily_all_lessons,
-               g.daily_all_reviews,
-               g.updated_at
-        FROM goals g
-        LEFT JOIN discord_users du ON du.discord_user_id = g.discord_user_id
-        LEFT JOIN wanikani_accounts wa ON wa.discord_user_id = g.discord_user_id
-        ORDER BY g.guild_id, COALESCE(du.display_name, du.global_name, g.discord_user_id)
+               ug.target_level,
+               ug.deadline,
+               ug.daily_lessons,
+               ug.clear_queue,
+               ug.hit_rate,
+               ug.notify_enabled,
+               ug.updated_at
+        FROM user_goals ug
+        LEFT JOIN discord_users du ON du.discord_user_id = ug.discord_user_id
+        LEFT JOIN wanikani_accounts wa ON wa.discord_user_id = ug.discord_user_id
+        ORDER BY COALESCE(du.display_name, du.global_name, ug.discord_user_id)
     `);
 
-    section(`Daily goals (${daily.length})`);
-    if (daily.length === 0) {
+    section(`Goals (${goals.length})`);
+    if (goals.length === 0) {
         console.log('(none)');
     } else {
-        console.table(daily.map(r => ({
-            guild: r.guild_id,
-            user: nameOf(r),
-            wk: r.wk_username ?? '',
-            lvl: r.level ?? '',
-            'daily lessons': r.daily_lessons,
-            'daily reviews': r.daily_reviews,
-            'all lessons': r.daily_all_lessons,
-            'all reviews': r.daily_all_reviews,
-            updated: r.updated_at,
-        })));
-    }
-
-    const long = await all(db, `
-        SELECT lg.discord_user_id,
-               du.display_name,
-               du.global_name,
-               wa.username AS wk_username,
-               wa.level,
-               lg.target_level,
-               lg.deadline,
-               lg.pace_mode,
-               lg.days_per_level,
-               lg.daily_lessons,
-               lg.daily_reviews,
-               lg.hit_rate,
-               lg.notify_enabled,
-               lg.updated_at
-        FROM long_goals lg
-        LEFT JOIN discord_users du ON du.discord_user_id = lg.discord_user_id
-        LEFT JOIN wanikani_accounts wa ON wa.discord_user_id = lg.discord_user_id
-        ORDER BY COALESCE(du.display_name, du.global_name, lg.discord_user_id)
-    `);
-
-    section(`Long-term goals (${long.length})`);
-    if (long.length === 0) {
-        console.log('(none)');
-    } else {
-        console.table(long.map(r => ({
+        console.table(goals.map(r => ({
             user: nameOf(r),
             wk: r.wk_username ?? '',
             'cur lvl': r.level ?? '',
-            'target lvl': r.target_level,
+            'target lvl': r.target_level ?? '',
             deadline: r.deadline ?? '',
-            pace: r.pace_mode,
-            'days/lvl': r.days_per_level ?? '',
             'daily lessons': r.daily_lessons ?? '',
-            'daily reviews': r.daily_reviews ?? '',
+            'clear queue': flag(r.clear_queue),
             'hit rate': r.hit_rate ?? '',
             notify: flag(r.notify_enabled),
             updated: r.updated_at,

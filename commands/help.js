@@ -13,7 +13,7 @@ module.exports = {
                 {
                     name: '👤 Personal',
                     value: [
-                        '`/setup` — link your read-only WaniKani API token; toggle daily ping, shame, and the cleared-queue announcement',
+                        '`/setup` — link your read-only WaniKani API token; toggle DM reminders and shame',
                         '`/reviews` — current lessons and reviews, plus today\'s completed counts',
                         '`/wkstats` — level progress, lessons, reviews, SRS breakdown, 30-day heatmap',
                         '`/streak` — current and longest review streak',
@@ -28,10 +28,11 @@ module.exports = {
                 {
                     name: '🎯 Goals (works in DMs)',
                     value: [
-                        '`/goals` — view your current goals and pace, then:',
-                        '  **Set a goal** — long-term wizard (DMs) or daily targets for this server',
-                        '  **Configure alerts** — opt in/out of DM pings (pace, reviews piling up)',
-                        '  **Clear goal** — remove all your goals',
+                        '`/goals` — view your goal, pace, and goal streak, then:',
+                        '  **Set level target** — long-term wizard (DMs): target level + deadline → lessons/day pace',
+                        '  **Daily lessons** / **Clear queue daily** — your two daily commitments, checked in the daily recap',
+                        '  **Configure alerts** — opt in/out of pace-alert DMs',
+                        '  **Clear goal** — remove your goal',
                     ].join('\n'),
                 },
                 {
@@ -43,8 +44,9 @@ module.exports = {
                     value: [
                         '`/config` (no args) — view current server settings',
                         'Options (combine any in one call):',
-                        '`burn` `levelup` — toggle announcements',
-                        '`daily` — daily summary on/off',
+                        '`levelup` — toggle level-up announcements',
+                        '`burn` `cleared` — toggle the burns / queue-clears sections of the daily recap',
+                        '`daily` — daily recap on/off',
                         '`weekly` `weekly_day` — leaderboard on/off + day of week',
                         '`time` — time for all scheduled messages (HH:MM, server timezone)',
                         '`timezone` — IANA timezone (e.g. `Asia/Tokyo`, `America/Denver`)',
