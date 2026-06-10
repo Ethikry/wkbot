@@ -34,15 +34,15 @@ module.exports = {
         .setDescription('Configure server-wide WaniKani bot settings (mods only). Run with no options to view current.')
         .setDMPermission(false)
         .addBooleanOption(o =>
-            o.setName('burn').setDescription('Burn-celebration announcements: true=enable, false=disable'))
+            o.setName('burn').setDescription('Burns section in the daily recap: true=enable, false=disable'))
         .addBooleanOption(o =>
             o.setName('levelup').setDescription('Level-up announcements: true=enable, false=disable'))
         .addBooleanOption(o =>
-            o.setName('daily').setDescription('Daily summary post: true=enable, false=disable'))
+            o.setName('daily').setDescription('Daily recap post: true=enable, false=disable'))
         .addBooleanOption(o =>
             o.setName('weekly').setDescription('Weekly leaderboard: true=enable, false=disable'))
         .addBooleanOption(o =>
-            o.setName('cleared').setDescription('Queue-cleared announcements: true=enable, false=disable'))
+            o.setName('cleared').setDescription('Queue-clears section in the daily recap: true=enable, false=disable'))
         .addStringOption(o =>
             o.setName('weekly_day').setDescription('Day of week for weekly leaderboard')
                 .addChoices(...DAY_NAMES.map(n => ({ name: n, value: n.toLowerCase() }))))
@@ -109,7 +109,7 @@ module.exports = {
         if (burn !== null) {
             fields.push('burn_celebrations_enabled = ?');
             params.push(burn ? 1 : 0);
-            summary.push(`Burn celebrations: **${burn ? 'on' : 'off'}**`);
+            summary.push(`Burns in daily recap: **${burn ? 'on' : 'off'}**`);
         }
         if (levelup !== null) {
             fields.push('level_up_announcements_enabled = ?');
@@ -119,7 +119,7 @@ module.exports = {
         if (daily !== null) {
             fields.push('daily_summary_enabled = ?');
             params.push(daily ? 1 : 0);
-            summary.push(`Daily summary: **${daily ? 'on' : 'off'}**`);
+            summary.push(`Daily recap: **${daily ? 'on' : 'off'}**`);
             scheduleChanged = true;
         }
         if (time !== null) {
@@ -137,7 +137,7 @@ module.exports = {
         if (cleared !== null) {
             fields.push('reviews_cleared_announcements_enabled = ?');
             params.push(cleared ? 1 : 0);
-            summary.push(`Queue-cleared announcements: **${cleared ? 'on' : 'off'}**`);
+            summary.push(`Queue clears in daily recap: **${cleared ? 'on' : 'off'}**`);
         }
         if (weeklyDay !== null) {
             fields.push('weekly_leaderboard_day = ?');
@@ -194,7 +194,7 @@ async function showSettings(interaction, guildId) {
             { name: 'Timezone', value: `**${resolveTimeZone(s.timezone)}**`, inline: true },
             { name: 'Scheduled time', value: `**${s.daily_summary_time}** ${resolveTimeZone(s.timezone)}`, inline: true },
             {
-                name: 'Daily summary',
+                name: 'Daily recap',
                 value: s.daily_summary_enabled ? 'on' : 'off',
                 inline: true,
             },
@@ -207,8 +207,8 @@ async function showSettings(interaction, guildId) {
             },
             { name: 'Mod role', value: modRoleStr, inline: false },
             { name: 'Level-up announcements', value: s.level_up_announcements_enabled ? 'on' : 'off', inline: true },
-            { name: 'Burn celebrations', value: s.burn_celebrations_enabled ? 'on' : 'off', inline: true },
-            { name: 'Queue-cleared announcements', value: s.reviews_cleared_announcements_enabled ? 'on' : 'off', inline: true },
+            { name: 'Burns in daily recap', value: s.burn_celebrations_enabled ? 'on' : 'off', inline: true },
+            { name: 'Queue clears in daily recap', value: s.reviews_cleared_announcements_enabled ? 'on' : 'off', inline: true },
         );
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
