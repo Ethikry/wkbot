@@ -140,12 +140,32 @@ async function buildWeeklyExtras(guildId, guild, timeZone) {
     }
     personalBests.sort((a, b) => (b.total - b.prev) - (a.total - a.prev));
 
-    const [improvedName, perfectNames, pbResolved] = await Promise.all([
+    // Burn forecast: Enlightened items (srs_stage 8) whose next review lands
+    // within the coming week — each one is a burn if answered correctly.
+    const burnForecast = await db.all(
+        `SELECT gm.discord_user_id, COUNT(*) AS n
+         FROM guild_members gm
+         JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
+         JOIN wk_assignments a ON a.wanikani_user_id = wa.wanikani_user_id
+         WHERE gm.guild_id = ? AND a.hidden = 0 AND a.srs_stage = 8
+           AND a.available_at IS NOT NULL
+           AND datetime(a.available_at) < datetime('now', '+7 days')
+         GROUP BY gm.discord_user_id
+         ORDER BY n DESC
+         LIMIT 5`,
+        [guildId]
+    );
+
+    const [improvedName, perfectNames, pbResolved, forecastResolved] = await Promise.all([
         mostImproved ? fetchDisplayName(guild, mostImproved.userId) : null,
         Promise.all(perfectUserIds.slice(0, 10).map(id => fetchDisplayName(guild, id))),
         Promise.all(personalBests.slice(0, 3).map(async pb => ({
             ...pb,
             name: await fetchDisplayName(guild, pb.userId),
+        }))),
+        Promise.all(burnForecast.map(async f => ({
+            ...f,
+            name: await fetchDisplayName(guild, f.discord_user_id),
         }))),
     ]);
 
@@ -161,6 +181,9 @@ async function buildWeeklyExtras(guildId, guild, timeZone) {
     if (levelUps > 0) milestoneBits.push(`🆙 **${levelUps}** level-up${levelUps === 1 ? '' : 's'}`);
     if (burnsDelta > 0) milestoneBits.push(`🔥 **${burnsDelta}** burn${burnsDelta === 1 ? '' : 's'}`);
     if (milestoneBits.length) serverLines.push(milestoneBits.join(' · '));
+    if (forecastResolved.length) {
+        serverLines.push(`🔮 Up for burn this week: ${forecastResolved.map(f => `**${f.name}** ${f.n}`).join(' · ')}`);
+    }
 
     const highlightLines = [];
     if (mostImproved && improvedName) {

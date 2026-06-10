@@ -25,8 +25,10 @@ module.exports = {
             [userId]
         );
         if (!otherGuilds) {
-            // Order matters: long_goals references wanikani_accounts; deleting the account
-            // would cascade-delete long_goals anyway, but be explicit.
+            // Order matters: user_goals references wanikani_accounts; deleting the account
+            // would cascade-delete user_goals anyway, but be explicit. long_goals is the
+            // legacy pre-v16 table, purged here too for privacy.
+            await db.run(`DELETE FROM user_goals WHERE discord_user_id = ?`, [userId]);
             await db.run(`DELETE FROM long_goals WHERE discord_user_id = ?`, [userId]);
             await db.run(`DELETE FROM wanikani_accounts WHERE discord_user_id = ?`, [userId]);
             await db.run(`DELETE FROM discord_users WHERE discord_user_id = ?`, [userId]);
