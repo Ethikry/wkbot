@@ -35,7 +35,7 @@ module.exports = {
 
         if (rows.length === 0) {
             return interaction.editReply({
-                embeds: [error('No Data Yet', 'No reviews tracked in the past 7 days. Snapshots are recorded once a day after the daily summary.')],
+                embeds: [error('No Data Yet', 'No reviews tracked in the past 7 days. Snapshots are recorded once a day with the daily recap.')],
             });
         }
 

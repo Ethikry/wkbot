@@ -687,6 +687,61 @@ const SCHEMA_V15 = [
     `ALTER TABLE user_reminder_settings ADD COLUMN sleep_end_hour INTEGER`,
 ];
 
+// Single user-level goal model. Replaces both `long_goals` (user-level
+// long-term) and `goals` (per-guild daily targets). Numeric daily *review*
+// targets are gone — the SRS dictates how many reviews come due, so the only
+// meaningful daily commitments are lessons/day (user-controlled) and
+// "clear my review queue" (boolean). Pace fields (pace_mode, days_per_level,
+// items_per_level, daily_reviews) are dropped: projections are recomputed
+// live from WK data wherever they're shown.
+//
+// Backfill: long_goals rows carry over 1:1; per-guild goals collapse to the
+// user level (MAX lessons target across guilds; `daily_all_reviews`, or a
+// numeric review target >= 50 — intent was "do my reviews" — maps to
+// clear_queue). `daily_all_lessons` is dropped (it fights SRS pacing).
+// The old tables are kept for one release so rollback is trivial.
+const SCHEMA_V16 = [
+    `CREATE TABLE IF NOT EXISTS user_goals (
+        discord_user_id TEXT PRIMARY KEY,
+        wanikani_user_id TEXT NOT NULL,
+        target_level INTEGER,
+        deadline TEXT,
+        hit_rate REAL,
+        daily_lessons INTEGER,
+        clear_queue INTEGER NOT NULL DEFAULT 0,
+        notify_enabled INTEGER NOT NULL DEFAULT 1,
+        last_alerted_at TEXT,
+        last_projection_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (discord_user_id) REFERENCES discord_users(discord_user_id) ON DELETE CASCADE,
+        FOREIGN KEY (wanikani_user_id) REFERENCES wanikani_accounts(wanikani_user_id) ON DELETE CASCADE
+    )`,
+    `INSERT OR IGNORE INTO user_goals
+        (discord_user_id, wanikani_user_id, target_level, deadline, hit_rate,
+         daily_lessons, notify_enabled, last_alerted_at, last_projection_at)
+     SELECT discord_user_id, wanikani_user_id, target_level, deadline, hit_rate,
+            daily_lessons, notify_enabled, last_alerted_at, last_projection_at
+     FROM long_goals`,
+    `INSERT INTO user_goals (discord_user_id, wanikani_user_id, daily_lessons, clear_queue)
+     SELECT g.discord_user_id,
+            wa.wanikani_user_id,
+            NULLIF(MAX(g.daily_lessons), 0),
+            MAX(CASE WHEN g.daily_all_reviews = 1 OR g.daily_reviews >= 50 THEN 1 ELSE 0 END)
+     FROM goals g
+     JOIN wanikani_accounts wa ON wa.discord_user_id = g.discord_user_id
+     GROUP BY g.discord_user_id
+     ON CONFLICT(discord_user_id) DO UPDATE SET
+        daily_lessons = COALESCE(user_goals.daily_lessons, excluded.daily_lessons),
+        clear_queue = MAX(user_goals.clear_queue, excluded.clear_queue),
+        updated_at = CURRENT_TIMESTAMP`,
+    // Daily goal-met result, finalized once per day by dailyJob for the day
+    // being closed. NULL = the user had no goal that day.
+    `ALTER TABLE daily_snapshots ADD COLUMN goal_met INTEGER`,
+    `ALTER TABLE streaks ADD COLUMN goal_current_streak INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE streaks ADD COLUMN goal_longest_streak INTEGER NOT NULL DEFAULT 0`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -703,6 +758,7 @@ const MIGRATIONS = [
     { version: 13, name: 'split_reviews_ping_into_dm', statements: SCHEMA_V13 },
     { version: 14, name: 'user_level_reminder_settings', statements: SCHEMA_V14 },
     { version: 15, name: 'user_sleep_hours', statements: SCHEMA_V15 },
+    { version: 16, name: 'user_goals_and_goal_streaks', statements: SCHEMA_V16 },
 ];
 
 async function runMigrations({ get, all, run }) {
