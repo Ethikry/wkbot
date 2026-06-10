@@ -1308,8 +1308,7 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
                 [row.wanikani_user_id]
             );
 
-            // Bucket activity into per-day counts. Reviews = item already
-            // started before the day; lessons = item started during the day.
+            // Bucket activity into per-day counts.
             const perSecondCounts = new Map();
             for (const it of items) {
                 const sec = Math.floor(new Date(it.data_updated_at).getTime() / 1000);
@@ -1317,21 +1316,37 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
             }
             let bulkFiltered = 0;
             const byDay = new Map(days.map(d => [d.dateKey, { reviews: 0, lessons: 0 }]));
+            const dayBounds = days.map(d => ({
+                dateKey: d.dateKey,
+                start: new Date(d.startISO).getTime(),
+                end: new Date(d.endISO).getTime(),
+            }));
             for (const it of items) {
                 const updatedAt = new Date(it.data_updated_at).getTime();
+                const startedAt = new Date(it.started_at).getTime();
+
+                // Lessons bucket by started_at: it's stamped once when the
+                // lesson is completed and never moves. Bucketing lessons by
+                // data_updated_at (the old behavior) silently dropped them —
+                // the item's first reviews re-stamp data_updated_at onto a
+                // later day, so any recomputation after that reclassified the
+                // lesson as a review on the wrong day and wrote 0 lessons.
+                for (const d of dayBounds) {
+                    if (startedAt >= d.start && startedAt < d.end) {
+                        byDay.get(d.dateKey).lessons++;
+                        break;
+                    }
+                }
+
+                // Reviews: item updated during the day, started before it.
                 const sec = Math.floor(updatedAt / 1000);
                 if (perSecondCounts.get(sec) > BULK_UPDATE_SECOND_THRESHOLD) {
                     bulkFiltered++;
                     continue;
                 }
-                const startedAt = new Date(it.started_at).getTime();
-                for (const d of days) {
-                    const start = new Date(d.startISO).getTime();
-                    const end = new Date(d.endISO).getTime();
-                    if (updatedAt >= start && updatedAt < end) {
-                        const bucket = byDay.get(d.dateKey);
-                        if (startedAt < start) bucket.reviews++;
-                        else bucket.lessons++;
+                for (const d of dayBounds) {
+                    if (updatedAt >= d.start && updatedAt < d.end) {
+                        if (startedAt < d.start) byDay.get(d.dateKey).reviews++;
                         break;
                     }
                 }
