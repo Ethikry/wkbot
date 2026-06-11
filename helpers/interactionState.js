@@ -18,16 +18,20 @@ const FORCE_FRESH = {
 
 async function upsertDiscordUser(interaction) {
     await db.run(
-        `INSERT INTO discord_users (discord_user_id, display_name, global_name)
-         VALUES (?, ?, ?)
+        `INSERT INTO discord_users (discord_user_id, display_name, global_name, locale)
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(discord_user_id) DO UPDATE SET
             display_name = COALESCE(excluded.display_name, discord_users.display_name),
             global_name = excluded.global_name,
+            locale = COALESCE(excluded.locale, discord_users.locale),
             updated_at = CURRENT_TIMESTAMP`,
         [
             interaction.user.id,
             interaction.member?.displayName ?? interaction.user.displayName ?? interaction.user.username ?? null,
             interaction.user.globalName ?? null,
+            // Client locale (e.g. "en-US", "ja") — timezone inference uses it
+            // to snap a raw UTC offset onto a plausible IANA zone.
+            interaction.locale ?? null,
         ]
     );
 }

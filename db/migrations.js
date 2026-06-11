@@ -742,6 +742,29 @@ const SCHEMA_V16 = [
     `ALTER TABLE streaks ADD COLUMN goal_longest_streak INTEGER NOT NULL DEFAULT 0`,
 ];
 
+// Level-up announcement watermark + per-user timezone (explicit + inferred).
+//
+// `last_announced_level` decouples level-up detection from whoever refreshed
+// `wanikani_accounts.level` last: the 5-minute summaryRefreshJob force-syncs
+// /user, so by the time the hourly slowDetectionJob compared level
+// before/after its own sync the diff was always zero and announcements never
+// fired. Only the announcement path advances the watermark.
+//
+// Timezone columns: `timezone` is an explicit per-user override (/timezone);
+// `inferred_timezone` is computed daily from activity patterns (review
+// timestamps, queue drops, command usage) with a 0-1 confidence score.
+// Effective zone precedence: override > confident inference > guild timezone.
+// `discord_users.locale` caches interaction.locale to snap a raw UTC offset
+// to a plausible IANA zone (which also gets DST right going forward).
+const SCHEMA_V17 = [
+    `ALTER TABLE wanikani_accounts ADD COLUMN last_announced_level INTEGER`,
+    `ALTER TABLE discord_users ADD COLUMN locale TEXT`,
+    `ALTER TABLE user_reminder_settings ADD COLUMN timezone TEXT`,
+    `ALTER TABLE user_reminder_settings ADD COLUMN inferred_timezone TEXT`,
+    `ALTER TABLE user_reminder_settings ADD COLUMN inferred_tz_confidence REAL`,
+    `ALTER TABLE user_reminder_settings ADD COLUMN inferred_tz_updated_at TEXT`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -759,6 +782,7 @@ const MIGRATIONS = [
     { version: 14, name: 'user_level_reminder_settings', statements: SCHEMA_V14 },
     { version: 15, name: 'user_sleep_hours', statements: SCHEMA_V15 },
     { version: 16, name: 'user_goals_and_goal_streaks', statements: SCHEMA_V16 },
+    { version: 17, name: 'levelup_watermark_and_user_timezone', statements: SCHEMA_V17 },
 ];
 
 async function runMigrations({ get, all, run }) {

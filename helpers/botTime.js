@@ -125,13 +125,16 @@ function startOfBotDayUtcIso(dateKey = botDateKey(), timeZone = getBotTimeZone()
 
 module.exports = {
     DEFAULT_TIME_ZONE,
+    TIME_ZONE_ABBREVIATIONS,
     getBotTimeZone,
     normalizeTimeZone,
     isValidTimeZone,
     resolveTimeZone,
+    datePartsInTimeZone,
     botDateKey,
     addDaysToDateKey,
     recentDateKeys,
     startOfBotDayUtcIso,
     zonedDateTimeToUtc,
+    getTimeZoneOffsetMs,
 };
