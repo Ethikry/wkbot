@@ -673,36 +673,50 @@ async function maybeSendReviewsAvailableDM(client, account) {
 // recap's Highlights digest instead of real-time posts.)
 
 async function slowDetectionJob(client) {
-    // Sync each WaniKani account exactly once per tick, capturing
-    // previous/current level before any guild loop runs.
-    // Doing the sync inside the per-guild loop caused multi-guild users to
-    // miss level-up announcements in every guild after the first: the second
-    // guild's "previous" read picked up the already-synced row, so the diff
-    // was always zero.
+    // Sync each WaniKani account exactly once per tick, before any guild loop
+    // runs. Level-ups are detected against the `last_announced_level`
+    // watermark rather than a before/after read of `level`: the 5-minute
+    // summaryRefreshJob also syncs /user, so `level` is usually already
+    // current when this job runs and a before/after diff is always zero.
+    // Only this job's announcement path moves the watermark.
     const accountRows = await db.all(
         `SELECT DISTINCT wa.wanikani_user_id, wa.discord_user_id, wa.api_token_encrypted
          FROM wanikani_accounts wa
          JOIN guild_members gm ON gm.discord_user_id = wa.discord_user_id`
     );
 
-    const accountState = new Map(); // wanikani_user_id -> { previousLevel, level, burned }
+    const accountState = new Map(); // wanikani_user_id -> { level, leveledUp }
     for (const row of accountRows) {
         try {
-            const accountBefore = await db.get(
-                `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
-                [row.wanikani_user_id]
-            );
-            const previousLevel = accountBefore?.level ?? null;
-
             await wkSync.syncUser(row);
             await wkSync.syncAssignments(row);
 
-            const accountAfter = await db.get(
-                `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
+            const account = await db.get(
+                `SELECT level, last_announced_level FROM wanikani_accounts
+                 WHERE wanikani_user_id = ?`,
                 [row.wanikani_user_id]
             );
-            const level = accountAfter?.level ?? previousLevel;
-            accountState.set(row.wanikani_user_id, { previousLevel, level });
+            const level = account?.level ?? null;
+            const watermark = account?.last_announced_level ?? null;
+            if (level === null) continue;
+
+            if (watermark === null || level < watermark) {
+                // First sync (no watermark yet) or a level reset: align the
+                // watermark silently so we never announce stale or downward
+                // movement.
+                await db.run(
+                    `UPDATE wanikani_accounts SET last_announced_level = ?
+                     WHERE wanikani_user_id = ?`,
+                    [level, row.wanikani_user_id]
+                );
+                if (watermark === null) {
+                    console.log(`[slowDetection] ${row.discord_user_id}: no prior announced level, initializing watermark at ${level}`);
+                }
+            }
+            accountState.set(row.wanikani_user_id, {
+                level,
+                leveledUp: watermark !== null && level > watermark,
+            });
         } catch (err) {
             console.error(`[slowDetection/sync] ${row.wanikani_user_id}:`, err);
         }
@@ -718,7 +732,7 @@ async function slowDetectionJob(client) {
                     const apiKey = decrypt(row.api_token_encrypted);
                     const state = accountState.get(row.wanikani_user_id);
                     if (!state) continue;
-                    const { previousLevel, level } = state;
+                    const { level, leveledUp } = state;
 
                     const lastResetState = await db.get(
                         `SELECT last_reset_checked_at FROM bot_user_state
@@ -731,8 +745,7 @@ async function slowDetectionJob(client) {
                         channel &&
                         settings.level_up_announcements_enabled &&
                         row.levelup_announcement_enabled !== 0 &&
-                        previousLevel !== null &&
-                        level > previousLevel
+                        leveledUp
                     ) {
                         const embed = new EmbedBuilder()
                             .setColor(COLOR_PRIMARY)
@@ -741,8 +754,6 @@ async function slowDetectionJob(client) {
                             .setTimestamp()
                             .setFooter(FOOTER);
                         await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
-                    } else if (previousLevel === null) {
-                        console.log(`[slowDetection] ${row.discord_user_id}@${guild.id}: no prior level, skipping level-up announcement (first sync)`);
                     }
 
                     // Burns are no longer announced in real time — they show
@@ -761,6 +772,20 @@ async function slowDetectionJob(client) {
         } catch (err) {
             console.error('[slowDetection] guild loop:', err);
         }
+    }
+
+    // Advance watermarks only after every guild has had its chance to
+    // announce — moving it inside the guild loop would re-introduce the old
+    // multi-guild bug (first guild announces, the rest see no diff). If a
+    // single send failed above, the watermark still advances: a rare missed
+    // announcement beats re-announcing in every other guild each hour.
+    for (const [wanikaniUserId, state] of accountState) {
+        if (!state.leveledUp) continue;
+        await db.run(
+            `UPDATE wanikani_accounts SET last_announced_level = ?
+             WHERE wanikani_user_id = ?`,
+            [state.level, wanikaniUserId]
+        ).catch(err => console.error(`[slowDetection/watermark] ${wanikaniUserId}:`, err));
     }
 }
 
@@ -795,6 +820,21 @@ async function dailyGlobalsAndUserSyncJob() {
             await wkSync.syncStudyMaterials(account);
         } catch (err) {
             console.error(`[dailyUserSync] ${account.wanikani_user_id}:`, err);
+        }
+    }
+
+    // Refresh each user's inferred timezone from their activity patterns.
+    // Cheap (local SQL only) and self-correcting across DST shifts since the
+    // stored value is an IANA zone.
+    const { inferAndStoreUserTimeZone } = require('./helpers/tzInfer');
+    for (const account of accounts) {
+        try {
+            const result = await inferAndStoreUserTimeZone(account.discord_user_id, account.wanikani_user_id);
+            if (result.zone) {
+                console.log(`[tzInfer] ${account.discord_user_id}: ${result.zone} (offset ${result.offset}, confidence ${result.confidence.toFixed(2)}, ${result.totalSlots} slots)`);
+            }
+        } catch (err) {
+            console.error(`[tzInfer] ${account.discord_user_id}:`, err);
         }
     }
 }
@@ -1111,29 +1151,34 @@ const BULK_UPDATE_SECOND_THRESHOLD = 50;
 
 async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
     const settings = await getOrCreateSettings(guildId);
-    const timeZone = resolveTimeZone(settings.timezone);
+    const guildTimeZone = resolveTimeZone(settings.timezone);
     const {
         ensureUserSynced, ensureSummarySynced, ensureReviewStatsSynced,
         getCompletedItemsSince, getSrsBreakdown,
     } = require('./helpers/wanikaniData');
+    const { getEffectiveUserTimeZone } = require('./helpers/tzInfer');
     const userMaxAgeMs = options.userMaxAgeMs ?? 0;
     const summaryMaxAgeMs = options.summaryMaxAgeMs ?? 60 * 1000;
     const reviewStatsMaxAgeMs = options.reviewStatsMaxAgeMs ?? 0;
     const assignmentMaxAgeMs = options.assignmentMaxAgeMs ?? 4 * 60 * 1000;
 
-    // Build the list of guild-local days we'll write snapshots for, with the
-    // window boundaries needed to bucket assignments updates into them.
-    const days = [];
-    for (let i = SNAPSHOT_LOOKBACK_DAYS - 1; i >= 0; i--) {
-        const dateKey = botDateStr(-i, timeZone);
-        const startISO = startOfBotDayUtcIso(dateKey, timeZone);
-        const endISO = startOfBotDayUtcIso(botDateStr(-i + 1, timeZone), timeZone);
-        days.push({ dateKey, startISO, endISO });
-    }
-    const earliestStartISO = days[0].startISO;
-
     for (const row of rows) {
         try {
+            // Bucket each user's activity by *their* local days — explicit
+            // /timezone override, else a confident activity-pattern
+            // inference, else the guild timezone. Day keys stay YYYY-MM-DD,
+            // so snapshot consumers don't care that two users in the same
+            // guild close their days at different UTC instants.
+            const { timeZone } = await getEffectiveUserTimeZone(row.discord_user_id, guildTimeZone);
+            const days = [];
+            for (let i = SNAPSHOT_LOOKBACK_DAYS - 1; i >= 0; i--) {
+                const dateKey = botDateStr(-i, timeZone);
+                const startISO = startOfBotDayUtcIso(dateKey, timeZone);
+                const endISO = startOfBotDayUtcIso(botDateStr(-i + 1, timeZone), timeZone);
+                days.push({ dateKey, startISO, endISO });
+            }
+            const earliestStartISO = days[0].startISO;
+
             await ensureUserSynced(row, userMaxAgeMs);
             await ensureSummarySynced(row, summaryMaxAgeMs);
             await ensureReviewStatsSynced(row, reviewStatsMaxAgeMs);

@@ -1,12 +1,15 @@
 const db = require('../db');
 const { resolveTimeZone, datePartsInTimeZone } = require('./botTime');
+const { getEffectiveUserTimeZone } = require('./tzInfer');
 
 // Reads the user's sleep window from user_reminder_settings and decides whether
 // the current local hour falls inside it. Returns true if a DM should be
 // suppressed right now.
 //
-// Time zone is the user's primary (earliest-joined) guild — same convention
-// as paceAlertJob. Falls back to the bot default if the user has no guild.
+// Time zone precedence: the user's /timezone override, else a confident
+// activity-pattern inference, else the primary (earliest-joined) guild's
+// timezone — same fallback convention as paceAlertJob. Falls back to the bot
+// default if the user has no guild.
 //
 // Window is [start, end). If end <= start the window wraps midnight, e.g.
 // 22 → 7 means 22, 23, 0, 1, 2, 3, 4, 5, 6.
@@ -30,8 +33,8 @@ async function isWithinSleepWindow(discordUserId, now = new Date()) {
           ORDER BY gm.joined_bot_at ASC LIMIT 1`,
         [discordUserId]
     );
-    const tz = resolveTimeZone(tzRow?.timezone);
-    const parts = datePartsInTimeZone(now, tz);
+    const { timeZone } = await getEffectiveUserTimeZone(discordUserId, resolveTimeZone(tzRow?.timezone));
+    const parts = datePartsInTimeZone(now, timeZone);
     const hour = Number(parts.hour);
 
     if (start < end) return hour >= start && hour < end;
