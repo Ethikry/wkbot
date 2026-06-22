@@ -29,8 +29,6 @@ async function upsertDiscordUser(interaction) {
             interaction.user.id,
             interaction.member?.displayName ?? interaction.user.displayName ?? interaction.user.username ?? null,
             interaction.user.globalName ?? null,
-            // Client locale (e.g. "en-US", "ja") — timezone inference uses it
-            // to snap a raw UTC offset onto a plausible IANA zone.
             interaction.locale ?? null,
         ]
     );
