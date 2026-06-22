@@ -4,11 +4,10 @@ const { normalizeTimeZone, isValidTimeZone, resolveTimeZone, getBotTimeZone } = 
 const { getEffectiveUserTimeZone } = require('../helpers/tzInfer');
 const db = require('../db');
 
-// Personal timezone override. The bot infers a zone from activity patterns
-// (see helpers/tzInfer.js); this command lets a user pin the real one, which
-// always wins over the inference. Discord caps a string option at 25 choices,
-// so the dropdown carries 24 common zones plus "Clear override" — anything
-// else goes through the free-text `custom` option.
+// Personal timezone override. The server default is JST; use this command to
+// pin a different zone. Discord caps a string option at 25 choices, so the
+// dropdown carries 24 common zones plus "Clear override" — anything else goes
+// through the free-text `custom` option.
 const ZONE_CHOICES = [
     { name: 'UTC', value: 'UTC' },
     { name: 'PST/PDT — US Pacific (Los Angeles)', value: 'America/Los_Angeles' },
@@ -34,13 +33,13 @@ const ZONE_CHOICES = [
     { name: 'ACST/ACDT — Central Australia (Adelaide)', value: 'Australia/Adelaide' },
     { name: 'AEST/AEDT — Eastern Australia (Sydney)', value: 'Australia/Sydney' },
     { name: 'NZST/NZDT — New Zealand (Auckland)', value: 'Pacific/Auckland' },
-    { name: 'Clear override (use auto-detected)', value: 'clear' },
+    { name: 'Clear override (use server default)', value: 'clear' },
 ];
 
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('timezone')
-        .setDescription('Set your personal timezone, or see what the bot detected for you')
+        .setDescription('Set your personal timezone (default: JST), or see your current setting')
         .addStringOption(opt =>
             opt.setName('zone')
                 .setDescription('Pick a timezone (or clear your override)')
@@ -98,7 +97,7 @@ module.exports = {
                 embeds: [success(
                     'Timezone Set',
                     `Your timezone is now **${zone}** (local time: ${localTime(zone)}).\n` +
-                    'This applies to your daily review/lesson day boundaries and sleep hours, and overrides anything the bot auto-detects.'
+                    'This applies to your daily review/lesson day boundaries and sleep hours.'
                 )],
                 flags: MessageFlags.Ephemeral,
             });
@@ -136,12 +135,8 @@ function localTime(zone) {
 
 function describeState(state) {
     const time = localTime(state.timeZone);
-    switch (state.source) {
-        case 'override':
-            return `**${state.timeZone}** (local time: ${time})\nSet by you — clear it with \`/timezone zone:Clear override\` to go back to auto-detection.`;
-        case 'inferred':
-            return `**${state.timeZone}** (local time: ${time})\nAuto-detected from your activity patterns (confidence ${(state.confidence * 100).toFixed(0)}%). Set one with \`/timezone\` if this is wrong.`;
-        default:
-            return `**${state.timeZone}** (local time: ${time})\nUsing the server default — the bot hasn't seen enough activity to detect your timezone yet. Set one with \`/timezone\`.`;
+    if (state.source === 'override') {
+        return `**${state.timeZone}** (local time: ${time})\nSet by you — clear it with \`/timezone zone:Clear override\` to go back to the server default.`;
     }
+    return `**${state.timeZone}** (local time: ${time})\nUsing the server default. Set your own with \`/timezone\` if you're in a different timezone.`;
 }
