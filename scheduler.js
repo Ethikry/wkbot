@@ -823,20 +823,6 @@ async function dailyGlobalsAndUserSyncJob() {
         }
     }
 
-    // Refresh each user's inferred timezone from their activity patterns.
-    // Cheap (local SQL only) and self-correcting across DST shifts since the
-    // stored value is an IANA zone.
-    const { inferAndStoreUserTimeZone } = require('./helpers/tzInfer');
-    for (const account of accounts) {
-        try {
-            const result = await inferAndStoreUserTimeZone(account.discord_user_id, account.wanikani_user_id);
-            if (result.zone) {
-                console.log(`[tzInfer] ${account.discord_user_id}: ${result.zone} (offset ${result.offset}, confidence ${result.confidence.toFixed(2)}, ${result.totalSlots} slots)`);
-            }
-        } catch (err) {
-            console.error(`[tzInfer] ${account.discord_user_id}:`, err);
-        }
-    }
 }
 
 // Back-compat: pollUsersJob now just runs the slow-loop detection so any
@@ -996,50 +982,63 @@ async function paceAlertJob(client) {
 }
 
 // Fires ~2 hours before the guild's daily_summary_time. For each member with
-// an active streak whose last review was yesterday (not today), checks the
-// live queue: if reviews are due and none have been done today, the streak is
-// at risk. Sends either a shame DM (if the user opted in) or a gentle nudge.
+// an active streak whose last review was yesterday (not today, in *their*
+// timezone), checks the live queue: if reviews are due and none have been done
+// today, the streak is at risk. Sends either a shame DM (if the user opted in)
+// or a gentle nudge.
 async function streakRiskJob(client, guildId) {
     console.log(`[streakRisk] guild=${guildId}`);
     const guild = client.guilds.cache.get(guildId);
     if (!guild) return;
     const settings = await getOrCreateSettings(guildId);
-    const tz = resolveTimeZone(settings.timezone);
-    const today = botDateStr(0, tz);
-    const yesterday = botDateStr(-1, tz);
+    const guildTz = resolveTimeZone(settings.timezone);
+    const { getEffectiveUserTimeZone } = require('./helpers/tzInfer');
 
     // Streak DM + shame variant are user-scoped preferences (DMs are
     // inherently cross-guild). Defaults match user_reminder_settings: streak
     // on, shame off.
+    // Date filtering is intentionally absent here — each user's "today" and
+    // "yesterday" are resolved per-user below using their effective timezone.
     const candidates = await db.all(
         `SELECT
              gm.discord_user_id,
              wa.wanikani_user_id,
              wa.current_vacation_started_at,
              s.current_streak,
+             s.last_review_date,
              COALESCE(urs.streak_reminder_enabled, 1) AS streak_reminder_enabled,
              COALESCE(urs.shame_enabled, 0) AS shame_enabled,
-             COALESCE(cache.review_count_now, 0) AS due_now,
-             COALESCE(ds.reviews_completed, 0) AS reviews_today
+             COALESCE(cache.review_count_now, 0) AS due_now
          FROM guild_members gm
          JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
          JOIN streaks s ON s.guild_id = gm.guild_id AND s.discord_user_id = gm.discord_user_id
          LEFT JOIN user_reminder_settings urs ON urs.discord_user_id = gm.discord_user_id
          LEFT JOIN wk_summary_cache cache ON cache.wanikani_user_id = wa.wanikani_user_id
-         LEFT JOIN daily_snapshots ds
-             ON ds.guild_id = gm.guild_id
-             AND ds.discord_user_id = gm.discord_user_id
-             AND ds.snapshot_date = ?
          WHERE gm.guild_id = ?
-           AND s.current_streak >= 1
-           AND s.last_review_date = ?`,
-        [today, guildId, yesterday]
+           AND s.current_streak >= 1`,
+        [guildId]
     );
 
     for (const c of candidates) {
         if (c.current_vacation_started_at) continue;
         if (c.due_now <= 0) continue;
-        if (c.reviews_today > 0) continue;
+
+        // Resolve the user's own timezone so "today" and "yesterday" line up
+        // with the same day boundaries used when writing their snapshots.
+        const { timeZone: userTz } = await getEffectiveUserTimeZone(c.discord_user_id, guildTz);
+        const userToday = botDateStr(0, userTz);
+        const userYesterday = botDateStr(-1, userTz);
+
+        // Only at risk if their last review was yesterday (in their tz) and
+        // they haven't done any reviews yet today (in their tz).
+        if (c.last_review_date !== userYesterday) continue;
+        const snapToday = await db.get(
+            `SELECT reviews_completed FROM daily_snapshots
+             WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
+            [guildId, c.discord_user_id, userToday]
+        );
+        if ((snapToday?.reviews_completed ?? 0) > 0) continue;
+
         const wantsShame = c.shame_enabled === 1;
         const wantsGentle = c.streak_reminder_enabled === 1;
         if (!wantsShame && !wantsGentle) continue;
@@ -1165,10 +1164,10 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
     for (const row of rows) {
         try {
             // Bucket each user's activity by *their* local days — explicit
-            // /timezone override, else a confident activity-pattern
-            // inference, else the guild timezone. Day keys stay YYYY-MM-DD,
-            // so snapshot consumers don't care that two users in the same
-            // guild close their days at different UTC instants.
+            // /timezone override, else the guild timezone (defaults to JST).
+            // Day keys stay YYYY-MM-DD so snapshot consumers don't care that
+            // two users in the same guild close their days at different UTC
+            // instants.
             const { timeZone } = await getEffectiveUserTimeZone(row.discord_user_id, guildTimeZone);
             const days = [];
             for (let i = SNAPSHOT_LOOKBACK_DAYS - 1; i >= 0; i--) {
