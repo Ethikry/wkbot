@@ -5,7 +5,7 @@ const db = require('../db');
 // Per-guild personal preferences. Personal DM preferences (reviews_dm, streak,
 // shame DMs) live cross-guild under `/setup`. This command only controls how
 // the *current server's* channel posts treat the user — whether to @mention,
-// whether their queue clears / burns appear in the daily recap's Highlights,
+// whether their queue clears appear in the daily recap's Highlights,
 // whether to announce level-ups, and whether to include shame about them in
 // this server's daily/weekly posts.
 //
@@ -25,13 +25,6 @@ const FIELDS = [
         column: 'cleared_enabled',
         description: "Include my queue clears in this server's daily recap",
         label: 'Recap: queue clears',
-        defaultValue: 1,
-    },
-    {
-        option: 'burn',
-        column: 'burn_announcement_enabled',
-        description: "Include my burns in this server's daily recap",
-        label: 'Recap: burns',
         defaultValue: 1,
     },
     {
