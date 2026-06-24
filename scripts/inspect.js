@@ -131,7 +131,6 @@ async function showSetup(db) {
                rs.reviews_ping_enabled,
                rs.shame_enabled,
                rs.cleared_enabled,
-               rs.burn_announcement_enabled,
                rs.levelup_announcement_enabled,
                rs.min_review_count,
                rs.dm_enabled,
@@ -174,7 +173,6 @@ async function showSetup(db) {
                 mention: flag(r.reviews_ping_enabled),
                 shame: flag(r.shame_enabled),
                 cleared: flag(r.cleared_enabled),
-                burn: flag(r.burn_announcement_enabled),
                 levelup: flag(r.levelup_announcement_enabled),
                 'min reviews': r.min_review_count,
                 dm: flag(r.dm_enabled),
@@ -222,7 +220,6 @@ async function showGuilds(db) {
             ? `${DAY_NAMES[g.weekly_leaderboard_day] ?? '?'} ${g.weekly_leaderboard_time}`
             : 'off',
         levelup: flag(g.level_up_announcements_enabled),
-        burn: flag(g.burn_celebrations_enabled),
         cleared: flag(g.reviews_cleared_announcements_enabled),
         morning: g.morning_ping_enabled ? g.morning_ping_time : 'off',
         shame: g.shame_mode_enabled ? g.shame_time : 'off',

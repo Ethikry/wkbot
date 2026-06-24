@@ -32,7 +32,7 @@ module.exports = {
         const guildSettings = await db.get(
             `SELECT reviews_ping_enabled,
                     shame_enabled, cleared_enabled,
-                    burn_announcement_enabled, levelup_announcement_enabled,
+                    levelup_announcement_enabled,
                     min_review_count
              FROM reminder_settings
              WHERE guild_id = ? AND discord_user_id = ?`,
@@ -75,7 +75,6 @@ module.exports = {
                 { name: '— This server —', value: '`/guild_setup` to change', inline: false },
                 { name: 'Daily/weekly @mention', value: (settings.reviews_ping_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Queue-cleared announce', value: (settings.cleared_enabled ?? 1) ? 'on' : 'off', inline: true },
-                { name: 'Burn announce', value: (settings.burn_announcement_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Level-up announce', value: (settings.levelup_announcement_enabled ?? 1) ? 'on' : 'off', inline: true },
                 { name: 'Channel shame', value: (settings.shame_enabled ?? 0) ? 'on' : 'off', inline: true },
             );

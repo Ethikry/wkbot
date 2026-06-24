@@ -1,11 +1,9 @@
 const db = require('../db');
-const { addDaysToDateKey, startOfBotDayUtcIso } = require('./botTime');
+const { addDaysToDateKey, botDateKey, startOfBotDayUtcIso } = require('./botTime');
+const { getEffectiveUserTimeZone } = require('./tzInfer');
 
 const STREAK_MILESTONES = [7, 30, 100, 365];
 const MAX_HIGHLIGHT_LINES = 12;
-const MAX_BURN_CHARACTERS = 8;
-// Personal-best callouts need enough history to be meaningful (mirrors the
-// guard in weeklyExtras.buildWeeklyExtras).
 const PERSONAL_BEST_MIN_DAYS = 14;
 
 const DAY_FULL_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -43,8 +41,7 @@ async function getRecapMembers(guildId) {
              gm.discord_user_id,
              wa.wanikani_user_id,
              wa.current_vacation_started_at,
-             COALESCE(rs.cleared_enabled, 1) AS cleared_enabled,
-             COALESCE(rs.burn_announcement_enabled, 1) AS burn_enabled
+             COALESCE(rs.cleared_enabled, 1) AS cleared_enabled
          FROM guild_members gm
          JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
          LEFT JOIN reminder_settings rs
@@ -180,13 +177,28 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     }));
     const nameOf = id => names.get(id) ?? 'Unknown';
 
-    const snapRows = await db.all(
-        `SELECT discord_user_id, reviews_completed, lessons_completed, goal_met, burned_count
-         FROM daily_snapshots
-         WHERE guild_id = ? AND snapshot_date = ?`,
-        [guildId, recapDateKey]
-    );
-    const snaps = new Map(snapRows.map(r => [r.discord_user_id, r]));
+    // Read each user's snapshot for their personal "yesterday" — the most
+    // recently completed 24h day in their own timezone. daily_snapshots uses
+    // per-user timezone date keys, so snapshot_date "Jun 22" means different
+    // UTC windows for a JST user vs a PDT user. At midnight JST the recap
+    // fires, a PDT user's current day is only 8 hours old; their prior day is
+    // the one that's actually finished. Reading that row gives a complete
+    // picture rather than a partial one.
+    const now = new Date();
+    const snaps = new Map();
+    const userYesterdays = new Map();
+    for (const m of members) {
+        const { timeZone: userTz } = await getEffectiveUserTimeZone(m.discord_user_id, timeZone);
+        const userYesterday = addDaysToDateKey(botDateKey(now, userTz), -1);
+        userYesterdays.set(m.discord_user_id, userYesterday);
+        const snap = await db.get(
+            `SELECT reviews_completed, lessons_completed, goal_met
+             FROM daily_snapshots
+             WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
+            [guildId, m.discord_user_id, userYesterday]
+        );
+        if (snap) snaps.set(m.discord_user_id, snap);
+    }
 
     const streakRows = await db.all(
         `SELECT discord_user_id, current_streak, last_review_date, goal_current_streak
@@ -229,16 +241,17 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         if (reviews === 0 && lessons === 0) {
             const due = cache?.review_count_now ?? 0;
             userLines.push(due > 0
-                ? `**${name}** 💤 no activity — **${due}** review${due === 1 ? '' : 's'} waiting`
+                ? `**${name}** 💤 no activity · ${due} due`
                 : `**${name}** 💤 no activity`);
             continue;
         }
 
-        const bits = [`**${reviews}** review${reviews === 1 ? '' : 's'}`, `**${lessons}** lesson${lessons === 1 ? '' : 's'}`];
-        if (goalMet === 1) bits.push('🎯 goal met');
-        else if (goalMet === 0) bits.push('▫️ goal missed');
+        const bits = [`**${reviews}** review${reviews === 1 ? '' : 's'}`];
+        if (lessons > 0) bits.push(`**${lessons}** lesson${lessons === 1 ? '' : 's'}`);
+        if (goalMet === 1) bits.push('🎯');
+        else if (goalMet === 0) bits.push('▫️');
         const streak = streaks.get(m.discord_user_id);
-        if (streak && streak.current_streak > 0 && streak.last_review_date >= recapDateKey) {
+        if (streak && streak.current_streak > 0 && streak.last_review_date >= userYesterdays.get(m.discord_user_id)) {
             bits.push(`🔥 ${streak.current_streak}`);
         }
         userLines.push(`**${name}** ✅ ${bits.join(' · ')}`);
@@ -254,39 +267,6 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     // ── highlights digest ────────────────────────────────────────────────
     const highlights = [];
 
-    // Burns — exact items from wk_assignments.burned_at (synced hourly).
-    if (settings?.burn_celebrations_enabled) {
-        const burnMembers = members.filter(m => m.burn_enabled !== 0);
-        if (burnMembers.length) {
-            const burnRows = await db.all(
-                `SELECT a.wanikani_user_id, s.characters
-                 FROM wk_assignments a
-                 JOIN wk_subjects s ON s.subject_id = a.subject_id
-                 WHERE a.hidden = 0
-                   AND a.burned_at >= ? AND a.burned_at < ?
-                   AND a.wanikani_user_id IN (${burnMembers.map(() => '?').join(',')})`,
-                [startIso, endIso, ...burnMembers.map(m => m.wanikani_user_id)]
-            );
-            const burnsByWk = new Map();
-            for (const r of burnRows) {
-                if (!burnsByWk.has(r.wanikani_user_id)) burnsByWk.set(r.wanikani_user_id, []);
-                burnsByWk.get(r.wanikani_user_id).push(r.characters);
-            }
-            for (const m of burnMembers) {
-                const burned = burnsByWk.get(m.wanikani_user_id);
-                if (!burned?.length) continue;
-                const chars = burned.filter(Boolean).slice(0, MAX_BURN_CHARACTERS);
-                const extra = burned.length - chars.length;
-                const charStr = chars.length
-                    ? ` (${chars.join(' ')}${extra > 0 ? ` +${extra} more` : ''})`
-                    : '';
-                const total = snaps.get(m.discord_user_id)?.burned_count;
-                const totalStr = total ? ` — ${total} total` : '';
-                highlights.push(`🔥 **${nameOf(m.discord_user_id)}** burned **${burned.length}** item${burned.length === 1 ? '' : 's'}${charStr}${totalStr}`);
-            }
-        }
-    }
-
     // Queue clears — >0 → 0 transitions observed by the 5-minute poll.
     if (settings?.reviews_cleared_announcements_enabled) {
         const clears = await countQueueClears(guildId, startIso, endIso);
@@ -298,29 +278,28 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         }
     }
 
-    // Personal daily records.
-    const priorRows = await db.all(
-        `SELECT discord_user_id, MAX(reviews_completed) AS prev_max, COUNT(*) AS days
-         FROM daily_snapshots
-         WHERE guild_id = ? AND snapshot_date < ?
-         GROUP BY discord_user_id`,
-        [guildId, recapDateKey]
-    );
-    const priors = new Map(priorRows.map(r => [r.discord_user_id, r]));
+    // Personal daily records — compared against each user's own history
+    // up to (but not including) their personal yesterday.
     for (const m of members) {
         const snap = snaps.get(m.discord_user_id);
-        const prior = priors.get(m.discord_user_id);
-        if (!snap || !prior) continue;
-        if (prior.days < PERSONAL_BEST_MIN_DAYS || !prior.prev_max) continue;
+        if (!snap) continue;
+        const userYesterday = userYesterdays.get(m.discord_user_id);
+        const prior = await db.get(
+            `SELECT MAX(reviews_completed) AS prev_max, COUNT(*) AS days
+             FROM daily_snapshots
+             WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date < ?`,
+            [guildId, m.discord_user_id, userYesterday]
+        );
+        if (!prior || prior.days < PERSONAL_BEST_MIN_DAYS || !prior.prev_max) continue;
         if ((snap.reviews_completed ?? 0) > prior.prev_max) {
             highlights.push(`🏅 New personal best: **${nameOf(m.discord_user_id)}** — ${snap.reviews_completed} reviews in a day (prev ${prior.prev_max})`);
         }
     }
 
-    // Streak milestones crossed on the recap day.
+    // Streak milestones crossed on the user's personal yesterday.
     for (const m of members) {
         const streak = streaks.get(m.discord_user_id);
-        if (!streak || streak.last_review_date !== recapDateKey) continue;
+        if (!streak || streak.last_review_date !== userYesterdays.get(m.discord_user_id)) continue;
         if (STREAK_MILESTONES.includes(streak.current_streak)) {
             highlights.push(`✨ **${nameOf(m.discord_user_id)}** hit a ${streak.current_streak}-day streak!`);
         }
@@ -346,9 +325,10 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         const cache = caches.get(m.wanikani_user_id);
         const due = cache?.review_count_now ?? 0;
         const next24 = Math.max(0, (cache?.review_count_24h ?? 0) - due);
+        if (due === 0 && next24 === 0) continue;
         todayBits.push(due > 0 && next24 > 0
-            ? `**${nameOf(m.discord_user_id)}** ${due} due (+${next24} in 24h)`
-            : `**${nameOf(m.discord_user_id)}** ${due > 0 ? `${due} due` : next24 > 0 ? `+${next24} in 24h` : '0 due'}`);
+            ? `**${nameOf(m.discord_user_id)}** ${due} due (+${next24})`
+            : `**${nameOf(m.discord_user_id)}** ${due > 0 ? `${due} due` : `+${next24} coming`}`);
     }
 
     const fields = [];
@@ -361,7 +341,7 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     }
     if (todayBits.length) {
         fields.push({
-            name: '📥 Today',
+            name: '📥 Up next',
             value: clipFieldValue(todayBits.join(' · ')),
             inline: false,
         });
