@@ -34,8 +34,6 @@ module.exports = {
         .setDescription('Configure server-wide WaniKani bot settings (mods only). Run with no options to view current.')
         .setDMPermission(false)
         .addBooleanOption(o =>
-            o.setName('burn').setDescription('Burns section in the daily recap: true=enable, false=disable'))
-        .addBooleanOption(o =>
             o.setName('levelup').setDescription('Level-up announcements: true=enable, false=disable'))
         .addBooleanOption(o =>
             o.setName('daily').setDescription('Daily recap post: true=enable, false=disable'))
@@ -68,7 +66,6 @@ module.exports = {
         const guildId = interaction.guild.id;
         await ensureSettings(guildId);
 
-        const burn = interaction.options.getBoolean('burn');
         const levelup = interaction.options.getBoolean('levelup');
         const daily = interaction.options.getBoolean('daily');
         const weekly = interaction.options.getBoolean('weekly');
@@ -79,7 +76,7 @@ module.exports = {
         const channel = interaction.options.getChannel('channel');
         const modrole = interaction.options.getRole('modrole');
 
-        const noneSet = [burn, levelup, daily, weekly, cleared, weeklyDay, time, timezone, channel, modrole]
+        const noneSet = [levelup, daily, weekly, cleared, weeklyDay, time, timezone, channel, modrole]
             .every(v => v === null);
 
         if (noneSet) {
@@ -106,11 +103,6 @@ module.exports = {
         const summary = [];
         let scheduleChanged = false;
 
-        if (burn !== null) {
-            fields.push('burn_celebrations_enabled = ?');
-            params.push(burn ? 1 : 0);
-            summary.push(`Burns in daily recap: **${burn ? 'on' : 'off'}**`);
-        }
         if (levelup !== null) {
             fields.push('level_up_announcements_enabled = ?');
             params.push(levelup ? 1 : 0);
@@ -207,7 +199,6 @@ async function showSettings(interaction, guildId) {
             },
             { name: 'Mod role', value: modRoleStr, inline: false },
             { name: 'Level-up announcements', value: s.level_up_announcements_enabled ? 'on' : 'off', inline: true },
-            { name: 'Burns in daily recap', value: s.burn_celebrations_enabled ? 'on' : 'off', inline: true },
             { name: 'Queue clears in daily recap', value: s.reviews_cleared_announcements_enabled ? 'on' : 'off', inline: true },
         );
     return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });

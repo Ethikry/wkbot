@@ -92,7 +92,6 @@ async function getGuildMembers(guildId) {
              COALESCE(rs.reviews_ping_enabled, 1) AS ping_enabled,
              COALESCE(rs.shame_enabled, 0) AS shame_enabled,
              COALESCE(rs.cleared_enabled, 1) AS cleared_enabled,
-             COALESCE(rs.burn_announcement_enabled, 1) AS burn_announcement_enabled,
              COALESCE(rs.levelup_announcement_enabled, 1) AS levelup_announcement_enabled,
              COALESCE(urs.shame_enabled, 0) AS user_shame_enabled
          FROM guild_members gm
@@ -669,8 +668,6 @@ async function maybeSendReviewsAvailableDM(client, account) {
 // ── slow-loop detection (hourly) ────────────────────────────────────────
 // Replaces the old 15-minute pollUsersJob. Level-up / reset detection is not
 // time-critical, so it runs once per hour against freshly-synced caches.
-// (Burn detection used to live here too; burns now surface in the daily
-// recap's Highlights digest instead of real-time posts.)
 
 async function slowDetectionJob(client) {
     // Sync each WaniKani account exactly once per tick, before any guild loop
@@ -755,10 +752,6 @@ async function slowDetectionJob(client) {
                             .setFooter(FOOTER);
                         await channel.send({ content: `<@${row.discord_user_id}>`, embeds: [embed] });
                     }
-
-                    // Burns are no longer announced in real time — they show
-                    // up in the daily recap's Highlights digest instead
-                    // (helpers/dailyRecap.js reads wk_assignments.burned_at).
 
                     // Achievement check — runs against freshly-synced state.
                     await evaluateAchievements({

@@ -3,7 +3,8 @@ const { getWaniKaniData, getSrsBreakdown, getLevelProgress } = require('../helpe
 const { getAccountForDiscordUser } = require('../helpers/userLink');
 const { base, error, renderMonthlyHeatmap } = require('../helpers/embeds');
 const { recordPoll } = require('../helpers/zerostate');
-const { DEFAULT_TIME_ZONE, addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { DEFAULT_TIME_ZONE, addDaysToDateKey, botDateKey } = require('../helpers/botTime');
+const { getEffectiveUserTimeZone } = require('../helpers/tzInfer');
 const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
 const db = require('../db');
 
@@ -43,7 +44,7 @@ module.exports = {
         try {
             await awaitInteractionStateRefresh(interaction, 'wkstats');
             const settings = await db.get(`SELECT timezone FROM guild_settings WHERE guild_id = ?`, [guildId]);
-            const timeZone = resolveTimeZone(settings?.timezone);
+            const { timeZone } = await getEffectiveUserTimeZone(userId, settings?.timezone);
             const today = botDateKey(new Date(), timeZone);
             const heatmapStart = addDaysToDateKey(today, -(HEATMAP_DAYS - 1));
             const data = await getWaniKaniData(account);
