@@ -45,7 +45,7 @@ module.exports = {
                         '`/config` (no args) — view current server settings',
                         'Options (combine any in one call):',
                         '`levelup` — toggle level-up announcements',
-                        '`burn` `cleared` — toggle the burns / queue-clears sections of the daily recap',
+                        '`cleared` — toggle the queue-clears section of the daily recap',
                         '`daily` — daily recap on/off',
                         '`weekly` `weekly_day` — leaderboard on/off + day of week',
                         '`time` — time for all scheduled messages (HH:MM, server timezone)',

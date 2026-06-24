@@ -166,7 +166,7 @@ module.exports = {
                         `Shame DMs: **${shame ? 'enabled' : 'disabled'}**.`,
                         `Sleep hours: **${formatSleepHours(sleepStart, sleepEnd)}**.`,
                         '',
-                        'Server-specific options (channel @mention, queue-clear / burn / level-up announcements, channel shame) live under `/guild_setup`.',
+                        'Server-specific options (channel @mention, queue-clear / level-up announcements, channel shame) live under `/guild_setup`.',
                     ].join('\n')
                 )],
             });
@@ -326,7 +326,7 @@ function showUserSettings({ reviewsDm, streak, shame, sleepStart, sleepEnd }) {
         { name: 'Sleep hours', value: formatSleepHours(sleepStart, sleepEnd), inline: true },
         {
             name: 'Per-server options',
-            value: 'Run `/guild_setup` in a server to configure @mentions, queue-clear / burn / level-up announcements, and channel shame.',
+            value: 'Run `/guild_setup` in a server to configure @mentions, queue-clear / level-up announcements, and channel shame.',
             inline: false,
         },
     );
