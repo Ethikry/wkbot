@@ -11,8 +11,8 @@
 // names resolve to "Unknown" since there is no Discord client — pass real
 // names through the live bot to see them.
 //
-// Read-only with one exception: it does NOT call finalizeGoalDay, so goal_met
-// markers reflect whatever the last real dailyJob run wrote.
+// Read-only: builds the embed from existing snapshot/cache rows without
+// writing anything.
 
 const db = require('../db');
 const { buildDailyRecap } = require('../helpers/dailyRecap');
