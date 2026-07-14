@@ -165,7 +165,7 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         const head = [`**${name}**`, `Lv **${m.level}**`];
         const streak = streaks.get(m.discord_user_id);
         if (streak && streak.current_streak > 0 && streak.last_review_date >= userYesterdays.get(m.discord_user_id)) {
-            head.push(`🔥 **${streak.current_streak}**`);
+            head.push(`🔥 **${streak.current_streak}** day streak`);
         }
 
         const doneBits = [];
