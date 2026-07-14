@@ -223,11 +223,13 @@ async function leaderboardJob(client, guildId) {
     const rows = await db.all(
         `SELECT
              gm.discord_user_id,
+             wa.current_vacation_started_at,
              COALESCE(rs.shame_enabled, 0) AS shame_enabled,
              COALESCE(rs.reviews_ping_enabled, 1) AS ping_enabled,
              COALESCE(SUM(ds.reviews_completed), 0) AS reviews,
              COALESCE(SUM(ds.lessons_completed), 0) AS lessons
          FROM guild_members gm
+         LEFT JOIN wanikani_accounts wa ON wa.discord_user_id = gm.discord_user_id
          LEFT JOIN daily_snapshots ds
              ON ds.guild_id = gm.guild_id
              AND ds.discord_user_id = gm.discord_user_id
@@ -235,7 +237,7 @@ async function leaderboardJob(client, guildId) {
          LEFT JOIN reminder_settings rs
              ON rs.guild_id = gm.guild_id AND rs.discord_user_id = gm.discord_user_id
          WHERE gm.guild_id = ?
-         GROUP BY gm.discord_user_id, rs.shame_enabled, rs.reviews_ping_enabled
+         GROUP BY gm.discord_user_id, wa.current_vacation_started_at, rs.shame_enabled, rs.reviews_ping_enabled
          ORDER BY reviews DESC, lessons DESC, gm.discord_user_id ASC`,
         [sinceStr, guildId]
     );
@@ -253,6 +255,7 @@ async function leaderboardJob(client, guildId) {
             reviews: r.reviews,
             lessons: r.lessons,
             shameEnabled: r.shame_enabled === 1,
+            onVacation: r.current_vacation_started_at != null,
             pingEnabled: r.ping_enabled === 1,
         };
     }));
@@ -277,7 +280,7 @@ async function leaderboardJob(client, guildId) {
         return `${medal} **${name}** — ${r.longest_streak} day${r.longest_streak === 1 ? '' : 's'} (current: ${r.current_streak})`;
     }));
 
-    const shameTargets = enriched.filter(e => e.shameEnabled && e.reviews === 0);
+    const shameTargets = enriched.filter(e => e.shameEnabled && e.reviews === 0 && !e.onVacation);
     const shameLines = await Promise.all(shameTargets.map(async e => {
         const user = `<@${e.userId}>`;
         const ctx = await fetchShameContext(e.userId);
