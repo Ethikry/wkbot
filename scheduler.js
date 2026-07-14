@@ -9,7 +9,7 @@ const {
     computeFastestPaceDays,
 } = require('./helpers/wanikaniData');
 const { projectPace } = require('./helpers/longgoal');
-const { buildDailyRecap, finalizeGoalDay } = require('./helpers/dailyRecap');
+const { buildDailyRecap } = require('./helpers/dailyRecap');
 const wkSync = require('./helpers/wkSync');
 const { COLOR_PRIMARY, COLOR_ERROR, COLOR_WARN, FOOTER } = require('./helpers/embeds');
 const { recordPoll } = require('./helpers/zerostate');
@@ -120,12 +120,8 @@ async function dailyJob(client, guildId) {
     // it's the (almost-complete) current day.
     const recapDateKey = botDateKey(new Date(Date.now() - 60 * 1000), tz);
 
-    // Snapshots first so the recap reads finalized data for the closing day,
-    // then goal results (which read the finalized snapshot rows).
+    // Snapshots first so the recap reads finalized data for the closing day.
     await updateSnapshotsAndStreaks(guildId, rows);
-    await finalizeGoalDay(guildId, recapDateKey, tz).catch(err =>
-        console.error(`[finalizeGoalDay] ${guildId}:`, err)
-    );
 
     if (settings.daily_summary_enabled) {
         const channel = await resolveOutputChannel(guild, settings);

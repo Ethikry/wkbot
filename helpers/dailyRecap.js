@@ -40,6 +40,7 @@ async function getRecapMembers(guildId) {
         `SELECT
              gm.discord_user_id,
              wa.wanikani_user_id,
+             wa.level,
              wa.current_vacation_started_at,
              COALESCE(rs.cleared_enabled, 1) AS cleared_enabled
          FROM guild_members gm
@@ -77,87 +78,6 @@ async function countQueueClears(guildId, startIso, endIso) {
     return clears;
 }
 
-// Evaluates and persists daily_snapshots.goal_met for the day being closed,
-// then recomputes per-user goal streaks the same self-healing way the review
-// streak is computed (walk back from the recap day while goal_met = 1).
-// Call after updateSnapshotsAndStreaks so the recap day's row is final.
-async function finalizeGoalDay(guildId, recapDateKey, timeZone) {
-    const startIso = startOfBotDayUtcIso(recapDateKey, timeZone);
-    const endIso = startOfBotDayUtcIso(addDaysToDateKey(recapDateKey, 1), timeZone);
-
-    const goals = await db.all(
-        `SELECT ug.discord_user_id, ug.daily_lessons, ug.clear_queue
-         FROM user_goals ug
-         JOIN guild_members gm ON gm.discord_user_id = ug.discord_user_id
-         WHERE gm.guild_id = ?
-           AND (ug.daily_lessons IS NOT NULL OR ug.clear_queue = 1)`,
-        [guildId]
-    );
-    if (goals.length === 0) return;
-
-    const clears = await countQueueClears(guildId, startIso, endIso);
-
-    for (const goal of goals) {
-        try {
-            const snap = await db.get(
-                `SELECT reviews_completed, lessons_completed, reviews_available
-                 FROM daily_snapshots
-                 WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
-                [guildId, goal.discord_user_id, recapDateKey]
-            );
-            if (!snap) continue;
-
-            const lessonsOk = goal.daily_lessons === null
-                || (snap.lessons_completed ?? 0) >= goal.daily_lessons;
-
-            // "Clear my queue" counts when the user did reviews and either
-            // ended the day at zero or hit zero at some point during it
-            // (revived evaluateAllGoal semantics from helpers/zerostate.js).
-            let clearOk = true;
-            if (goal.clear_queue === 1) {
-                const didReviews = (snap.reviews_completed ?? 0) > 0;
-                const endedAtZero = (snap.reviews_available ?? 0) === 0;
-                const clearedDuringDay = (clears.get(goal.discord_user_id) ?? 0) > 0;
-                clearOk = didReviews && (endedAtZero || clearedDuringDay);
-            }
-
-            const met = lessonsOk && clearOk ? 1 : 0;
-            await db.run(
-                `UPDATE daily_snapshots SET goal_met = ?
-                 WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
-                [met, guildId, goal.discord_user_id, recapDateKey]
-            );
-
-            const history = await db.all(
-                `SELECT snapshot_date, goal_met FROM daily_snapshots
-                 WHERE guild_id = ? AND discord_user_id = ?
-                 ORDER BY snapshot_date DESC
-                 LIMIT 365`,
-                [guildId, goal.discord_user_id]
-            );
-            const histMap = new Map(history.map(h => [h.snapshot_date, h.goal_met]));
-            let goalStreak = 0;
-            let cursor = recapDateKey;
-            while (histMap.get(cursor) === 1) {
-                goalStreak++;
-                cursor = addDaysToDateKey(cursor, -1);
-            }
-
-            await db.run(
-                `INSERT INTO streaks (guild_id, discord_user_id, goal_current_streak, goal_longest_streak)
-                 VALUES (?, ?, ?, ?)
-                 ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
-                    goal_current_streak = excluded.goal_current_streak,
-                    goal_longest_streak = max(streaks.goal_longest_streak, excluded.goal_longest_streak),
-                    updated_at = CURRENT_TIMESTAMP`,
-                [guildId, goal.discord_user_id, goalStreak, goalStreak]
-            );
-        } catch (err) {
-            console.error(`[finalizeGoalDay] ${goal.discord_user_id}@${guildId}:`, err);
-        }
-    }
-}
-
 // Builds the daily recap as plain embed data ({ title, description, fields })
 // for the bot-day that just closed. Reads only the local DB (snapshots,
 // streaks, queue_history, wk_assignments, wk_summary_cache) — no WK API
@@ -192,7 +112,7 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         const userYesterday = addDaysToDateKey(botDateKey(now, userTz), -1);
         userYesterdays.set(m.discord_user_id, userYesterday);
         const snap = await db.get(
-            `SELECT reviews_completed, lessons_completed, goal_met
+            `SELECT reviews_completed, lessons_completed
              FROM daily_snapshots
              WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
             [guildId, m.discord_user_id, userYesterday]
@@ -208,61 +128,65 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     const streaks = new Map(streakRows.map(r => [r.discord_user_id, r]));
 
     const cacheRows = await db.all(
-        `SELECT wanikani_user_id, review_count_now, review_count_24h FROM wk_summary_cache
+        `SELECT wanikani_user_id, lesson_count, review_count_now, review_count_24h FROM wk_summary_cache
          WHERE wanikani_user_id IN (${members.map(() => '?').join(',')})`,
         members.map(m => m.wanikani_user_id)
     );
     const caches = new Map(cacheRows.map(r => [r.wanikani_user_id, r]));
 
-    // ── per-user lines + server totals ──────────────────────────────────
+    // ── per-user entries + server totals ────────────────────────────────
     let totalReviews = 0;
     let totalLessons = 0;
-    let goalsTotal = 0;
-    let goalsMet = 0;
+    let activeMembers = 0;
+    let countedMembers = 0;
+    let totalLessonsAvail = 0;
+    let totalDue24 = 0;
     const userLines = [];
     for (const m of members) {
         const name = nameOf(m.discord_user_id);
         const snap = snaps.get(m.discord_user_id);
-        const goalMet = snap?.goal_met ?? null;
-        if (goalMet !== null) {
-            goalsTotal++;
-            if (goalMet === 1) goalsMet++;
-        }
         if (m.current_vacation_started_at) {
-            userLines.push(`**${name}** 🏖️ Vacation mode`);
+            userLines.push(`**${name}** · Lv **${m.level}** · 🏖️ Vacation mode`);
             continue;
         }
+        countedMembers++;
         const reviews = snap?.reviews_completed ?? 0;
         const lessons = snap?.lessons_completed ?? 0;
         totalReviews += reviews;
         totalLessons += lessons;
+        if (reviews > 0 || lessons > 0) activeMembers++;
 
         const cache = caches.get(m.wanikani_user_id);
-        if (reviews === 0 && lessons === 0) {
-            const due = cache?.review_count_now ?? 0;
-            userLines.push(due > 0
-                ? `**${name}** 💤 no activity · ${due} due`
-                : `**${name}** 💤 no activity`);
-            continue;
-        }
+        const lessonsAvail = cache?.lesson_count ?? 0;
+        const due24 = cache?.review_count_24h ?? 0;
+        totalLessonsAvail += lessonsAvail;
+        totalDue24 += due24;
 
-        const bits = [`**${reviews}** review${reviews === 1 ? '' : 's'}`];
-        if (lessons > 0) bits.push(`**${lessons}** lesson${lessons === 1 ? '' : 's'}`);
-        if (goalMet === 1) bits.push('🎯');
-        else if (goalMet === 0) bits.push('▫️');
+        const head = [`**${name}**`, `Lv **${m.level}**`];
         const streak = streaks.get(m.discord_user_id);
         if (streak && streak.current_streak > 0 && streak.last_review_date >= userYesterdays.get(m.discord_user_id)) {
-            bits.push(`🔥 ${streak.current_streak}`);
+            head.push(`🔥 **${streak.current_streak}**`);
         }
-        userLines.push(`**${name}** ✅ ${bits.join(' · ')}`);
-    }
 
-    const serverBits = [
-        `**${totalReviews}** reviews`,
-        `**${totalLessons}** lessons`,
+        const doneBits = [];
+        if (lessons > 0) doneBits.push(`✏️ **${lessons}** lesson${lessons === 1 ? '' : 's'} completed`);
+        if (reviews > 0) doneBits.push(`✅ **${reviews}** review${reviews === 1 ? '' : 's'} cleared`);
+        const lines = [head.join(' · '), `> ${doneBits.length ? doneBits.join(' · ') : '💤 no activity'}`];
+
+        const upBits = [];
+        if (lessonsAvail > 0) upBits.push(`📚 **${lessonsAvail}** lesson${lessonsAvail === 1 ? '' : 's'} ready`);
+        if (due24 > 0) upBits.push(`📥 **${due24}** review${due24 === 1 ? '' : 's'} due (24h)`);
+        if (upBits.length) lines.push(`> ${upBits.join(' · ')}`);
+
+        userLines.push(lines.join('\n'));
+    }
+    const description = clipDescription(userLines.join('\n'));
+
+    const totalsLines = [
+        `✏️ **${totalLessons}** lessons completed · ✅ **${totalReviews}** reviews cleared`,
+        `🙋 **${activeMembers}/${countedMembers}** members active`,
+        `📚 **${totalLessonsAvail}** lessons ready · 📥 **${totalDue24}** reviews due (24h)`,
     ];
-    if (goalsTotal > 0) serverBits.push(`**${goalsMet}/${goalsTotal}** goals met`);
-    const description = clipDescription([serverBits.join(' · '), '', ...userLines].join('\n'));
 
     // ── highlights digest ────────────────────────────────────────────────
     const highlights = [];
@@ -318,19 +242,6 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
         highlights.push(`🏆 **${nameOf(r.discord_user_id)}** unlocked “${r.name}”`);
     }
 
-    // ── today line (current queues from the 5-minute summary cache) ─────
-    const todayBits = [];
-    for (const m of members) {
-        if (m.current_vacation_started_at) continue;
-        const cache = caches.get(m.wanikani_user_id);
-        const due = cache?.review_count_now ?? 0;
-        const next24 = Math.max(0, (cache?.review_count_24h ?? 0) - due);
-        if (due === 0 && next24 === 0) continue;
-        todayBits.push(due > 0 && next24 > 0
-            ? `**${nameOf(m.discord_user_id)}** ${due} due (+${next24})`
-            : `**${nameOf(m.discord_user_id)}** ${due > 0 ? `${due} due` : `+${next24} coming`}`);
-    }
-
     const fields = [];
     if (highlights.length) {
         fields.push({
@@ -339,13 +250,11 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
             inline: false,
         });
     }
-    if (todayBits.length) {
-        fields.push({
-            name: '📥 Up next',
-            value: clipFieldValue(todayBits.join(' · ')),
-            inline: false,
-        });
-    }
+    fields.push({
+        name: '📊 Server Totals',
+        value: clipFieldValue(totalsLines.join('\n')),
+        inline: false,
+    });
 
     return {
         title: `📅 Daily Recap — ${formatRecapDate(recapDateKey)}`,
@@ -354,4 +263,4 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     };
 }
 
-module.exports = { buildDailyRecap, finalizeGoalDay, countQueueClears };
+module.exports = { buildDailyRecap, countQueueClears };
