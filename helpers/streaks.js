@@ -64,12 +64,17 @@ function nextReturnDate(offeringsUsed, dayKey) {
  * @param {Array<{snapshot_date: string, reviews_completed: number, lessons_completed: number}>} history
  *        Snapshot rows in any order. Only dates >= `floorDate` are considered.
  * @param {string} todayKey  The user's current local date (YYYY-MM-DD).
- * @param {{floorDate?: string|null}} [options]
+ * @param {{floorDate?: string|null, trace?: boolean}} [options]
  *        `floorDate` drops history before a hard boundary — a WaniKani reset,
  *        where pre-reset activity must not prop the streak up.
+ *        `trace` adds a per-day record of the replay to the result. It has to
+ *        come from this one forward pass: re-running the walk per day with
+ *        that day as `todayKey` reports every day as still-pending, so a
+ *        frozen day would never resolve in its own row.
  */
 function computeReviewStreak(history, todayKey, options = {}) {
     const floorDate = options.floorDate ?? null;
+    const trace = options.trace ? [] : null;
 
     const studied = new Map();
     for (const h of history) {
@@ -80,7 +85,7 @@ function computeReviewStreak(history, todayKey, options = {}) {
     }
 
     const offeringsUsed = [];
-    if (studied.size === 0) return emptyResult(todayKey, offeringsUsed);
+    if (studied.size === 0) return { ...emptyResult(todayKey, offeringsUsed), trace };
 
     let streak = 0;
     let lastActiveDate = null;
@@ -98,18 +103,25 @@ function computeReviewStreak(history, todayKey, options = {}) {
     let cursor = [...studied.keys()].sort()[0];
     while (cursor <= todayKey) {
         const didStudy = studied.get(cursor);
+        let status;
 
         if (didStudy === undefined) {
             gapRun++;
-            if (gapRun > MAX_UNOBSERVED_GAP_DAYS) breakStreak();
+            status = 'unobserved';
+            if (gapRun > MAX_UNOBSERVED_GAP_DAYS) {
+                breakStreak();
+                status = 'blackout';
+            }
         } else {
             gapRun = 0;
             if (didStudy) {
                 streak++;
                 lastActiveDate = cursor;
                 lastStreakDate = cursor;
+                status = 'studied';
             } else if (cursor === todayKey) {
                 // Today is still in progress — nothing has been missed yet.
+                status = 'pending';
             } else if (streak > 0) {
                 const available = MAX_OFFERINGS - spentWithinCooldown(offeringsUsed, cursor);
                 if (available > 0) {
@@ -117,10 +129,28 @@ function computeReviewStreak(history, todayKey, options = {}) {
                     frozenDates.push(cursor);
                     streak++;
                     lastStreakDate = cursor;
+                    status = 'frozen';
                 } else {
                     breakStreak();
+                    status = 'broken';
                 }
+            } else {
+                status = 'idle';
             }
+        }
+
+        if (trace) {
+            const row = studied.has(cursor)
+                ? history.find(h => h.snapshot_date === cursor)
+                : null;
+            trace.push({
+                date: cursor,
+                status,
+                streak,
+                offeringsAvailable: MAX_OFFERINGS - spentWithinCooldown(offeringsUsed, cursor),
+                reviews: row?.reviews_completed ?? 0,
+                lessons: row?.lessons_completed ?? 0,
+            });
         }
 
         cursor = addDaysToDateKey(cursor, 1);
@@ -133,6 +163,7 @@ function computeReviewStreak(history, todayKey, options = {}) {
         frozenDates,
         offeringsAvailable: MAX_OFFERINGS - spentWithinCooldown(offeringsUsed, todayKey),
         offeringReturnDate: nextReturnDate(offeringsUsed, todayKey),
+        trace,
     };
 }
 
