@@ -765,6 +765,25 @@ const SCHEMA_V17 = [
     `ALTER TABLE user_reminder_settings ADD COLUMN inferred_tz_updated_at TEXT`,
 ];
 
+// WaniKani-style streak freezes ("offerings to the Crabigator").
+//
+// The streak is still recomputed from daily_snapshots on every pass, so these
+// columns are a cache of the last replay rather than incrementally-maintained
+// state — except `streak_floor_date`, which is authoritative: checkUserResets
+// stamps it so a WaniKani reset can never be bridged by pre-reset activity.
+//
+// `last_review_date` keeps meaning "last day with real activity"; the new
+// `last_streak_date` is the last day the streak *covers*, which is later than
+// it whenever the tail of the streak is offering-covered.
+const SCHEMA_V18 = [
+    `ALTER TABLE streaks ADD COLUMN last_streak_date TEXT`,
+    `ALTER TABLE streaks ADD COLUMN offerings_available INTEGER NOT NULL DEFAULT 2`,
+    `ALTER TABLE streaks ADD COLUMN offering_return_date TEXT`,
+    `ALTER TABLE streaks ADD COLUMN frozen_dates TEXT`,
+    `ALTER TABLE streaks ADD COLUMN streak_floor_date TEXT`,
+    `UPDATE streaks SET last_streak_date = last_review_date WHERE last_streak_date IS NULL`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -783,6 +802,7 @@ const MIGRATIONS = [
     { version: 15, name: 'user_sleep_hours', statements: SCHEMA_V15 },
     { version: 16, name: 'user_goals_and_goal_streaks', statements: SCHEMA_V16 },
     { version: 17, name: 'levelup_watermark_and_user_timezone', statements: SCHEMA_V17 },
+    { version: 18, name: 'streak_offerings', statements: SCHEMA_V18 },
 ];
 
 async function runMigrations({ get, all, run }) {

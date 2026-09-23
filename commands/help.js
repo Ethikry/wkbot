@@ -16,7 +16,7 @@ module.exports = {
                         '`/setup` — link your read-only WaniKani API token; toggle DM reminders and shame',
                         '`/reviews` — current lessons and reviews, plus today\'s completed counts',
                         '`/wkstats` — level progress, lessons, reviews, SRS breakdown, 30-day heatmap',
-                        '`/streak` — current and longest review streak',
+                        '`/streak` — study streak, longest streak, and offerings left',
                         '`/mistakes` — items you missed in the past 7 days (answers in spoilers)',
                         '`/achievements` — your unlocked WaniKani achievements',
                         '`/sync` — refresh your WK data right now instead of waiting for the daily update',
