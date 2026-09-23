@@ -21,6 +21,7 @@ const { evaluateAchievements } = require('./helpers/achievements');
 const { evaluateGuildAchievements } = require('./helpers/guildAchievements');
 const { writeReviewStatSnapshots } = require('./helpers/reviewStatSnapshot');
 const { buildWeeklyExtras } = require('./helpers/weeklyExtras');
+const { computeReviewStreak, MAX_OFFERINGS } = require('./helpers/streaks');
 const {
     DEFAULT_TIME_ZONE,
     addDaysToDateKey,
@@ -340,10 +341,19 @@ async function checkUserResets(apiKey, discordUserId, guildId, wanikaniUserId, l
             const resetDate = latest.data.confirmed_at.slice(0, 10);
             console.log(`[reset] ${discordUserId}@${guildId}: reset to level ${targetLevel} on ${resetDate}`);
 
+            // Stamping streak_floor_date matters as much as zeroing the
+            // counter: the snapshot delete below leaves a hole in the history,
+            // and computeReviewStreak carries a streak across unobserved days.
+            // The floor makes the reset a hard boundary instead.
             await db.run(
-                `UPDATE streaks SET current_streak = 0, updated_at = CURRENT_TIMESTAMP
-                 WHERE guild_id = ? AND discord_user_id = ?`,
-                [guildId, discordUserId]
+                `UPDATE streaks
+                    SET current_streak = 0,
+                        last_streak_date = NULL,
+                        frozen_dates = NULL,
+                        streak_floor_date = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                  WHERE guild_id = ? AND discord_user_id = ?`,
+                [resetDate, guildId, discordUserId]
             );
 
             await db.run(
@@ -974,10 +984,14 @@ async function paceAlertJob(client) {
 }
 
 // Fires ~2 hours before the guild's daily_summary_time. For each member with
-// an active streak whose last review was yesterday (not today, in *their*
-// timezone), checks the live queue: if reviews are due and none have been done
-// today, the streak is at risk. Sends either a shame DM (if the user opted in)
-// or a gentle nudge.
+// an active streak that is currently carried through yesterday (not today, in
+// *their* timezone), checks the live queue: if reviews are due and nothing has
+// been studied today, the streak is on the line. Sends either a shame DM (if
+// the user opted in) or a gentle nudge.
+//
+// With offerings in play "on the line" has two flavours: with an offering in
+// hand the streak survives the miss and only the offering is spent, so the DM
+// says so rather than crying wolf about a break that will not happen.
 async function streakRiskJob(client, guildId) {
     console.log(`[streakRisk] guild=${guildId}`);
     const guild = client.guilds.cache.get(guildId);
@@ -998,6 +1012,8 @@ async function streakRiskJob(client, guildId) {
              wa.current_vacation_started_at,
              s.current_streak,
              s.last_review_date,
+             s.last_streak_date,
+             COALESCE(s.offerings_available, ?) AS offerings_available,
              COALESCE(urs.streak_reminder_enabled, 1) AS streak_reminder_enabled,
              COALESCE(urs.shame_enabled, 0) AS shame_enabled,
              COALESCE(cache.review_count_now, 0) AS due_now
@@ -1008,7 +1024,7 @@ async function streakRiskJob(client, guildId) {
          LEFT JOIN wk_summary_cache cache ON cache.wanikani_user_id = wa.wanikani_user_id
          WHERE gm.guild_id = ?
            AND s.current_streak >= 1`,
-        [guildId]
+        [MAX_OFFERINGS, guildId]
     );
 
     for (const c of candidates) {
@@ -1021,15 +1037,20 @@ async function streakRiskJob(client, guildId) {
         const userToday = botDateStr(0, userTz);
         const userYesterday = botDateStr(-1, userTz);
 
-        // Only at risk if their last review was yesterday (in their tz) and
-        // they haven't done any reviews yet today (in their tz).
-        if (c.last_review_date !== userYesterday) continue;
+        // Only on the line if the streak currently runs through yesterday (in
+        // their tz) and they have not studied yet today (in their tz).
+        // last_streak_date, not last_review_date: a streak whose tail is
+        // offering-covered still needs the nudge — arguably more so, since
+        // another miss is what actually breaks it.
+        const streakThrough = c.last_streak_date ?? c.last_review_date;
+        if (streakThrough !== userYesterday) continue;
         const snapToday = await db.get(
-            `SELECT reviews_completed FROM daily_snapshots
+            `SELECT reviews_completed, lessons_completed FROM daily_snapshots
              WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date = ?`,
             [guildId, c.discord_user_id, userToday]
         );
-        if ((snapToday?.reviews_completed ?? 0) > 0) continue;
+        // Lessons keep the streak alive on WaniKani just as reviews do.
+        if (((snapToday?.reviews_completed ?? 0) + (snapToday?.lessons_completed ?? 0)) > 0) continue;
 
         const wantsShame = c.shame_enabled === 1;
         const wantsGentle = c.streak_reminder_enabled === 1;
@@ -1056,6 +1077,11 @@ async function streakRiskJob(client, guildId) {
             const user = await client.users.fetch(c.discord_user_id).catch(() => null);
             if (!user) continue;
 
+            const offerings = c.offerings_available ?? 0;
+            const offeringNote = offerings > 0
+                ? `🐢 You have **${offerings}** offering${offerings === 1 ? '' : 's'} left — miss today and one gets spent to save the streak.`
+                : '🐢 No offerings left — miss today and the streak breaks.';
+
             let embed;
             if (wantsShame) {
                 const userTag = `<@${c.discord_user_id}>`;
@@ -1076,6 +1102,7 @@ async function streakRiskJob(client, guildId) {
                         body,
                         '',
                         `**${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting · **${c.current_streak}**-day streak at risk.`,
+                        offeringNote,
                         '[**Start reviews →**](https://www.wanikani.com/subjects/review)',
                         '-# Clear at least one review today to keep the streak alive.',
                     ].join('\n'))
@@ -1084,9 +1111,10 @@ async function streakRiskJob(client, guildId) {
             } else {
                 embed = new EmbedBuilder()
                     .setColor(COLOR_WARN)
-                    .setTitle('🔥 Streak about to break')
+                    .setTitle(offerings > 0 ? '🔥 Streak on the line' : '🔥 Streak about to break')
                     .setDescription([
                         `You have **${c.due_now}** review${c.due_now === 1 ? '' : 's'} waiting and a **${c.current_streak}**-day streak on the line.`,
+                        offeringNote,
                         '[**Start reviews →**](https://www.wanikani.com/subjects/review)',
                         'Clear at least one review today to keep the streak alive.',
                         '',
@@ -1290,54 +1318,48 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
 
             // Recompute the streak from the snapshot history rather than
             // incrementing — self-heals when a day's row was missed and now
-            // gets backfilled. Walk back from "today or yesterday" while
-            // reviews_completed > 0.
+            // gets backfilled. computeReviewStreak replays the history forward
+            // under WaniKani's rules (lessons *or* reviews count; a missed day
+            // spends one of two offerings, each recharging seven days later).
             const today = days[days.length - 1].dateKey;
-            const yesterday = days[days.length - 2].dateKey;
+            const prior = await db.get(
+                `SELECT longest_streak, last_review_date, streak_floor_date FROM streaks
+                 WHERE guild_id = ? AND discord_user_id = ?`,
+                [guildId, row.discord_user_id]
+            );
             const history = await db.all(
-                `SELECT snapshot_date, reviews_completed FROM daily_snapshots
+                `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
                  WHERE guild_id = ? AND discord_user_id = ?
                  ORDER BY snapshot_date DESC
                  LIMIT 365`,
                 [guildId, row.discord_user_id]
             );
-            const histMap = new Map(history.map(h => [h.snapshot_date, h.reviews_completed]));
+            const streak = computeReviewStreak(history, today, {
+                floorDate: prior?.streak_floor_date ?? null,
+            });
 
-            let currentStreak = 0;
-            let lastReviewDate = null;
-            // Anchor the streak at the most recent active day (today or yesterday).
-            let cursor = (histMap.get(today) ?? 0) > 0
-                ? today
-                : ((histMap.get(yesterday) ?? 0) > 0 ? yesterday : null);
-            while (cursor) {
-                const reviews = histMap.get(cursor) ?? 0;
-                if (reviews <= 0) break;
-                currentStreak++;
-                if (!lastReviewDate) lastReviewDate = cursor;
-                // Step one calendar day backward in guild-local terms.
-                const [yy, mm, dd] = cursor.split('-').map(Number);
-                const prev = new Date(Date.UTC(yy, mm - 1, dd));
-                prev.setUTCDate(prev.getUTCDate() - 1);
-                cursor = prev.toISOString().slice(0, 10);
-            }
-
-            const prior = await db.get(
-                `SELECT longest_streak, last_review_date FROM streaks
-                 WHERE guild_id = ? AND discord_user_id = ?`,
-                [guildId, row.discord_user_id]
-            );
-            const longest = Math.max(currentStreak, prior?.longest_streak ?? 0);
-            const persistedLastDate = lastReviewDate ?? prior?.last_review_date ?? null;
+            const longest = Math.max(streak.currentStreak, prior?.longest_streak ?? 0);
+            const persistedLastDate = streak.lastActiveDate ?? prior?.last_review_date ?? null;
 
             await db.run(
-                `INSERT INTO streaks (guild_id, discord_user_id, current_streak, longest_streak, last_review_date)
-                 VALUES (?, ?, ?, ?, ?)
+                `INSERT INTO streaks (
+                    guild_id, discord_user_id, current_streak, longest_streak, last_review_date,
+                    last_streak_date, offerings_available, offering_return_date, frozen_dates
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(guild_id, discord_user_id) DO UPDATE SET
                     current_streak = excluded.current_streak,
                     longest_streak = excluded.longest_streak,
                     last_review_date = excluded.last_review_date,
+                    last_streak_date = excluded.last_streak_date,
+                    offerings_available = excluded.offerings_available,
+                    offering_return_date = excluded.offering_return_date,
+                    frozen_dates = excluded.frozen_dates,
                     updated_at = CURRENT_TIMESTAMP`,
-                [guildId, row.discord_user_id, currentStreak, longest, persistedLastDate]
+                [
+                    guildId, row.discord_user_id, streak.currentStreak, longest, persistedLastDate,
+                    streak.lastStreakDate, streak.offeringsAvailable, streak.offeringReturnDate,
+                    JSON.stringify(streak.frozenDates),
+                ]
             );
 
             // Snapshot review_statistics for /mistakes baselines using today's

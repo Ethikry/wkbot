@@ -121,7 +121,8 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     }
 
     const streakRows = await db.all(
-        `SELECT discord_user_id, current_streak, last_review_date, goal_current_streak
+        `SELECT discord_user_id, current_streak, last_review_date, last_streak_date,
+                offerings_available, goal_current_streak
          FROM streaks WHERE guild_id = ?`,
         [guildId]
     );
@@ -164,7 +165,10 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
 
         const head = [`**${name}**`, `Lv **${m.level}**`];
         const streak = streaks.get(m.discord_user_id);
-        if (streak && streak.current_streak > 0 && streak.last_review_date >= userYesterdays.get(m.discord_user_id)) {
+        // last_streak_date covers offering-frozen days too, so a streak the
+        // Crabigator is holding open still shows its flame.
+        const streakThrough = streak && (streak.last_streak_date ?? streak.last_review_date);
+        if (streak && streak.current_streak > 0 && streakThrough >= userYesterdays.get(m.discord_user_id)) {
             head.push(`🔥 **${streak.current_streak}** day streak`);
         }
 
@@ -223,10 +227,25 @@ async function buildDailyRecap(guildId, guild, timeZone, recapDateKey) {
     // Streak milestones crossed on the user's personal yesterday.
     for (const m of members) {
         const streak = streaks.get(m.discord_user_id);
-        if (!streak || streak.last_review_date !== userYesterdays.get(m.discord_user_id)) continue;
+        if (!streak) continue;
+        const streakThrough = streak.last_streak_date ?? streak.last_review_date;
+        if (streakThrough !== userYesterdays.get(m.discord_user_id)) continue;
         if (STREAK_MILESTONES.includes(streak.current_streak)) {
             highlights.push(`✨ **${nameOf(m.discord_user_id)}** hit a ${streak.current_streak}-day streak!`);
         }
+    }
+
+    // Offerings spent yesterday — the streak survived a missed day, which is
+    // worth calling out so nobody thinks the flame is unearned.
+    for (const m of members) {
+        const streak = streaks.get(m.discord_user_id);
+        if (!streak || streak.current_streak <= 0) continue;
+        const userYesterday = userYesterdays.get(m.discord_user_id);
+        if ((streak.last_streak_date ?? null) !== userYesterday) continue;
+        if ((streak.last_review_date ?? null) === userYesterday) continue;
+        highlights.push(
+            `🐢 **${nameOf(m.discord_user_id)}** spent an offering — ${streak.current_streak}-day streak held (${streak.offerings_available ?? 0} left)`
+        );
     }
 
     // Achievements unlocked during the day (these previously unlocked silently).
