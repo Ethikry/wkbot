@@ -51,10 +51,14 @@ function bucketEmoji(reviews) {
     return '🟥';
 }
 
-function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone = getBotTimeZone()) {
-    const cells = recentDateKeys(days, timeZone).map(dateStr =>
-        bucketEmoji(snapshotsByDate.get(dateStr) ?? 0)
-    );
+// `frozenDates` are days an offering covered: they would otherwise render as
+// an empty ⬛ even though the streak carried through them.
+function renderMonthlyHeatmap(snapshotsByDate, days = 30, columns = 6, timeZone = getBotTimeZone(), frozenDates = new Set()) {
+    const cells = recentDateKeys(days, timeZone).map(dateStr => {
+        const reviews = snapshotsByDate.get(dateStr) ?? 0;
+        if (reviews === 0 && frozenDates.has(dateStr)) return '🐢';
+        return bucketEmoji(reviews);
+    });
     const rows = [];
     for (let i = 0; i < cells.length; i += columns) {
         rows.push(cells.slice(i, i + columns).join(''));
