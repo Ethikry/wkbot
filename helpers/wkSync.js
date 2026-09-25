@@ -470,7 +470,55 @@ async function syncUser(account) {
 
 // ── /summary (per-user) ───────────────────────────────────────────────────
 
-async function syncSummary(account) {
+// Upsert-then-prune rather than delete-then-insert: each db.run is its own
+// await, so two syncSummary calls for the same account can interleave (the
+// */5 and hourly jobs both fire at HH:00). With delete-then-insert both
+// deletes could land before either insert and the second plain INSERT hit
+// the primary key. This form is idempotent under interleaving and never
+// leaves the table momentarily empty for readers like scheduleNextReviewTimer.
+async function writeSummaryBuckets(wkId, bucketType, buckets) {
+    // Merge any entries sharing an available_at so no subject_ids are lost
+    // to the (wanikani_user_id, bucket_type, available_at) primary key.
+    const merged = new Map();
+    for (const b of buckets) {
+        const ids = merged.get(b.available_at) ?? new Set();
+        for (const id of b.subject_ids) ids.add(id);
+        merged.set(b.available_at, ids);
+    }
+    for (const [availableAt, ids] of merged) {
+        const subjectIds = [...ids];
+        await db.run(
+            `INSERT INTO wk_summary_buckets (wanikani_user_id, bucket_type, available_at, subject_ids_json, subject_count)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(wanikani_user_id, bucket_type, available_at) DO UPDATE SET
+                subject_ids_json = excluded.subject_ids_json,
+                subject_count = excluded.subject_count`,
+            [wkId, bucketType, availableAt, JSON.stringify(subjectIds), subjectIds.length]
+        );
+    }
+    await db.run(
+        `DELETE FROM wk_summary_buckets
+         WHERE wanikani_user_id = ?
+           AND bucket_type = ?
+           AND available_at NOT IN (SELECT value FROM json_each(?))`,
+        [wkId, bucketType, JSON.stringify([...merged.keys()])]
+    );
+}
+
+// Concurrent callers for the same account share one in-flight sync instead
+// of issuing duplicate /summary requests and racing each other's writes.
+const summaryInFlight = new Map(); // wanikani_user_id -> Promise
+
+function syncSummary(account) {
+    const wkId = account.wanikani_user_id;
+    const pending = summaryInFlight.get(wkId);
+    if (pending) return pending;
+    const p = syncSummaryUncoalesced(account).finally(() => summaryInFlight.delete(wkId));
+    summaryInFlight.set(wkId, p);
+    return p;
+}
+
+async function syncSummaryUncoalesced(account) {
     const apiKey = decrypt(account.api_token_encrypted);
     const wkId = account.wanikani_user_id;
     const state = await loadUserSyncState(wkId, 'summary');
@@ -512,21 +560,8 @@ async function syncSummary(account) {
                 ]
             );
 
-            await db.run(`DELETE FROM wk_summary_buckets WHERE wanikani_user_id = ?`, [wkId]);
-            for (const b of lessonBuckets) {
-                await db.run(
-                    `INSERT INTO wk_summary_buckets (wanikani_user_id, bucket_type, available_at, subject_ids_json, subject_count)
-                     VALUES (?, 'lesson', ?, ?, ?)`,
-                    [wkId, b.available_at, JSON.stringify(b.subject_ids), b.subject_ids.length]
-                );
-            }
-            for (const b of reviewBuckets) {
-                await db.run(
-                    `INSERT OR REPLACE INTO wk_summary_buckets (wanikani_user_id, bucket_type, available_at, subject_ids_json, subject_count)
-                     VALUES (?, 'review', ?, ?, ?)`,
-                    [wkId, b.available_at, JSON.stringify(b.subject_ids), b.subject_ids.length]
-                );
-            }
+            await writeSummaryBuckets(wkId, 'lesson', lessonBuckets);
+            await writeSummaryBuckets(wkId, 'review', reviewBuckets);
         }
         // On 304 the bucket rows are unchanged but real time has advanced —
         // buckets whose available_at slid into the past won't be counted in the
