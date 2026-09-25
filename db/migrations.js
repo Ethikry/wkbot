@@ -784,6 +784,18 @@ const SCHEMA_V18 = [
     `UPDATE streaks SET last_streak_date = last_review_date WHERE last_streak_date IS NULL`,
 ];
 
+// Backfill rows the per-user incremental syncs skipped. When an upsert failed
+// mid-batch (FK on a subject WaniKani had just published), the retry sent the
+// in-memory ETag for the same updated_after URL, got a 304, and advanced the
+// watermark past rows that were never written. Clearing the watermark (and
+// the ETag, so the unconditional full fetch can't 304) makes the next sync
+// re-fetch each collection in full; the upserts are idempotent.
+const SCHEMA_V19 = [
+    `UPDATE wk_sync_state
+        SET last_data_updated_at = NULL, etag = NULL, last_modified = NULL
+      WHERE endpoint IN ('assignments', 'review_statistics', 'study_materials', 'level_progressions')`,
+];
+
 const MIGRATIONS = [
     { version: 1, name: 'initial_schema_v2', statements: SCHEMA_V1 },
     { version: 2, name: 'seed_achievements', statements: ACHIEVEMENTS_V2 },
@@ -803,6 +815,7 @@ const MIGRATIONS = [
     { version: 16, name: 'user_goals_and_goal_streaks', statements: SCHEMA_V16 },
     { version: 17, name: 'levelup_watermark_and_user_timezone', statements: SCHEMA_V17 },
     { version: 18, name: 'streak_offerings', statements: SCHEMA_V18 },
+    { version: 19, name: 'resync_skipped_user_collections', statements: SCHEMA_V19 },
 ];
 
 async function runMigrations({ get, all, run }) {
