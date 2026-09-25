@@ -33,6 +33,7 @@ function emptyResult(todayKey, offeringsUsed = []) {
         lastActiveDate: null,
         lastStreakDate: null,
         frozenDates: [],
+        offeringDates: [...offeringsUsed],
         offeringsAvailable: MAX_OFFERINGS - spentWithinCooldown(offeringsUsed, todayKey),
         offeringReturnDate: nextReturnDate(offeringsUsed, todayKey),
     };
@@ -131,6 +132,9 @@ function computeReviewStreak(history, todayKey, options = {}) {
         lastActiveDate,
         lastStreakDate,
         frozenDates,
+        // Every day an offering was spent on, including ones inside streaks
+        // that have since broken — `frozenDates` only covers the live streak.
+        offeringDates: offeringsUsed,
         offeringsAvailable: MAX_OFFERINGS - spentWithinCooldown(offeringsUsed, todayKey),
         offeringReturnDate: nextReturnDate(offeringsUsed, todayKey),
     };

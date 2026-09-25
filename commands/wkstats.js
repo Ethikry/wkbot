@@ -6,6 +6,7 @@ const { recordPoll } = require('../helpers/zerostate');
 const { DEFAULT_TIME_ZONE, addDaysToDateKey, botDateKey } = require('../helpers/botTime');
 const { getEffectiveUserTimeZone } = require('../helpers/tzInfer');
 const { awaitInteractionStateRefresh } = require('../helpers/interactionState');
+const { computeReviewStreak } = require('../helpers/streaks');
 const db = require('../db');
 
 const HEATMAP_DAYS = 30;
@@ -55,19 +56,32 @@ module.exports = {
                 console.error('[wkstats recordPoll]', err)
             );
 
-            const [srs, levelProgress, snapshots] = await Promise.all([
+            // Offerings can't be read off the 30-day window alone — whether a
+            // missed day was covered depends on the offerings spent the week
+            // before it — so replay the same history the scheduler does.
+            const [srs, levelProgress, history, streakRow] = await Promise.all([
                 getSrsBreakdown(account),
                 getLevelProgress(account, userData.level),
                 db.all(
                     `SELECT snapshot_date, reviews_completed, lessons_completed FROM daily_snapshots
-                     WHERE guild_id = ? AND discord_user_id = ?
-                       AND snapshot_date >= ? AND snapshot_date <= ?`,
-                    [guildId, userId, heatmapStart, today]
+                     WHERE guild_id = ? AND discord_user_id = ? AND snapshot_date <= ?
+                     ORDER BY snapshot_date DESC
+                     LIMIT 365`,
+                    [guildId, userId, today]
+                ),
+                db.get(
+                    `SELECT streak_floor_date FROM streaks WHERE guild_id = ? AND discord_user_id = ?`,
+                    [guildId, userId]
                 ),
             ]);
+            const snapshots = history.filter(s => s.snapshot_date >= heatmapStart);
+            const { currentStreak, offeringDates } = computeReviewStreak(history, today, {
+                floorDate: streakRow?.streak_floor_date ?? null,
+            });
+            const frozenDates = new Set(offeringDates.filter(d => d >= heatmapStart));
 
             const snapshotsByDate = new Map(snapshots.map(s => [s.snapshot_date, s.reviews_completed]));
-            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6, timeZone);
+            const heatmap = renderMonthlyHeatmap(snapshotsByDate, HEATMAP_DAYS, 6, timeZone, frozenDates);
             const totalReviews = snapshots.reduce((acc, s) => acc + (s.reviews_completed || 0), 0);
             const totalLessons = snapshots.reduce((acc, s) => acc + (s.lessons_completed || 0), 0);
             const levelProgressLine = formatLevelProgress(userData.level, levelProgress);
@@ -90,8 +104,9 @@ module.exports = {
                         name: '📅 30 Day Heatmap',
                         value: [
                             heatmap,
-                            '0 ⬛🟦🟩🟨🟧🟥 200+',
+                            '0 ⬛🟦🟩🟨🟧🟥 200+' + (frozenDates.size > 0 ? ' · 🐢 offering' : ''),
                             `**${totalReviews}** reviews · **${totalLessons}** lessons completed in the last 30 days`,
+                            `🔥 **${currentStreak}** day streak`,
                         ].join('\n'),
                         inline: false,
                     },
