@@ -15,18 +15,19 @@ function sleep(ms) {
 // Low-level request. Returns the full response envelope:
 //   { data, etag, lastModified, dataUpdatedAt, status, notModified, totalCount, pages, raw }
 // Conditional headers default to whatever's in the in-memory cache; callers
-// that persist their own cache (sync workers) can override with `conditional`.
+// that persist their own cache (sync workers) can override with `conditional`
+// — pass `null` to send no conditional headers at all.
 async function wkRequest(pathOrUrl, apiKey, opts = {}) {
     const {
         timeoutMs = 10000,
         retries = 1,
-        conditional = null,
+        conditional,
     } = opts;
     if (!apiKey) throw new Error('API key is required');
     const url = pathOrUrl.startsWith('http') ? pathOrUrl : `${BASE}${pathOrUrl}`;
     const cacheKey = `${apiKey}::${url}`;
     const memCached = _cache.get(cacheKey);
-    const cond = conditional ?? memCached;
+    const cond = conditional === undefined ? memCached : conditional;
 
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -139,8 +140,12 @@ async function wkRequestAllPages(pathOrUrl, apiKey, opts = {}) {
     let maxDataUpdatedAt = null;
     let allNotModified = true;
 
-    // Conditional headers only apply to the first page — subsequent pages
-    // are unique URLs the server would never 304 against the same ETag.
+    // Conditional headers only apply to the first page, and only when the
+    // caller passes them explicitly. Never fall back to wkRequest's in-memory
+    // cache here: a 304 yields no items, so a retry of an incremental URL whose
+    // previous response was fetched but not fully persisted (e.g. an insert
+    // failed mid-batch) would come back empty and the caller would move on
+    // as if those rows had been stored.
     let conditional = opts.conditional ?? null;
 
     while (next) {
@@ -148,11 +153,14 @@ async function wkRequestAllPages(pathOrUrl, apiKey, opts = {}) {
         conditional = null;
         if (res.notModified) {
             // Whole collection unchanged; bail out — caller can read its cache.
+            // No dataUpdatedAt: nothing was fetched, so sync workers must keep
+            // their existing updated_after watermark rather than jump to the
+            // stale body's data_updated_at.
             return {
                 items: [],
                 etag: res.etag,
                 lastModified: res.lastModified,
-                dataUpdatedAt: res.dataUpdatedAt,
+                dataUpdatedAt: null,
                 notModified: true,
             };
         }

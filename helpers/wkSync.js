@@ -123,6 +123,32 @@ async function syncSubjects(apiKey) {
     }
 }
 
+// WaniKani publishes new subjects on its own schedule and creates assignments
+// for them the same minute for everyone already past their level, but the
+// incremental subjects sync only runs from the daily globals job. Pull any
+// subject a per-user collection references that isn't cached yet, so the
+// subject_id foreign keys can't reject the batch in between.
+async function ensureSubjectsCached(apiKey, subjectIds) {
+    const ids = [...new Set(subjectIds.filter(id => id != null))];
+    const missing = [];
+    for (let i = 0; i < ids.length; i += 500) {
+        const chunk = ids.slice(i, i + 500);
+        const rows = await db.all(
+            `SELECT subject_id FROM wk_subjects WHERE subject_id IN (${chunk.map(() => '?').join(',')})`,
+            chunk
+        );
+        const known = new Set(rows.map(r => r.subject_id));
+        for (const id of chunk) if (!known.has(id)) missing.push(id);
+    }
+    if (!missing.length) return 0;
+    for (let i = 0; i < missing.length; i += 200) {
+        const res = await wkRequestAllPages(`/subjects?ids=${missing.slice(i, i + 200).join(',')}`, apiKey);
+        for (const item of res.items) await upsertSubject(item);
+    }
+    console.log(`[wkSync] fetched ${missing.length} uncached subject(s) on demand`);
+    return missing.length;
+}
+
 // ── spaced_repetition_systems (global) ────────────────────────────────────
 
 async function upsertSrsSystem(item) {
@@ -221,6 +247,7 @@ async function syncAssignments(account) {
         const res = await wkRequestAllPages(url, apiKey, {
             conditional: state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
         });
+        await ensureSubjectsCached(apiKey, res.items.map(item => item.data?.subject_id));
         for (const item of res.items) await upsertAssignment(wkId, item);
         await saveUserSyncState(wkId, 'assignments', {
             etag: res.etag, lastModified: res.lastModified,
@@ -303,6 +330,7 @@ async function syncReviewStatistics(account) {
         const res = await wkRequestAllPages(url, apiKey, {
             conditional: state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
         });
+        await ensureSubjectsCached(apiKey, res.items.map(item => item.data?.subject_id));
         for (const item of res.items) await upsertReviewStatistic(wkId, item);
         await saveUserSyncState(wkId, 'review_statistics', {
             etag: res.etag, lastModified: res.lastModified,
@@ -407,6 +435,7 @@ async function syncStudyMaterials(account) {
         const res = await wkRequestAllPages(url, apiKey, {
             conditional: state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
         });
+        await ensureSubjectsCached(apiKey, res.items.map(item => item.data?.subject_id));
         for (const item of res.items) await upsertStudyMaterial(wkId, item);
         await saveUserSyncState(wkId, 'study_materials', {
             etag: res.etag, lastModified: res.lastModified,
@@ -593,7 +622,7 @@ async function syncUserAll(account) {
 module.exports = {
     loadGlobalSyncState, saveGlobalSyncState,
     loadUserSyncState, saveUserSyncState,
-    syncSubjects, syncSpacedRepetitionSystems, syncGlobals,
+    syncSubjects, ensureSubjectsCached, syncSpacedRepetitionSystems, syncGlobals,
     syncAssignments, syncReviewStatistics, syncLevelProgressions,
     syncStudyMaterials,
     syncUser, syncSummary, syncUserAll,
