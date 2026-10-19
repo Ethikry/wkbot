@@ -20,7 +20,7 @@
 
 const db = require('../db');
 const { computeReviewStreak, MAX_OFFERINGS } = require('../helpers/streaks');
-const { addDaysToDateKey, botDateKey, resolveTimeZone } = require('../helpers/botTime');
+const { botDateKey, resolveTimeZone } = require('../helpers/botTime');
 const { getEffectiveUserTimeZone } = require('../helpers/tzInfer');
 
 function parseArgs(argv) {
@@ -51,21 +51,25 @@ async function resolveUserFilter(needle) {
     return rows.map(r => r.discord_user_id);
 }
 
-function traceReplay(history, todayKey, days, floorDate) {
-    const byDate = new Map(history.map(h => [h.snapshot_date, h]));
-    const lines = [];
-    for (let i = days - 1; i >= 0; i--) {
-        const d = addDaysToDateKey(todayKey, -i);
-        const row = byDate.get(d);
-        const result = computeReviewStreak(history, d, { floorDate });
-        const froze = result.frozenDates.includes(d);
-        const mark = row === undefined ? '·  no snapshot'
-            : ((row.reviews_completed ?? 0) + (row.lessons_completed ?? 0)) > 0
-                ? `✅ ${row.reviews_completed ?? 0}r ${row.lessons_completed ?? 0}l`
-                : (froze ? '👻 offering spent' : '❌ no activity');
-        lines.push(`    ${d}  ${mark.padEnd(20)} streak=${String(result.currentStreak).padStart(4)}  offerings=${result.offeringsAvailable}`);
-    }
-    return lines;
+const TRACE_MARKS = {
+    studied: e => `✅ ${e.reviews}r ${e.lessons}l`,
+    frozen: () => '👻 offering spent',
+    broken: () => '💔 streak broken',
+    pending: () => '⏳ today, not over',
+    idle: () => '❌ no activity',
+    unobserved: () => '·  no snapshot',
+    blackout: () => '·  blackout >7d',
+};
+
+// Renders the tail of the replay the engine already performed. The per-day
+// values must come from that single pass: asking the engine for day D with D
+// as "today" reports D as still-pending, so a frozen day would never show up
+// as frozen in its own row.
+function traceLines(trace, days) {
+    return trace.slice(-days).map(e =>
+        `    ${e.date}  ${(TRACE_MARKS[e.status] ?? (() => e.status))(e).padEnd(20)}` +
+        ` streak=${String(e.streak).padStart(4)}  offerings=${e.offeringsAvailable}`
+    );
 }
 
 async function main() {
@@ -118,7 +122,7 @@ async function main() {
         if (history.length === 0) continue;
 
         const floorDate = prior?.streak_floor_date ?? null;
-        const streak = computeReviewStreak(history, today, { floorDate });
+        const streak = computeReviewStreak(history, today, { floorDate, trace: args.trace });
         const longest = Math.max(streak.currentStreak, prior?.longest_streak ?? 0);
         const before = prior?.current_streak ?? 0;
         const delta = streak.currentStreak - before;
@@ -132,7 +136,7 @@ async function main() {
             `${streak.frozenDates.length ? `, frozen ${streak.frozenDates.join(', ')}` : ''}` +
             `${floorDate ? `, floor ${floorDate}` : ''}`
         );
-        if (args.trace) console.log(traceReplay(history, today, args.days, floorDate).join('\n'));
+        if (args.trace && streak.trace) console.log(traceLines(streak.trace, args.days).join('\n'));
 
         if (delta !== 0) changed++;
         if (!args.apply) continue;
