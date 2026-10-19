@@ -818,7 +818,10 @@ async function dailyGlobalsAndUserSyncJob() {
     for (const account of accounts) {
         try {
             await wkSync.syncLevelProgressions(account);
-            await wkSync.syncReviewStatistics(account);
+            // Full fetches, once a day, to drop records WK has deleted — the
+            // */5 incremental syncs can't see those.
+            await wkSync.syncAssignments(account, { full: true });
+            await wkSync.syncReviewStatistics(account, { full: true });
             await wkSync.syncStudyMaterials(account);
         } catch (err) {
             console.error(`[dailyUserSync] ${account.wanikani_user_id}:`, err);
@@ -1168,12 +1171,39 @@ const SNAPSHOT_LOOKBACK_DAYS = 3;
 // and drop it from the review/lesson buckets.
 const BULK_UPDATE_SECOND_THRESHOLD = 50;
 
+// An assignment's data_updated_at also moves when nobody reviewed anything:
+// when WaniKani staff edit a subject's content, every user's assignment and
+// review_statistic for it are re-stamped within seconds, one subject at a time
+// (too sparse for the bulk filter), with the answer counts left unchanged. On
+// a day without study, one such edit used to read as "1 review" and keep the
+// streak alive. So an assignment update only counts as a review when the
+// subject's answer total went up around it: compared against the last stat
+// version from before REVIEW_ANSWER_LOOKBACK_MS ahead of the update, up to
+// REVIEW_ANSWER_SETTLE_MS after it. The lookback covers a burn's stat landing
+// minutes before its assignment; no SRS interval is shorter than it.
+const REVIEW_ANSWER_LOOKBACK_MS = ONE_HOUR_MS;
+const REVIEW_ANSWER_SETTLE_MS = 15 * 60 * 1000;
+
+function answersRoseAround(timeline, updatedAtMs) {
+    if (!timeline) return false;
+    let before = null;
+    let after = null;
+    for (const v of timeline) {
+        if (v.at > updatedAtMs + REVIEW_ANSWER_SETTLE_MS) break;
+        after = v;
+        if (v.at < updatedAtMs - REVIEW_ANSWER_LOOKBACK_MS) before = v;
+    }
+    if (!after) return false;
+    // No earlier version: the stat was created by this item's first review.
+    return before === null || after.total > before.total;
+}
+
 async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
     const settings = await getOrCreateSettings(guildId);
     const guildTimeZone = resolveTimeZone(settings.timezone);
     const {
         ensureUserSynced, ensureSummarySynced, ensureReviewStatsSynced,
-        getCompletedItemsSince, getSrsBreakdown,
+        getCompletedItemsSince, getReviewStatTimelines, getSrsBreakdown,
     } = require('./helpers/wanikaniData');
     const { getEffectiveUserTimeZone } = require('./helpers/tzInfer');
     const userMaxAgeMs = options.userMaxAgeMs ?? 0;
@@ -1200,7 +1230,6 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
 
             await ensureUserSynced(row, userMaxAgeMs);
             await ensureSummarySynced(row, summaryMaxAgeMs);
-            await ensureReviewStatsSynced(row, reviewStatsMaxAgeMs);
 
             const acct = await db.get(
                 `SELECT level FROM wanikani_accounts WHERE wanikani_user_id = ?`,
@@ -1211,6 +1240,9 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
             // with a 4-min staleness floor — back-to-back callers (e.g. the
             // 5-min summaryRefreshJob) won't pile up redundant syncs.
             const items = await getCompletedItemsSince(row, earliestStartISO, assignmentMaxAgeMs);
+            // After the assignments: WK writes a review's stat no later than
+            // its assignment, so every review seen above has its stat by now.
+            await ensureReviewStatsSynced(row, reviewStatsMaxAgeMs);
             const srs = await getSrsBreakdown(row);
             const totals = await db.get(
                 `SELECT COUNT(*) AS total_assignments,
@@ -1232,6 +1264,10 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
                 perSecondCounts.set(sec, (perSecondCounts.get(sec) || 0) + 1);
             }
             let bulkFiltered = 0;
+            const timelines = await getReviewStatTimelines(
+                row.wanikani_user_id,
+                [...new Set(items.map(it => it.subject_id))]
+            );
             const byDay = new Map(days.map(d => [d.dateKey, { reviews: 0, lessons: 0 }]));
             const dayBounds = days.map(d => ({
                 dateKey: d.dateKey,
@@ -1255,7 +1291,8 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
                     }
                 }
 
-                // Reviews: item updated during the day, started before it.
+                // Reviews: item updated during the day, started before it,
+                // with answers recorded around the update.
                 const sec = Math.floor(updatedAt / 1000);
                 if (perSecondCounts.get(sec) > BULK_UPDATE_SECOND_THRESHOLD) {
                     bulkFiltered++;
@@ -1263,7 +1300,9 @@ async function updateSnapshotsAndStreaks(guildId, rows, options = {}) {
                 }
                 for (const d of dayBounds) {
                     if (updatedAt >= d.start && updatedAt < d.end) {
-                        if (startedAt < d.start) byDay.get(d.dateKey).reviews++;
+                        if (startedAt < d.start && answersRoseAround(timelines.get(it.subject_id), updatedAt)) {
+                            byDay.get(d.dateKey).reviews++;
+                        }
                         break;
                     }
                 }
@@ -1472,7 +1511,8 @@ async function scheduleAll(client) {
             { timezone: 'UTC' }
         );
     }
-    // Daily globals (subjects, SRS systems) + slow per-user data (level progressions, review stats).
+    // Daily globals (subjects, SRS systems) + slow per-user data (level progressions, review stats)
+    // and the full assignment/review-stat fetch that prunes deleted records.
     if (!dailySyncJobHandle) {
         dailySyncJobHandle = cron.schedule(
             '0 4 * * *',

@@ -238,17 +238,43 @@ async function upsertAssignment(wanikaniUserId, item) {
     );
 }
 
-async function syncAssignments(account) {
+// An updated_after sync never hears about a record WaniKani deleted, so the
+// cache keeps it forever. WK once re-created an account's assignments and
+// review stats under new ids, which left two rows per subject and doubled that
+// user's SRS counts. A `full` sync fetches the whole collection unfiltered and
+// drops every cached id it did not return.
+async function pruneMissing(table, idColumn, wanikaniUserId, keptIds) {
+    const rows = await db.all(
+        `SELECT ${idColumn} AS id FROM ${table} WHERE wanikani_user_id = ?`,
+        [wanikaniUserId]
+    );
+    const stale = rows.map(r => r.id).filter(id => !keptIds.has(id));
+    for (let i = 0; i < stale.length; i += 500) {
+        const chunk = stale.slice(i, i + 500);
+        await db.run(
+            `DELETE FROM ${table} WHERE wanikani_user_id = ? AND ${idColumn} IN (${chunk.map(() => '?').join(',')})`,
+            [wanikaniUserId, ...chunk]
+        );
+    }
+    if (stale.length) console.log(`[wkSync] pruned ${stale.length} deleted row(s) from ${table} for ${wanikaniUserId}`);
+    return stale.length;
+}
+
+async function syncAssignments(account, { full = false } = {}) {
     const apiKey = decrypt(account.api_token_encrypted);
     const wkId = account.wanikani_user_id;
     const state = await loadUserSyncState(wkId, 'assignments');
-    const url = buildIncrementalUrl('/assignments', state?.lastDataUpdatedAt);
+    const url = full ? '/assignments' : buildIncrementalUrl('/assignments', state?.lastDataUpdatedAt);
     try {
         const res = await wkRequestAllPages(url, apiKey, {
-            conditional: state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
+            conditional: full || state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
         });
         await ensureSubjectsCached(apiKey, res.items.map(item => item.data?.subject_id));
         for (const item of res.items) await upsertAssignment(wkId, item);
+        // An empty collection is more likely an API hiccup than a wiped account.
+        if (full && res.items.length > 0) {
+            await pruneMissing('wk_assignments', 'assignment_id', wkId, new Set(res.items.map(item => item.id)));
+        }
         await saveUserSyncState(wkId, 'assignments', {
             etag: res.etag, lastModified: res.lastModified,
             dataUpdatedAt: res.dataUpdatedAt,
@@ -321,17 +347,22 @@ async function upsertReviewStatistic(wanikaniUserId, item) {
     );
 }
 
-async function syncReviewStatistics(account) {
+async function syncReviewStatistics(account, { full = false } = {}) {
     const apiKey = decrypt(account.api_token_encrypted);
     const wkId = account.wanikani_user_id;
     const state = await loadUserSyncState(wkId, 'review_statistics');
-    const url = buildIncrementalUrl('/review_statistics', state?.lastDataUpdatedAt);
+    const url = full ? '/review_statistics' : buildIncrementalUrl('/review_statistics', state?.lastDataUpdatedAt);
     try {
         const res = await wkRequestAllPages(url, apiKey, {
-            conditional: state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
+            conditional: full || state?.lastDataUpdatedAt ? null : { etag: state?.etag, lastModified: state?.lastModified },
         });
         await ensureSubjectsCached(apiKey, res.items.map(item => item.data?.subject_id));
         for (const item of res.items) await upsertReviewStatistic(wkId, item);
+        // wk_review_stat_history is keyed by subject, not stat id, so pruning a
+        // dead stat row leaves the subject's answer timeline intact.
+        if (full && res.items.length > 0) {
+            await pruneMissing('wk_review_statistics', 'review_statistic_id', wkId, new Set(res.items.map(item => item.id)));
+        }
         await saveUserSyncState(wkId, 'review_statistics', {
             etag: res.etag, lastModified: res.lastModified,
             dataUpdatedAt: res.dataUpdatedAt,

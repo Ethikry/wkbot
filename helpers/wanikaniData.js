@@ -308,8 +308,10 @@ async function getBurnedCount(account) {
 
 // Returns { reviewsCompleted, lessonsCompleted }.
 // Review records are deprecated in WK API v2, so reviewsCompleted is the count
-// of unique subject review-stat rows updated in the window. This tracks reviewed
-// items, not repeated same-item reviews inside the same window.
+// of unique subjects whose review stat gained answers in the window. This
+// tracks reviewed items, not repeated same-item reviews inside the same window.
+// An updated stat alone is not enough: WaniKani re-stamps every user's stat for
+// a subject when staff edit its content, with the answer counts unchanged.
 async function getCompletedSince(account, isoDate) {
     const apiKey = decryptForAccount(account);
     const [assignments, reviewStats] = await Promise.all([
@@ -329,9 +331,17 @@ async function getCompletedSince(account, isoDate) {
         if (!startedAt) continue;
         if (new Date(startedAt) >= cutoff) lessonsCompleted++;
     }
-    const reviewedSubjectIds = new Set(
+    const statSubjectIds = [...new Set(
         reviewStats.map(s => s.data?.subject_id).filter(id => id !== undefined && id !== null)
-    );
+    )];
+    const baselines = await getReviewStatBaselines(account.wanikani_user_id, statSubjectIds, isoDate);
+    const reviewedSubjectIds = new Set();
+    for (const s of reviewStats) {
+        const id = s.data?.subject_id;
+        if (id === undefined || id === null) continue;
+        const baseline = baselines.get(id);
+        if (!baseline || answerTotal(s.data) > answerTotal(baseline)) reviewedSubjectIds.add(id);
+    }
     const reviewsCompleted = reviewedSubjectIds.size;
     return { reviewsCompleted, lessonsCompleted };
 }
@@ -567,6 +577,37 @@ async function getReviewStatBaselines(wanikaniUserId, subjectIds, cutoffISO) {
             [wanikaniUserId, ...chunk, cutoffISO, wanikaniUserId]
         );
         for (const row of rows) out.set(row.subject_id, row);
+    }
+    return out;
+}
+
+function answerTotal(row) {
+    return (row.meaning_correct || 0) + (row.meaning_incorrect || 0)
+        + (row.reading_correct || 0) + (row.reading_incorrect || 0);
+}
+
+// Every review_statistic version we have seen per subject, oldest first, as
+// { at: ms, total: answers }. Callers use it to tell a real review (the answer
+// total went up) from WaniKani re-stamping the stat without one.
+async function getReviewStatTimelines(wanikaniUserId, subjectIds) {
+    const out = new Map();
+    for (let i = 0; i < subjectIds.length; i += REVIEW_STAT_BASELINE_CHUNK_SIZE) {
+        const chunk = subjectIds.slice(i, i + REVIEW_STAT_BASELINE_CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = await db.all(
+            `SELECT subject_id, recorded_at,
+                    meaning_correct, meaning_incorrect,
+                    reading_correct, reading_incorrect
+             FROM wk_review_stat_history
+             WHERE wanikani_user_id = ?
+               AND subject_id IN (${placeholders})
+             ORDER BY subject_id, recorded_at`,
+            [wanikaniUserId, ...chunk]
+        );
+        for (const row of rows) {
+            if (!out.has(row.subject_id)) out.set(row.subject_id, []);
+            out.get(row.subject_id).push({ at: new Date(row.recorded_at).getTime(), total: answerTotal(row) });
+        }
     }
     return out;
 }
@@ -829,6 +870,7 @@ module.exports = {
     getSrsBreakdown,
     getCompletedSince,
     getCompletedItemsSince,
+    getReviewStatTimelines,
     getReviewsCompletedSince,
     getLessonsCompletedSince,
     getBurnedCount,
